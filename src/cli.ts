@@ -598,6 +598,7 @@ const SUBCOMMANDS: Record<string, SubcommandHandler> = {
   hold: args => candidateCommand('hold', args),
   seed: seedCommand,
   verify: args => candidateCommand('verify', args),
+  secret: args => import('./secret-save.js').then(m => m.secretCommand(args)),
 };
 
 export async function main(argv: string[]): Promise<void> {
