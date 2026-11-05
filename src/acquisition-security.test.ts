@@ -23,8 +23,11 @@ const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(join(dir, 'git-argv'))}, JSON.stringify(args) + '\\n');
 appendFileSync(${JSON.stringify(join(dir, 'git-env'))}, JSON.stringify({ args, env: process.env }) + '\\n');
 const behavior = JSON.parse(readFileSync(${JSON.stringify(join(dir, 'git-behavior.json'))}, 'utf-8'));
+const sslBypass = args[0] === '-c' && args[1] === 'http.sslVerify=false';
+if (sslBypass) args.splice(0, 2);
 if (args[0] === 'ls-remote') {
-  if (args[1] === behavior.missing) process.exit(1);
+  if (behavior.requireSsl && args[1] === behavior.requireSsl && !sslBypass) process.exit(1);
+  if (args[1] === behavior.missing) { console.error('old diagnostic 1\\nold diagnostic 2\\nfatal: TLS handshake failed\\ncheck the custom CA\\nremote unavailable'); process.exit(1); }
   if (args[1] === behavior.empty) process.exit(0);
   console.log('${SHA}\\t' + args[2]);
 } else if (args[0] === 'clone') {
@@ -48,7 +51,7 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 function run(command: string, source: Record<string, unknown> | undefined, flags: string[] = [], extension = false) {
   writeFileSync(join(dir, 'git-behavior.json'), JSON.stringify({
-    missing: env.FAKE_MISSING_URL, empty: env.FAKE_EMPTY_URL,
+    missing: env.FAKE_MISSING_URL, empty: env.FAKE_EMPTY_URL, requireSsl: env.FAKE_REQUIRE_SSL,
   }));
   const recipe = join(dir, 'recipe.json');
   writeFileSync(recipe, JSON.stringify({
@@ -260,3 +263,73 @@ test('source URL whitespace, ASCII controls and normalized token usernames are r
     }
   }
 });
+
+for (const command of ['build', 'install']) {
+  test(`${command}: pin resolution honors sslBypass`, () => {
+    env.FAKE_REQUIRE_SSL = 'https://example.invalid/component.git';
+    const result = run(command, { url: env.FAKE_REQUIRE_SSL, sslBypass: true }, ['--pin-refs']);
+    expect(result.status).toBe(0);
+    expect(gitCalls()).toContain('["-c","http.sslVerify=false","ls-remote"');
+    expect(readFileSync(join(dir, 'out/connectome.lock'), 'utf-8')).toContain(SHA);
+  });
+}
+
+for (const extension of [false, true]) {
+  test(`pin failures name the ${extension ? 'extension' : 'MCP'} source and retain only a short git stderr tail`, () => {
+    env.FAKE_MISSING_URL = 'https://example.invalid/component.git';
+    const result = run('build', { url: env.FAKE_MISSING_URL }, ['--pin-refs'], extension);
+    const output = result.stdout + result.stderr;
+    expect(result.status).not.toBe(0);
+    expect(output).toContain(`${join(dir, 'recipe.json')} :: ${extension ? 'extensions' : 'mcpServers'}.fixture.source`);
+    expect(output).toContain('remote failed');
+    expect(output).toContain('fatal: TLS handshake failed');
+    expect(output).toContain('remote unavailable');
+    expect(output).not.toContain('old diagnostic');
+    expect(output).not.toContain('ref not found');
+    expect(existsSync(join(dir, 'out'))).toBe(false);
+  });
+  test(`private symbolic pin errors name the ${extension ? 'extension' : 'MCP'} source`, () => {
+    const result = run('build', { url: 'https://example.invalid/private.git', authSecret: 'GIT_TOKEN' }, ['--pin-refs'], extension);
+    expect(result.status).not.toBe(0);
+    expect(result.stdout + result.stderr).toContain(`${join(dir, 'recipe.json')} :: ${extension ? 'extensions' : 'mcpServers'}.fixture.source`);
+    expect(result.stdout + result.stderr).toContain('authSecret');
+    expect(gitCalls()).toBe('');
+  });
+}
+
+test('a missing ref is distinguished from a failed remote and names the source', () => {
+  env.FAKE_EMPTY_URL = 'https://example.invalid/component.git';
+  const result = run('build', { url: env.FAKE_EMPTY_URL, ref: 'missing' }, ['--pin-refs']);
+  const output = result.stdout + result.stderr;
+  expect(result.status).not.toBe(0);
+  expect(output).toContain('ref not found');
+  expect(output).toContain('mcpServers.fixture.source');
+  expect(output).not.toContain('remote failed');
+  expect(existsSync(join(dir, 'out'))).toBe(false);
+});
+
+for (const ref of ['deadbee', '20241105', 'a'.repeat(39)]) {
+  test(`hex-looking symbolic ref ${ref} is resolved, not trusted`, () => {
+    const result = run('build', { url: 'https://example.invalid/component.git', ref }, ['--pin-refs']);
+    expect(result.status).toBe(0);
+    expect(gitCalls()).toContain(`refs/heads/${ref}`);
+    expect(readFileSync(join(dir, 'out/connectome.lock'), 'utf-8')).toContain(SHA);
+  });
+  test(`unresolvable hex-looking ref ${ref} fails closed`, () => {
+    env.FAKE_EMPTY_URL = 'https://example.invalid/component.git';
+    const result = run('build', { url: env.FAKE_EMPTY_URL, ref }, ['--pin-refs']);
+    expect(result.status).not.toBe(0);
+    expect(gitCalls()).toContain(`refs/heads/${ref}`);
+    expect(existsSync(join(dir, 'out'))).toBe(false);
+  });
+}
+
+for (const ref of ['b'.repeat(40), 'B'.repeat(40), 'c'.repeat(64)]) {
+  test(`full object ID (${ref.length} chars) can be trusted without remote resolution`, () => {
+    const url = 'https://example.invalid/component.git';
+    const result = run('build', { url, ref, authSecret: 'GIT_TOKEN' }, ['--pin-refs']);
+    expect(result.status).toBe(0);
+    expect(gitCalls()).not.toContain(url);
+    expect(readFileSync(join(dir, 'out/connectome.lock'), 'utf-8')).toContain(ref);
+  });
+}

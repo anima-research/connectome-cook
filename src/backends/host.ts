@@ -36,7 +36,7 @@ import { execFileSync, execSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
-import { assertCredentialFreeSourceUrl } from '../source-url.js';
+import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
 import { log } from '../log.js';
 import type { GeneratorInput, McpSource } from '../types.js';
 import type { Recipe } from '../vendor/recipe.js';
@@ -455,7 +455,7 @@ export async function runHostBackend(
   // Preflight every source before previewing URLs or making any changes.
   assertCredentialFreeSourceUrl(options.chRepoUrl, '--ch-repo');
   for (const source of plan.sources) {
-    assertCredentialFreeSourceUrl(source.url);
+    assertCredentialFreeSourceUrl(source.url, `${sourceLocation(source)}.url`);
   }
   const parent = plan.parentWalk.recipe;
   const hasSidecars = (parent.services ?? []).length > 0;

@@ -11,13 +11,13 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { assertCredentialFreeSourceUrl } from './source-url.js';
+import { assertCredentialFreeSourceUrl, sourceLocation } from './source-url.js';
 import { log } from './log.js';
 import type { McpSource } from './types.js';
 
-/** 40-char (or abbreviated 7+) hex string — already a commit, nothing to do. */
+/** Only full SHA-1 or SHA-256 object IDs are trusted without remote lookup. */
 export function looksLikeSha(ref: string): boolean {
-  return /^[0-9a-f]{7,40}$/.test(ref);
+  return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(ref);
 }
 
 /** Candidate remote ref names to try for a symbolic ref, in order. */
@@ -28,21 +28,28 @@ export function candidateRefNames(ref: string): string[] {
 
 /**
  * Resolve `ref` on `url` to a commit SHA via `git ls-remote`.
- * Returns null when the remote is unreachable or the ref doesn't exist.
+ * Returns null if no candidate ref exists; throws with diagnostics on remote failure.
  */
-export function resolveRemoteRef(url: string, ref: string): string | null {
-  assertCredentialFreeSourceUrl(url);
+export function resolveRemoteRef(
+  url: string, ref: string, sslBypass = false, location = 'Source URL',
+): string | null {
+  assertCredentialFreeSourceUrl(url, location);
   if (looksLikeSha(ref)) return ref;
   for (const candidate of candidateRefNames(ref)) {
     let output: string;
     try {
-      output = execFileSync('git', ['ls-remote', url, candidate], {
+      output = execFileSync('git', [...(sslBypass ? ['-c', 'http.sslVerify=false'] : []), 'ls-remote', url, candidate], {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 30_000,
       });
-    } catch {
-      return null; // Remote unreachable — retrying other candidates won't help.
+    } catch (err) {
+      // URL validation precedes git. Keep only a bounded diagnostic tail, never
+      // the execFileSync message (which repeats the entire command).
+      const failure = err as { stderr?: string | Buffer; code?: string; signal?: string };
+      const tail = failure.stderr?.toString().trim().split('\n').slice(-3).join('\n').slice(-600);
+      const detail = tail || failure.code || failure.signal || 'git could not complete';
+      throw new Error(`--pin-refs: ${location}: could not resolve ${url}@${ref}: remote failed; no output written.\n${detail}`);
     }
     const sha = output.split('\n')[0]?.split('\t')[0]?.trim();
     if (sha && looksLikeSha(sha)) return sha;
@@ -53,11 +60,12 @@ export function resolveRemoteRef(url: string, ref: string): string | null {
 /**
  * Pin every git source in place (sets `source.commit`). Skips registry,
  * sibling-copy, and already-pinned entries. Private symbolic refs are
- * refused: pinning has no safe authSecret handoff.
+ * refused: pinning does not implement an authSecret handoff.
  */
 export function pinSources(sources: McpSource[]): void {
   for (const source of sources) {
-    assertCredentialFreeSourceUrl(source.url);
+    const location = sourceLocation(source);
+    assertCredentialFreeSourceUrl(source.url, `${location}.url`);
     if (!source.url || source.commit) continue;
     if (source.install.kind === 'npm-global' || source.install.kind === 'sibling-copy') continue;
     if (looksLikeSha(source.ref)) {
@@ -65,14 +73,14 @@ export function pinSources(sources: McpSource[]): void {
       continue;
     }
     if (source.authSecret) {
-      throw new Error('--pin-refs: cannot resolve private refs with authSecret; supply a commit SHA.');
+      throw new Error(`--pin-refs: ${location}: cannot resolve private refs with authSecret; supply a full commit SHA.`);
     }
-    const sha = resolveRemoteRef(source.url, source.ref);
+    const sha = resolveRemoteRef(source.url, source.ref, source.sslBypass, location);
     if (sha) {
       source.commit = sha;
       log.info(`--pin-refs: ${log.dim(source.url)}@${source.ref} → ${sha.slice(0, 12)}`);
     } else {
-      throw new Error(`--pin-refs: could not resolve ${source.url}@${source.ref}; no output written.`);
+      throw new Error(`--pin-refs: ${location}: ref not found: ${source.url}@${source.ref}; no output written.`);
     }
   }
 }

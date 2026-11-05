@@ -166,7 +166,8 @@ describe('renderRuntimeFiles', () => {
 describe('pin-refs', () => {
   test('looksLikeSha and candidateRefNames', () => {
     expect(looksLikeSha('a'.repeat(40))).toBe(true);
-    expect(looksLikeSha('abc1234')).toBe(true);
+    expect(looksLikeSha('abc1234')).toBe(false);
+    expect(looksLikeSha('a'.repeat(64))).toBe(true);
     expect(looksLikeSha('main')).toBe(false);
     expect(candidateRefNames('dev')).toEqual(['refs/heads/dev', 'refs/tags/dev', 'dev']);
     expect(candidateRefNames('refs/merge-requests/1/head')).toEqual(['refs/merge-requests/1/head']);
@@ -187,6 +188,9 @@ describe('pin-refs', () => {
 
     expect(resolveRemoteRef(repo, 'main')).toBe(head);
     expect(resolveRemoteRef(repo, 'no-such-branch')).toBeNull();
+    execFileSync('git', ['tag', '20241105'], { cwd: repo });
+    expect(resolveRemoteRef(repo, '20241105')).toBe(head);
+    expect(resolveRemoteRef(repo, 'deadbee')).toBeNull();
     // Already a SHA — returned verbatim, no ls-remote.
     expect(resolveRemoteRef('https://invalid.invalid/x.git', head)).toBe(head);
   });

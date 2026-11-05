@@ -126,7 +126,13 @@ components and connectome-host itself — to its current commit SHA via
 (and the `CH_REF` build-arg default) and recorded in `connectome.lock`,
 so rebuilding later reproduces the exact trees. Unresolvable refs (offline,
 private repos) fail before any files are written or clones/builds start. Private
-`authSecret` sources need an explicit commit SHA when pinning.
+`authSecret` sources need an explicit full commit SHA when pinning. Only full
+40-hex SHA-1 or 64-hex SHA-256 object IDs are trusted without remote lookup;
+short hex strings are resolved as symbolic refs, like other branch/tag names.
+
+Compatibility: this also changes Docker `cook build --pin-refs`: an `authSecret`
+source tracking a branch now fails instead of warning and continuing unpinned.
+Without `--pin-refs`, host and Docker `authSecret` behavior is unchanged.
 
 ### Templates
 

@@ -1,3 +1,5 @@
+import type { McpSource } from './types.js';
+
 /** Reject inline credentials before a source URL can reach logs, git, or artifacts. */
 export function assertCredentialFreeSourceUrl(url: string, location = 'Source URL'): void {
   const credentialError = () => new Error(`${location}: embedded credentials are not allowed.`);
@@ -36,4 +38,12 @@ export function assertCredentialFreeSourceUrl(url: string, location = 'Source UR
   }
   checkUsername(parsed.username);
   if (parsed.password) throw credentialError();
+}
+
+/** Declaring location, without including potentially unvalidated URL contents. */
+export function sourceLocation(source: McpSource): string {
+  const ref = source.refs[0];
+  if (!ref) return 'Source';
+  const section = source.role === 'extension' ? 'extensions' : 'mcpServers';
+  return `${ref.recipePath} :: ${section}.${ref.mcpServerName}.source`;
 }
