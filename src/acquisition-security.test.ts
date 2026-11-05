@@ -231,3 +231,32 @@ for (const command of ['build', 'install']) {
     }
   });
 }
+
+for (const command of ['build', 'install', 'check']) {
+  for (const prefix of [' ', '\t']) {
+    for (const pin of [false, true]) {
+      test(`${command}: whitespace-token URLs are rejected before use (prefix=${JSON.stringify(prefix)}, pin=${pin})`, () => {
+        const result = run(command, { url: `${prefix}https://ghp_${SECRET}@example.invalid/repo.git` }, pin ? ['--pin-refs'] : []);
+        expect(result.status).not.toBe(0);
+        expect(result.stdout + result.stderr).not.toContain(SECRET);
+        expect(result.stdout + result.stderr).toContain('mcpServers.fixture.source.url');
+        expect(gitCalls()).toBe('');
+        expect(existsSync(join(dir, 'out'))).toBe(false);
+      });
+    }
+  }
+}
+
+test('source URL whitespace, ASCII controls and normalized token usernames are rejected safely', () => {
+  for (const url of [
+    'https://example.invalid/repo.git ', '\thttps://example.invalid/repo.git',
+    ...Array.from({ length: 33 }, (_, i) => `https://example.invalid/repo${String.fromCharCode(i === 32 ? 127 : i)}.git`),
+    `https:\\\\ghp_${SECRET}@example.invalid/repo.git`,
+  ]) {
+    expect(() => assertCredentialFreeSourceUrl(url, 'fixture source')).toThrow('fixture source');
+    try { assertCredentialFreeSourceUrl(url); } catch (err) {
+      expect(String(err)).not.toContain(SECRET);
+      expect(String(err)).not.toContain('https:');
+    }
+  }
+});

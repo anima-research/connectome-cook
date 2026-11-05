@@ -1,13 +1,15 @@
 /** Reject inline credentials before a source URL can reach logs, git, or artifacts. */
 export function assertCredentialFreeSourceUrl(url: string, location = 'Source URL'): void {
   const credentialError = () => new Error(`${location}: embedded credentials are not allowed.`);
-  // A bare username is useful to credential helpers. A colon in userinfo
-  // denotes a password/token pair, even if the password is empty or encoded.
-  const userinfo = url.match(/^(?:[a-z][a-z0-9+.-]*:\/\/)?([^/?#]*)@/i)?.[1];
-  if (userinfo) {
+  // URL() silently trims whitespace and removes some controls. Reject the raw
+  // spelling first, before parsing, logging, or passing it to another tool.
+  if (url !== url.trim() || /[\x00-\x1f\x7f]/.test(url)) {
+    throw new Error(`${location}: source URLs must not contain surrounding whitespace or ASCII controls.`);
+  }
+  const checkUsername = (value: string) => {
     let username: string;
     try {
-      username = decodeURIComponent(userinfo);
+      username = decodeURIComponent(value);
     } catch {
       throw new Error(`${location}: invalid source URL; use a URL without embedded credentials.`);
     }
@@ -16,8 +18,11 @@ export function assertCredentialFreeSourceUrl(url: string, location = 'Source UR
     if (username.includes(':') || tokenPrefix.test(username) || tokenUser.test(username)) {
       throw credentialError();
     }
-  }
-  // Path derivation and generated shell commands do not support URL suffixes.
+  };
+  // Also cover local/scp-style forms that URL() cannot parse.
+  const userinfo = url.match(/^(?:[a-z][a-z0-9+.-]*:\/\/)?([^/?#]*)@/i)?.[1];
+  if (userinfo) checkUsername(userinfo);
+  // Source path derivation does not support URL suffixes.
   if (url.includes('?') || url.includes('#')) {
     throw new Error(`${location}: query strings and fragments are not supported in source URLs.`);
   }
@@ -29,5 +34,6 @@ export function assertCredentialFreeSourceUrl(url: string, location = 'Source UR
     // Never echo the rejected URL: it may contain a credential.
     throw new Error(`${location}: invalid source URL; use a URL without embedded credentials.`);
   }
+  checkUsername(parsed.username);
   if (parsed.password) throw credentialError();
 }

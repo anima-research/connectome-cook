@@ -102,7 +102,10 @@ Source URLs must not embed password/token userinfo. Bare usernames such as
 but known token prefixes (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`,
 `glpat-`) and token usernames (`oauth2`, `x-access-token`, `x-token-auth`) are
 rejected. Query strings and fragments are unsupported and rejected: source path
-derivation and generated shell commands do not handle these suffixes safely.
+derivation does not support these suffixes. This validation is not shell quoting
+and does not make generated Docker commands safe for arbitrary URLs or refs.
+Surrounding whitespace and ASCII control characters are also rejected. Unknown
+token formats may not be recognized: never put credentials in a source URL.
 ### Sidecars in host mode
 
 `cook install` supports recipes with sidecar `services` and
