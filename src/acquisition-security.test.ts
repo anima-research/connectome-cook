@@ -275,15 +275,16 @@ for (const command of ['build', 'install']) {
 }
 
 for (const extension of [false, true]) {
-  test(`pin failures name the ${extension ? 'extension' : 'MCP'} source and retain only a short git stderr tail`, () => {
+  test(`pin failures name the ${extension ? 'extension' : 'MCP'} source and omit git helper output`, () => {
     env.FAKE_MISSING_URL = 'https://example.invalid/component.git';
     const result = run('build', { url: env.FAKE_MISSING_URL }, ['--pin-refs'], extension);
     const output = result.stdout + result.stderr;
     expect(result.status).not.toBe(0);
     expect(output).toContain(`${join(dir, 'recipe.json')} :: ${extension ? 'extensions' : 'mcpServers'}.fixture.source`);
-    expect(output).toContain('remote failed');
-    expect(output).toContain('fatal: TLS handshake failed');
-    expect(output).toContain('remote unavailable');
+    expect(output).toContain('remote unreachable or refused (git ls-remote exit 1)');
+    expect(output).not.toContain('TLS handshake failed');
+    expect(output).not.toContain('check the custom CA');
+    expect(output).not.toContain('remote unavailable');
     expect(output).not.toContain('old diagnostic');
     expect(output).not.toContain('ref not found');
     expect(existsSync(join(dir, 'out'))).toBe(false);
@@ -304,7 +305,7 @@ test('a missing ref is distinguished from a failed remote and names the source',
   expect(result.status).not.toBe(0);
   expect(output).toContain('ref not found');
   expect(output).toContain('mcpServers.fixture.source');
-  expect(output).not.toContain('remote failed');
+  expect(output).not.toContain('remote unreachable or refused');
   expect(existsSync(join(dir, 'out'))).toBe(false);
 });
 

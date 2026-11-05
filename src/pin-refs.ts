@@ -44,12 +44,11 @@ export function resolveRemoteRef(
         timeout: 30_000,
       });
     } catch (err) {
-      // URL validation precedes git. Keep only a bounded diagnostic tail, never
-      // the execFileSync message (which repeats the entire command).
-      const failure = err as { stderr?: string | Buffer; code?: string; signal?: string };
-      const tail = failure.stderr?.toString().trim().split('\n').slice(-3).join('\n').slice(-600);
-      const detail = tail || failure.code || failure.signal || 'git could not complete';
-      throw new Error(`--pin-refs: ${location}: could not resolve ${url}@${ref}: remote failed; no output written.\n${detail}`);
+      // Helper output and the execFileSync message may contain credentials.
+      // Report only the exit status, never stderr/stdout or the original error.
+      const status = (err as { status?: number }).status;
+      const outcome = typeof status === 'number' ? `exit ${status}` : 'did not complete';
+      throw new Error(`--pin-refs: ${location}: could not resolve ${url}@${ref}: remote unreachable or refused (git ls-remote ${outcome}); no output written.`);
     }
     const sha = output.split('\n')[0]?.split('\t')[0]?.trim();
     if (sha && looksLikeSha(sha)) return sha;
