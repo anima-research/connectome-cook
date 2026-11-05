@@ -95,6 +95,14 @@ Cook probes the candidates, suggests the first hit, lets you confirm or
 override, and exposes the answer as `$SPRING_HOME` — usable in recipe
 `${VAR}` references and install steps, and recorded in the lock.
 
+### Source credentials
+
+Source URLs must not embed password/token userinfo. Bare usernames such as
+`https://user@host/repo.git` are allowed for credential-helper account selection,
+but known token prefixes (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`,
+`glpat-`) and token usernames (`oauth2`, `x-access-token`, `x-token-auth`) are
+rejected. Query strings and fragments are unsupported and rejected: source path
+derivation and generated shell commands do not handle these suffixes safely.
 ### Sidecars in host mode
 
 `cook install` supports recipes with sidecar `services` and
@@ -114,7 +122,8 @@ components and connectome-host itself — to its current commit SHA via
 `git ls-remote` at cook time. The SHA is baked into clone/checkout steps
 (and the `CH_REF` build-arg default) and recorded in `connectome.lock`,
 so rebuilding later reproduces the exact trees. Unresolvable refs (offline,
-private repos) warn and stay symbolic.
+private repos) fail before any files are written or clones/builds start. Private
+`authSecret` sources need an explicit commit SHA when pinning.
 
 ### Templates
 
@@ -130,7 +139,7 @@ private repos) warn and stay symbolic.
 --image-name <name>    Override the generated image name
 --no-prompts           Non-interactive; warn-and-continue on missing values
 --env-file <path>      Read variable values from this file before prompting
---pin-refs             Resolve branch refs to current SHAs (Phase 4 — TODO)
+--pin-refs             Resolve branch refs to current SHAs; fail if unresolved
 ```
 
 ### Anthropic credentials
