@@ -227,3 +227,5 @@ For now this lives in @Tengro's namespace. Once the CLI is meaningfully battle-t
 ## License
 
 Apache 2.0. See [LICENSE](./LICENSE).
+
+Host installs: [static systemd user-unit export](docs/host-user-unit.md).
