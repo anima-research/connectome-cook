@@ -1,3 +1,4 @@
+import { applyHostDependencies, parseHostDependencies, preflightHostDependencies, type LockedHostDependency } from '../host-dependency.js';
 /**
  * Host backend — materializes an InstallPlan directly onto the operator's
  * machine instead of into a docker image. This is the "link against the
@@ -61,6 +62,8 @@ import {
 import type { BuildResult } from './docker.js';
 
 export interface HostBackendOptions {
+  /** Repeatable name=absolute-archive#sha256=hex inputs. */
+  hostDependencies?: string[];
   /** Install root. Default: ~/.connectome/installs/<slug>. */
   installDir: string;
   /** Non-interactive mode (no prompts at all). */
@@ -272,7 +275,7 @@ function cloneUrlFor(action: CloneAction, values: Record<string, string>): strin
 
 /** Execute one clone+build action. Throws on failure; the caller removes
  *  the target on failure so no half-built checkout survives. */
-function executeClone(action: CloneAction, values: Record<string, string>): { commit?: string } {
+function executeClone(action: CloneAction, values: Record<string, string>, dependencies?: LockedHostDependency[]): { commit?: string } {
   rmSync(action.target, { recursive: true, force: true });
   mkdirSync(resolve(action.target, '..'), { recursive: true });
 
@@ -323,6 +326,7 @@ function executeClone(action: CloneAction, values: Record<string, string>): { co
     // Non-fatal — lock entry just omits the commit.
   }
 
+  if (dependencies?.length) applyHostDependencies(action.target, dependencies);
   if (action.buildCommand) {
     log.step(`building ${log.dim(action.target)}: ${action.buildCommand}`);
     execSync(action.buildCommand, {
@@ -452,11 +456,16 @@ export async function runHostBackend(
   options: HostBackendOptions,
 ): Promise<BuildResult> {
   const installDir = options.installDir;
+  const dependencyInputs = parseHostDependencies(options.hostDependencies);
   // Preflight every source before previewing URLs or making any changes.
   assertCredentialFreeSourceUrl(options.chRepoUrl, '--ch-repo');
   for (const source of plan.sources) {
     assertCredentialFreeSourceUrl(source.url, `${sourceLocation(source)}.url`);
   }
+  const dependencies = dependencyInputs.length ? preflightHostDependencies(options.chRepoUrl, options.chCommit ?? options.chRef, dependencyInputs) : undefined;
+  if (dependencies) options = { ...options, chCommit: dependencies.commit };
+  let keepSnapshots = false;
+  try {
   const parent = plan.parentWalk.recipe;
   const hasSidecars = (parent.services ?? []).length > 0;
 
@@ -509,14 +518,14 @@ export async function runHostBackend(
   let chCommit: string | undefined;
   for (const action of actions.clones) {
     let commit: string | undefined;
-    if (isSatisfiedByLock(action, existingLock)) {
+    if (!(action.role === 'connectome-host' && (dependencies || existingLock?.hostDependencies?.length)) && isSatisfiedByLock(action, existingLock)) {
       log.info(`unchanged ${log.dim(action.key)} — kept (${log.dim(action.target)})`);
       commit = action.role === 'connectome-host'
         ? existingLock!.connectomeHost.commit
         : existingLock!.components.find((c) => c.key === action.key)?.commit;
     } else {
       try {
-        commit = executeClone(action, plan.values).commit;
+        commit = executeClone(action, plan.values, action.role === 'connectome-host' ? dependencies?.records : undefined).commit;
       } catch (err) {
         log.error(
           `install of ${action.key} failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -713,6 +722,7 @@ export async function runHostBackend(
     const lock: Lockfile = {
       version: 1,
       backend: 'host',
+      ...(dependencies ? { hostDependencies: dependencies.records } : {}),
       recipePath: plan.recipePath,
       createdAt: new Date().toISOString(),
       connectomeHost: {
@@ -744,5 +754,7 @@ export async function runHostBackend(
   log.success(`host install complete → ${installDir}`);
   log.info('');
   log.info(`Next: ${log.bold(`${join(installDir, 'run.sh')}`)}`);
+  keepSnapshots = true;
   return { exitCode: 0, outDir: installDir };
+  } finally { if (!keepSnapshots) dependencies?.cleanup(); }
 }

@@ -41,6 +41,8 @@ export interface LockedRequirement {
 
 export interface Lockfile {
   version: 1;
+  /** Hash-pinned local inputs and explicit pre-install package.json edits. */
+  hostDependencies?: import('./host-dependency.js').LockedHostDependency[];
   /** Which backend materialized this directory. */
   backend: 'docker' | 'host';
   /** The recipe path/URL the operator named at resolve time. */

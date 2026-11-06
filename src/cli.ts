@@ -175,6 +175,7 @@ ${log.bold('Flags:')}
                          references render as empty (default: refuse)
   --env-file <path>      Read variable values from this file before prompting
   --ch-repo <url>        connectome-host repo (default: ${DEFAULT_CH_REPO_URL})
+  --host-dependency <name>=<abs-path>#sha256=<hex> Repeatable local archive input
   --ch-ref <ref>         connectome-host ref (default: ${DEFAULT_CH_REF})
   --help, -h             Show this message
 `;
@@ -182,7 +183,7 @@ ${log.bold('Flags:')}
 async function handleInstall(argv: string[]): Promise<number> {
   const flags = mri(argv, {
     boolean: ['help', 'strict', 'yes', 'pin-refs', 'allow-incomplete-templates'],
-    string: ['out', 'env-file', 'ch-repo', 'ch-ref'],
+    string: ['out', 'env-file', 'ch-repo', 'ch-ref', 'host-dependency'],
     alias: { h: 'help' },
   });
 
@@ -231,6 +232,7 @@ async function handleInstall(argv: string[]): Promise<number> {
   );
   const result = await runHostBackend(planResult.plan, {
     installDir,
+    hostDependencies: flags['host-dependency'],
     noPrompts: flags.prompts === false,
     yes: !!flags.yes,
     chRepoUrl,
