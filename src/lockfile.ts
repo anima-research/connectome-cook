@@ -41,6 +41,8 @@ export interface LockedRequirement {
 
 export interface Lockfile {
   version: 1;
+  /** Operator-selected engines, validated against the acquired host. */
+  engines?: import('./host-engines.js').HostEngines;
   /** Which backend materialized this directory. */
   backend: 'docker' | 'host';
   /** The recipe path/URL the operator named at resolve time. */
@@ -54,7 +56,7 @@ export interface Lockfile {
   localExtensions: Array<{ name: string; hostDir: string; path: string }>;
   requirements: LockedRequirement[];
   /** Backend-specific launch hint: compose dir (docker) or launcher path (host). */
-  launch: { kind: 'compose'; dir: string } | { kind: 'script'; script: string };
+  launch: { kind: 'compose'; dir: string } | { kind: 'script'; script: string; userUnit?: string };
 }
 
 export function writeLockfile(dir: string, lock: Lockfile): void {

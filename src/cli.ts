@@ -21,6 +21,7 @@ import {
   DEFAULT_CH_REPO_URL,
   runHostBackend,
 } from './backends/host.js';
+import { renderUserUnit, validateUserUnit } from './host-unit.js';
 import { pinSources, resolveRemoteRef } from './pin-refs.js';
 import { listTemplates, scaffoldRecipe, type TemplateName } from './init.js';
 
@@ -175,6 +176,9 @@ ${log.bold('Flags:')}
                          references render as empty (default: refuse)
   --env-file <path>      Read variable values from this file before prompting
   --ch-repo <url>        connectome-host repo (default: ${DEFAULT_CH_REPO_URL})
+  --user-unit <name.service> Export a user unit only (requires selected engines)
+  --bun-path <absolute>  Validate host engines (requires --node-path)
+  --node-path <absolute> Select Node for host stdio consumers
   --ch-ref <ref>         connectome-host ref (default: ${DEFAULT_CH_REF})
   --help, -h             Show this message
 `;
@@ -182,7 +186,7 @@ ${log.bold('Flags:')}
 async function handleInstall(argv: string[]): Promise<number> {
   const flags = mri(argv, {
     boolean: ['help', 'strict', 'yes', 'pin-refs', 'allow-incomplete-templates'],
-    string: ['out', 'env-file', 'ch-repo', 'ch-ref'],
+    string: ['out', 'env-file', 'ch-repo', 'ch-ref', 'bun-path', 'node-path', 'user-unit'],
     alias: { h: 'help' },
   });
 
@@ -196,6 +200,17 @@ async function handleInstall(argv: string[]): Promise<number> {
     log.error('install: missing recipe path');
     process.stderr.write(`\n${INSTALL_USAGE}`);
     return 1;
+  }
+
+  // Refuse unit options before recipe resolution can fetch or prompt.
+  if (flags['user-unit'] !== undefined) {
+    validateUserUnit(flags['user-unit']);
+    if (!flags['bun-path'] || !flags['node-path']) {
+      throw new Error('E_HOST_UNIT: --user-unit requires both --bun-path and --node-path');
+    }
+    // Explicit output paths are known before recipe resolution can prompt.
+    // The default is slug-derived and is validated by the host backend.
+    if (flags.out !== undefined) renderUserUnit(resolve(flags.out));
   }
 
   const planResult = await resolvePlan(recipePath, {
@@ -215,13 +230,16 @@ async function handleInstall(argv: string[]): Promise<number> {
   if (flags['pin-refs']) {
     log.step('pinning refs (git ls-remote)');
     pinSources(planResult.plan.sources);
-    const chLocation = `connectome-host (${chRepoUrl})`;
-    const chSha = resolveRemoteRef(chRepoUrl, chRef, false, chLocation);
-    if (chSha) {
-      chCommit = chSha;
-      log.info(`--pin-refs: ${chLocation}@${chRef} → ${chSha.slice(0, 12)}`);
-    } else {
-      throw new Error(`--pin-refs: ${chLocation}: ref not found: ${chRef}; no output written.`);
+    // Engine preflight fetches and binds the host itself; avoid ls-remote too.
+    if (flags['bun-path'] === undefined && flags['node-path'] === undefined) {
+      const chLocation = `connectome-host (${chRepoUrl})`;
+      const chSha = resolveRemoteRef(chRepoUrl, chRef, false, chLocation);
+      if (chSha) {
+        chCommit = chSha;
+        log.info(`--pin-refs: ${chLocation}@${chRef} → ${chSha.slice(0, 12)}`);
+      } else {
+        throw new Error(`--pin-refs: ${chLocation}: ref not found: ${chRef}; no output written.`);
+      }
     }
   }
 
@@ -231,6 +249,9 @@ async function handleInstall(argv: string[]): Promise<number> {
   );
   const result = await runHostBackend(planResult.plan, {
     installDir,
+    userUnit: flags['user-unit'],
+    bunPath: flags['bun-path'],
+    nodePath: flags['node-path'],
     noPrompts: flags.prompts === false,
     yes: !!flags.yes,
     chRepoUrl,
