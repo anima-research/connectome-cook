@@ -21,6 +21,7 @@ import {
   DEFAULT_CH_REPO_URL,
   runHostBackend,
 } from './backends/host.js';
+import { validateUserUnit } from './host-unit.js';
 import { pinSources, resolveRemoteRef } from './pin-refs.js';
 import { listTemplates, scaffoldRecipe, type TemplateName } from './init.js';
 
@@ -199,6 +200,14 @@ async function handleInstall(argv: string[]): Promise<number> {
     log.error('install: missing recipe path');
     process.stderr.write(`\n${INSTALL_USAGE}`);
     return 1;
+  }
+
+  // Refuse unit options before recipe resolution can fetch or prompt.
+  if (flags['user-unit'] !== undefined) {
+    validateUserUnit(flags['user-unit']);
+    if (!flags['bun-path'] || !flags['node-path']) {
+      throw new Error('E_HOST_UNIT: --user-unit requires both --bun-path and --node-path');
+    }
   }
 
   const planResult = await resolvePlan(recipePath, {

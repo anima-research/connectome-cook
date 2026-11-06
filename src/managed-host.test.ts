@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { checkEngine, preflightHostEngines } from './host-engines.js';
@@ -67,7 +67,7 @@ test('CLI exports a headless private journal user unit without service calls', (
   expect(result.status).toBe(0);
   const unit = readFileSync(join(out, 'example.service'), 'utf8');
   expect(unit).toContain('ExecStart=/bin/bash "' + join(out, 'run.sh') + '" --headless');
-  expect(unit).toContain('WorkingDirectory="' + out + '"');
+  expect(unit).toContain('WorkingDirectory=' + out);
   for (const required of ['Restart=on-failure', 'UMask=0077', 'StandardOutput=journal', 'StandardError=journal']) expect(unit).toContain(required);
   const lock = JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8'));
   expect(lock.launch.userUnit).toBe(join(out, 'example.service'));
@@ -78,4 +78,58 @@ test('unit export refuses unsafe names and missing selected engines without mate
     expect(install(['--bun-path', bun, '--node-path', node, '--user-unit', name]).status).not.toBe(0);
     expect(existsSync(out)).toBe(false);
   }
+});
+
+
+test('R1-3/R1-6: invalid unit options fail before recipe loading or engine fetch', () => {
+  rmSync(recipe);
+  for (const extra of [
+    ['--user-unit', 'example.service'],
+    ['--bun-path', bun, '--node-path', node, '--user-unit', 'a'.repeat(248) + '.service'],
+  ]) {
+    const result = install(extra);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('E_HOST_UNIT');
+    expect(result.stderr).not.toContain('ENOENT');
+    expect(existsSync(out)).toBe(false);
+  }
+  const missing = install(['--user-unit', 'example.service']);
+  expect(missing.stderr).toContain('--bun-path');
+  expect(missing.stderr).toContain('--node-path');
+});
+
+test('R1-2: CLI launcher binds env-node scripts via private engine PATH without importing engine siblings', () => {
+  const tools = join(dir, 'tools'); mkdirSync(tools);
+  const unselected = join(dir, 'unselected'); mkdirSync(unselected);
+  // A non-literal stdio command found on the inherited PATH.
+  writeFileSync(join(tools, 'npx'), '#!/usr/bin/env node\n', { mode: 0o755 });
+  // Sibling executables of selected engines must not be imported into PATH.
+  writeFileSync(join(dir, 'npx'), '#!/bin/sh\necho WRONG_SIBLING\n', { mode: 0o755 });
+  writeFileSync(join(unselected, 'node'), '#!/bin/sh\necho WRONG_NODE\n', { mode: 0o755 });
+  writeFileSync(node, '#!/bin/sh\nif [ "$1" = --version ]; then echo v22.23.3; else echo SELECTED_NODE; fi\n');
+  writeFileSync(bun, '#!/bin/sh\nif [ "$1" = --version ]; then echo 1.4.4; elif [ "$1" = src/index.ts ]; then exec npx; fi\n');
+  writeFileSync(recipe, JSON.stringify({ name: 'Fixture', agent: { systemPrompt: 'Test' }, mcpServers: { local: { command: 'npx', args: [] } } }));
+  expect(install(['--bun-path', bun, '--node-path', node, '--user-unit', 'example.service']).status).toBe(0);
+  const config = JSON.parse(readFileSync(join(out, 'recipes/recipe.json'), 'utf8'));
+  expect(config.mcpServers.local.command).toBe('npx');
+  const result = spawnSync('/bin/bash', [join(out, 'run.sh'), '--headless'], {
+    encoding: 'utf8', env: { PATH: tools + ':' + unselected + ':/usr/bin:/bin' },
+  });
+  expect(result.status).toBe(0);
+  expect(result.stdout.trim()).toBe('SELECTED_NODE');
+});
+
+test('R1 nits: repeated CLI export restores mode 0600 and retains differently named units', () => {
+  const args = ['--bun-path', bun, '--node-path', node, '--user-unit', 'example.service'];
+  expect(install(args).status).toBe(0);
+  const unit = join(out, 'example.service');
+  expect(statSync(unit).mode & 0o777).toBe(0o600);
+  chmodSync(unit, 0o644);
+  expect(install(args).status).toBe(0);
+  expect(statSync(unit).mode & 0o777).toBe(0o600);
+  args[args.length - 1] = 'renamed.service';
+  expect(install(args).status).toBe(0);
+  expect(existsSync(unit)).toBe(true);
+  const lock = JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8'));
+  expect(lock.launch.userUnit).toBe(join(out, 'renamed.service'));
 });
