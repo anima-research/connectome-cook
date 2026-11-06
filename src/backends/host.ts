@@ -58,11 +58,14 @@ import {
   type Lockfile,
   type LockedComponent,
 } from '../lockfile.js';
+import { renderUserUnit, validateUserUnit } from '../host-unit.js';
 import type { HostEngines, HostEnginePreflight } from '../host-engines.js';
 import type { BuildResult } from './docker.js';
 
 export interface HostBackendOptions {
   /** Both absolute paths opt into fail-closed host engine validation. */
+  /** Export a static user unit under the installation; never install/start it. */
+  userUnit?: string;
   bunPath?: string;
   /** Absolute Node path, required together with bunPath. */
   nodePath?: string;
@@ -482,6 +485,11 @@ export async function runHostBackend(
   for (const source of plan.sources) {
     assertCredentialFreeSourceUrl(source.url, `${sourceLocation(source)}.url`);
   }
+  if (options.userUnit !== undefined) {
+    if (!options.bunPath || !options.nodePath) throw new Error('E_HOST_UNIT: legacy selected engines required');
+    validateUserUnit(options.userUnit);
+    renderUserUnit(options.installDir);
+  }
   let checked: HostEnginePreflight | undefined;
   if (options.bunPath !== undefined || options.nodePath !== undefined) {
     if (!options.bunPath || !options.nodePath) throw new Error('E_HOST_ENGINE_PATH: both --bun-path and --node-path are required');
@@ -501,6 +509,7 @@ async function materializeHost(
 ): Promise<BuildResult> {
   const installDir = options.installDir;
   const engines = checked?.engines;
+  const userUnit = options.userUnit !== undefined ? renderUserUnit(installDir) : undefined;
   const buildEnv = { ...process.env };
   const parent = plan.parentWalk.recipe;
   const hasSidecars = (parent.services ?? []).length > 0;
@@ -773,6 +782,8 @@ async function materializeHost(
       { mode: 0o755 },
     );
 
+    if (userUnit !== undefined) writeFileSync(join(installDir, options.userUnit!), userUnit, { mode: 0o600 });
+
     const lock: Lockfile = {
       version: 1,
       backend: 'host',
@@ -797,7 +808,7 @@ async function materializeHost(
         origin: r.origin,
         ...(r.value !== undefined ? { value: r.value } : {}),
       })),
-      launch: { kind: 'script', script: join(installDir, 'run.sh') },
+      launch: { kind: 'script', script: join(installDir, 'run.sh'), ...(userUnit !== undefined ? { userUnit: join(installDir, options.userUnit!) } : {}) },
     };
     writeLockfile(installDir, lock);
   } catch (err) {
