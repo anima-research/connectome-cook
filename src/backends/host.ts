@@ -58,9 +58,13 @@ import {
   type Lockfile,
   type LockedComponent,
 } from '../lockfile.js';
+import { preflightHostEngines, type HostEngines } from '../host-engines.js';
 import type { BuildResult } from './docker.js';
 
 export interface HostBackendOptions {
+  /** Both absolute paths opt into fail-closed host engine validation. */
+  bunPath?: string;
+  nodePath?: string;
   /** Install root. Default: ~/.connectome/installs/<slug>. */
   installDir: string;
   /** Non-interactive mode (no prompts at all). */
@@ -272,7 +276,7 @@ function cloneUrlFor(action: CloneAction, values: Record<string, string>): strin
 
 /** Execute one clone+build action. Throws on failure; the caller removes
  *  the target on failure so no half-built checkout survives. */
-function executeClone(action: CloneAction, values: Record<string, string>): { commit?: string } {
+function executeClone(action: CloneAction, values: Record<string, string>, buildEnv: NodeJS.ProcessEnv): { commit?: string } {
   rmSync(action.target, { recursive: true, force: true });
   mkdirSync(resolve(action.target, '..'), { recursive: true });
 
@@ -328,7 +332,7 @@ function executeClone(action: CloneAction, values: Record<string, string>): { co
     execSync(action.buildCommand, {
       cwd: action.target,
       stdio: ['ignore', 'inherit', 'inherit'],
-      env: process.env,
+      env: buildEnv,
     });
   }
   return { ...(commit !== undefined ? { commit } : {}) };
@@ -395,7 +399,7 @@ export interface LauncherEnvsubst {
 
 export function renderLauncher(
   parentRecipeBasename: string,
-  opts: { hasSidecars: boolean; envsubstFiles: LauncherEnvsubst[] },
+  opts: { hasSidecars: boolean; envsubstFiles: LauncherEnvsubst[]; engines?: HostEngines },
 ): string {
   const lines = [
     '#!/usr/bin/env bash',
@@ -440,7 +444,7 @@ export function renderLauncher(
     'export DATA_DIR="${DATA_DIR:-$PWD/data}"',
     'mkdir -p "$DATA_DIR"',
     'cd app',
-    `exec bun src/index.ts "../recipes/${parentRecipeBasename}" "$@"`,
+    `exec ${opts.engines ? shellQuote(opts.engines.bun.path) : "bun"} src/index.ts "../recipes/${parentRecipeBasename}" "$@"`,
     '',
   );
   return lines.join('\n');
@@ -457,6 +461,15 @@ export async function runHostBackend(
   for (const source of plan.sources) {
     assertCredentialFreeSourceUrl(source.url, `${sourceLocation(source)}.url`);
   }
+  let engines: HostEngines | undefined;
+  if (options.bunPath !== undefined || options.nodePath !== undefined) {
+    if (!options.bunPath || !options.nodePath) throw new Error('E_HOST_ENGINE: both paths are required for legacy installs');
+    const checked = preflightHostEngines(options.chRepoUrl, options.chCommit ?? options.chRef, options.bunPath, options.nodePath);
+    engines = checked.engines;
+    options = { ...options, chCommit: checked.commit };
+  }
+  const buildEnv = { ...process.env };
+  if (engines) buildEnv.PATH = dirname(engines.bun.path) + ':' + dirname(engines.node.path) + ':' + (buildEnv.PATH ?? '');
   const parent = plan.parentWalk.recipe;
   const hasSidecars = (parent.services ?? []).length > 0;
 
@@ -474,12 +487,15 @@ export async function runHostBackend(
   }
 
   const actions = planHostActions(plan, options);
+  if (engines) actions.clones[0]!.buildCommand = shellQuote(engines.bun.path) + ' install';
   let existingLock: Lockfile | null = null;
   try {
     existingLock = readLockfile(installDir);
   } catch (err) {
     log.warn(`existing ${LOCKFILE_NAME} unreadable (${err instanceof Error ? err.message : String(err)}) — treating as fresh install`);
   }
+
+  if (engines && JSON.stringify(existingLock?.engines) !== JSON.stringify(engines)) existingLock = null;
 
   // ---- Confirm gate: commands run on the operator's machine. ----
   process.stdout.write(renderActionPreview(actions, options) + '\n\n');
@@ -516,7 +532,7 @@ export async function runHostBackend(
         : existingLock!.components.find((c) => c.key === action.key)?.commit;
     } else {
       try {
-        commit = executeClone(action, plan.values).commit;
+        commit = executeClone(action, plan.values, buildEnv).commit;
       } catch (err) {
         log.error(
           `install of ${action.key} failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -604,6 +620,10 @@ export async function runHostBackend(
   try {
     for (const walk of plan.walks) {
       const configuration = lowerToConfiguration(walk.recipe, overlays.get(walk.path), walk.path);
+      if (engines) for (const server of Object.values(configuration.mcpServers ?? {})) {
+        if (server.command === 'node') server.command = engines.node.path;
+        if (server.command === 'bun') server.command = engines.bun.path;
+      }
       writeFileSync(
         join(installDir, 'recipes', recipeFilename(walk.path)),
         JSON.stringify(configuration, null, 2) + '\n',
@@ -706,13 +726,14 @@ export async function runHostBackend(
     }
     writeFileSync(
       join(installDir, 'run.sh'),
-      renderLauncher(parentRecipeBasename, { hasSidecars, envsubstFiles }),
+      renderLauncher(parentRecipeBasename, { hasSidecars, envsubstFiles, engines }),
       { mode: 0o755 },
     );
 
     const lock: Lockfile = {
       version: 1,
       backend: 'host',
+      ...(engines ? { engines } : {}),
       recipePath: plan.recipePath,
       createdAt: new Date().toISOString(),
       connectomeHost: {
