@@ -33,7 +33,7 @@
  */
 
 import { execFileSync, execSync } from 'node:child_process';
-import { chmodSync, cpSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, lstatSync, readFileSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
 import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
@@ -243,7 +243,14 @@ export function renderActionPreview(actions: HostActions, options: HostBackendOp
     }
   }
   lines.push('');
-  lines.push(`Also writes: recipes/, .env, run.sh, ${LOCKFILE_NAME} under the install dir.`);
+  if (options.layout) {
+    const c = options.layout;
+    lines.push(`Also writes: ${join(c.config, 'recipes')}/, ${join(c.config, '.env')}`);
+    lines.push(`Runtime controls: ${['run.sh', LOCKFILE_NAME, 'bunfig.toml', '.cook-layout.json', ...(options.userUnit ? [options.userUnit] : [])].map(name => join(c.runtime, name)).join(', ')}`);
+    lines.push(`Host CWD / DATA_DIR: ${c.state}`);
+    lines.push(`Reserved workspace (WORKSPACE_DIR; no host consumer yet): ${c.workspace}`);
+    lines.push(`Reserved credentials (no consumer yet): ${c.credentials}`);
+  } else lines.push(`Also writes: recipes/, .env, run.sh, ${LOCKFILE_NAME} under the install dir.`);
   return lines.join('\n');
 }
 
@@ -485,8 +492,8 @@ export function renderLauncher(
     lines.push('umask 077',
       'export DATA_DIR=' + shellQuote(opts.layout.state),
       'export WORKSPACE_DIR=' + shellQuote(opts.layout.workspace),
-      'cd ' + shellQuote(opts.layout.workspace),
-      'exec ' + shellQuote(opts.engines!.bun.path) + ' ' + shellQuote(join(opts.layout.runtime, 'app/src/index.ts')) + ' ' + shellQuote(join(opts.layout.config, 'recipes', parentRecipeBasename)) + ' "$@"', '');
+      'cd ' + shellQuote(opts.layout.state),
+      'exec ' + shellQuote(opts.engines!.bun.path) + ' --no-env-file --config=' + shellQuote(join(opts.layout.runtime, 'bunfig.toml')) + ' ' + shellQuote(join(opts.layout.runtime, 'app/src/index.ts')) + ' ' + shellQuote(join(opts.layout.config, 'recipes', parentRecipeBasename)) + ' "$@"', '');
   } else lines.push(
     '',
     'export DATA_DIR="${DATA_DIR:-$PWD/data}"',
@@ -498,6 +505,40 @@ export function renderLauncher(
   return lines.join('\n');
 }
 
+const LAYOUT_MARKER = '.cook-layout.json';
+function pathPresent(path: string): boolean {
+  try { lstatSync(path); return true; }
+  catch (err) { if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false; throw err; }
+}
+/** Markers survive older cooks overwriting the v1 lock and launcher. */
+function assertRecordedLayout(installDir: string, requested?: HostLayout): void {
+  const markerPath = join(installDir, LAYOUT_MARKER);
+  let recorded: unknown;
+  const marker = pathPresent(markerPath);
+  if (marker) {
+    try { recorded = JSON.parse(readFileSync(markerPath, 'utf8')); }
+    catch { throw new Error('E_HOST_LAYOUT: unreadable runtime layout marker; restore from backup, do not reconcile'); }
+    if (!recorded || canonical(recorded) !== canonical(requested)) throw new Error('E_HOST_LAYOUT: runtime marker requires the same --layout; use fresh roots for changes');
+  }
+  // Recognize original PR8 installs as well, before markers were introduced.
+  let signature = false;
+  if (pathPresent(join(installDir, 'run.sh'))) {
+    try {
+      const launcher = readFileSync(join(installDir, 'run.sh'), 'utf8');
+      signature = launcher.includes('export WORKSPACE_DIR=') && launcher.includes('export DATA_DIR=');
+    } catch { throw new Error('E_HOST_LAYOUT: unreadable runtime launcher; cannot determine recorded layout'); }
+  }
+  if (marker || signature) {
+    let lock: Lockfile | null;
+    try { lock = readLockfile(installDir); }
+    catch { throw new Error('E_HOST_LAYOUT: split installation lock unreadable; restore it before reconcile'); }
+    if (!lock?.layout || !requested || canonical(lock.layout) !== canonical(requested)
+      || (marker && canonical(lock.layout) !== canonical(recorded))) {
+      throw new Error('E_HOST_LAYOUT: split installation lock missing or changed (possibly by an older cook); restore before reconcile');
+    }
+  }
+}
+
 /** Materialize the plan onto the host. */
 export async function runHostBackend(
   plan: InstallPlan,
@@ -505,11 +546,14 @@ export async function runHostBackend(
 ): Promise<BuildResult> {
   const layout = options.layout === undefined ? undefined : hostLayout(options.layout, options.installDir);
   if (layout) {
-    if (!options.bunPath || !options.nodePath) throw new Error('E_HOST_LAYOUT: selected engines required');
+    if (!options.bunPath || !options.nodePath) throw new Error('E_HOST_LAYOUT: --layout requires both --bun-path and --node-path');
     if (plan.credentialFiles.length || (plan.parentWalk.recipe.services ?? []).length || plan.walks.some(w => (w.recipe.containerTemplateFiles ?? []).length)) throw new Error('E_HOST_LAYOUT: sidecars, legacy credential files and templates require the default layout');
     if (Object.hasOwn(plan.values, 'DATA_DIR') || Object.hasOwn(plan.values, 'WORKSPACE_DIR')) throw new Error('E_HOST_LAYOUT: layout owns runtime roots');
     validateLayoutConsumers(layout, plan.walks.map(w => w.recipe));
   }
+  // Preserve a validated layout throughout preflight/materialization.
+  options = { ...options, layout };
+  assertRecordedLayout(options.installDir, layout);
   // Preflight every source before previewing URLs or making any changes.
   assertCredentialFreeSourceUrl(options.chRepoUrl, '--ch-repo');
   for (const source of plan.sources) {
@@ -518,7 +562,7 @@ export async function runHostBackend(
   if (options.userUnit !== undefined) {
     if (!options.bunPath || !options.nodePath) throw new Error('E_HOST_UNIT: --user-unit requires both --bun-path and --node-path');
     validateUserUnit(options.userUnit);
-    renderUserUnit(options.installDir, layout?.workspace);
+    renderUserUnit(options.installDir, layout?.state);
   }
   let checked: HostEnginePreflight | undefined;
   if (options.bunPath !== undefined || options.nodePath !== undefined) {
@@ -545,7 +589,7 @@ async function materializeHost(
     else writeFileSync(path, content, opts);
   };
   const engines = checked?.engines;
-  const userUnit = options.userUnit !== undefined ? renderUserUnit(installDir, layout?.workspace) : undefined;
+  const userUnit = options.userUnit !== undefined ? renderUserUnit(installDir, layout?.state) : undefined;
   const buildEnv = { ...process.env };
   const parent = plan.parentWalk.recipe;
   const hasSidecars = (parent.services ?? []).length > 0;
@@ -567,7 +611,7 @@ async function materializeHost(
   const actions = planHostActions(plan, options);
   if (layout) for (const target of [...actions.clones.map(a => a.target), ...actions.copies.map(a => a.target)]) {
     const rel = relative(installDir, target);
-    if (!rel || rel.startsWith('..') || /^(?:run\.sh|connectome\.lock|\.cook)(?:\/|$)/.test(rel)) throw new Error('E_HOST_LAYOUT: code target escapes runtime root');
+    if (!rel || rel.startsWith('..') || /^(?:run\.sh|bunfig\.toml|connectome\.lock|\.cook-layout\.json|\.cook)(?:\/|$)/.test(rel)) throw new Error('E_HOST_LAYOUT: code target escapes runtime root');
   }
   if (engines) bindHostEngine(actions, engines.bun.path);
   let existingLock: Lockfile | null = null;
@@ -604,7 +648,12 @@ async function materializeHost(
     }
   }
 
-  if (layout) provisionLayout(layout);
+  if (layout) {
+    provisionLayout(layout);
+    // Write before builds: a partial installation must not become a default install.
+    writeOutput(join(installDir, LAYOUT_MARKER), JSON.stringify(layout, null, 2) + '\n');
+    writeOutput(join(installDir, 'bunfig.toml'), '# Runtime-owned: no preloads.\n');
+  }
   else {
     mkdirSync(installDir, { recursive: true });
     mkdirSync(join(installDir, 'recipes'), { recursive: true });
