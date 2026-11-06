@@ -371,3 +371,20 @@ test('R2-3: --ch-ref abbreviated commit failure explains the full-ID requirement
   expect(result.stdout + result.stderr).toContain('--pin-refs needs the full 40-hex ID (git rev-parse deadbee)');
   expect(existsSync(join(dir, 'out'))).toBe(false);
 });
+
+for (const [command, customRepo] of [['build', false], ['install', false], ['install', true]] as const) {
+  for (const failure of ['remote', 'ref']) {
+    test(`R2-5: ${command} ${customRepo ? 'custom' : 'default'} host ${failure} error uses the repository label`, () => {
+      const url = customRepo ? 'https://example.invalid/host.git'
+        : 'https://github.com/anima-research/connectome-host.git';
+      if (failure === 'remote') env.FAKE_MISSING_URL = url;
+      else env.FAKE_EMPTY_URL = url;
+      const result = run(command, undefined, ['--pin-refs', ...(customRepo ? ['--ch-repo', url] : [])]);
+      expect(result.status).not.toBe(0);
+      expect(result.stdout + result.stderr).toContain(`connectome-host (${url}):`);
+      expect(result.stdout + result.stderr).not.toContain('--ch-repo (connectome-host)');
+      expect(result.stdout + result.stderr).not.toContain('ref not found: connectome-host@');
+      expect(existsSync(join(dir, 'out'))).toBe(false);
+    });
+  }
+}

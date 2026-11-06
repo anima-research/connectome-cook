@@ -126,12 +126,13 @@ async function runBuildPipeline(argv: string[]): Promise<BuildResult> {
   if (flags['pin-refs']) {
     log.step('pinning refs (git ls-remote)');
     pinSources(planResult.plan.sources);
-    const chSha = resolveRemoteRef(DEFAULT_CH_REPO_URL, DEFAULT_CH_REF, false, 'connectome-host');
+    const chLocation = `connectome-host (${DEFAULT_CH_REPO_URL})`;
+    const chSha = resolveRemoteRef(DEFAULT_CH_REPO_URL, DEFAULT_CH_REF, false, chLocation);
     if (chSha) {
       pinnedChRef = chSha;
-      log.info(`--pin-refs: connectome-host@${DEFAULT_CH_REF} → ${chSha.slice(0, 12)}`);
+      log.info(`--pin-refs: ${chLocation}@${DEFAULT_CH_REF} → ${chSha.slice(0, 12)}`);
     } else {
-      throw new Error(`--pin-refs: connectome-host: ref not found: connectome-host@${DEFAULT_CH_REF}; no output written.`);
+      throw new Error(`--pin-refs: ${chLocation}: ref not found: ${DEFAULT_CH_REF}; no output written.`);
     }
   }
 
@@ -214,12 +215,13 @@ async function handleInstall(argv: string[]): Promise<number> {
   if (flags['pin-refs']) {
     log.step('pinning refs (git ls-remote)');
     pinSources(planResult.plan.sources);
-    const chSha = resolveRemoteRef(chRepoUrl, chRef, false, '--ch-repo (connectome-host)');
+    const chLocation = `connectome-host (${chRepoUrl})`;
+    const chSha = resolveRemoteRef(chRepoUrl, chRef, false, chLocation);
     if (chSha) {
       chCommit = chSha;
-      log.info(`--pin-refs: connectome-host@${chRef} → ${chSha.slice(0, 12)}`);
+      log.info(`--pin-refs: ${chLocation}@${chRef} → ${chSha.slice(0, 12)}`);
     } else {
-      throw new Error(`--pin-refs: connectome-host: ref not found: connectome-host@${chRef}; no output written.`);
+      throw new Error(`--pin-refs: ${chLocation}: ref not found: ${chRef}; no output written.`);
     }
   }
 
