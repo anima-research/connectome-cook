@@ -334,3 +334,29 @@ for (const ref of ['b'.repeat(40), 'B'.repeat(40), 'c'.repeat(64)]) {
     expect(readFileSync(join(dir, 'out/connectome.lock'), 'utf-8')).toContain(ref);
   });
 }
+
+for (const url of [
+  'https://%20ghp_CANARY123@example.invalid/x.git',
+  'https:// ghp_CANARY123@example.invalid/x.git',
+  ...['\u00a0', '\u2028', '\ufeff'].map(space => `https://${space}ghp_CANARY123@example.invalid/x.git`),
+  'https://%C2%A0ghp_CANARY123@example.invalid/x.git',
+  '//ghp_CANARY123@example.invalid/x.git',
+  'https:/\\ghp_CANARY123@example.invalid/x.git',
+  'https:\\ghp_CANARY123@example.invalid/x.git',
+  '//example.invalid/x.git',
+]) {
+  test(`R2-1: URL-shaped or whitespace userinfo input is rejected: ${JSON.stringify(url)}`, () => {
+    expect(() => assertCredentialFreeSourceUrl(url, 'fixture source')).toThrow('fixture source');
+    try { assertCredentialFreeSourceUrl(url); } catch (err) {
+      expect(String(err)).not.toContain('CANARY123');
+    }
+  });
+}
+
+test('R2-1: cook build rejects encoded-space token canary without writing any output', () => {
+  const result = run('build', { url: 'https://%20ghp_CANARY123@example.invalid/x.git' });
+  expect(result.status).not.toBe(0);
+  expect(result.stdout + result.stderr).not.toContain('CANARY123');
+  expect(gitCalls()).toBe('');
+  expect(existsSync(join(dir, 'out'))).toBe(false);
+});

@@ -17,7 +17,7 @@ export function assertCredentialFreeSourceUrl(url: string, location = 'Source UR
     }
     const tokenPrefix = /^(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-)/i;
     const tokenUser = /^(?:oauth2|x-access-token|x-token-auth)$/i;
-    if (username.includes(':') || tokenPrefix.test(username) || tokenUser.test(username)) {
+    if (/\s/u.test(username) || username.includes(':') || tokenPrefix.test(username) || tokenUser.test(username)) {
       throw credentialError();
     }
   };
@@ -28,7 +28,8 @@ export function assertCredentialFreeSourceUrl(url: string, location = 'Source UR
   if (url.includes('?') || url.includes('#')) {
     throw new Error(`${location}: query strings and fragments are not supported in source URLs.`);
   }
-  if (!url.includes('://')) return; // Local paths and scp-style SSH addresses.
+  // URL-shaped spellings must parse or fail, never fall through as paths.
+  if (!/^(?:\/\/|[a-z][a-z0-9+.-]*:[/\\])/i.test(url)) return; // Local/scp paths.
   let parsed: URL;
   try {
     parsed = new URL(url);
