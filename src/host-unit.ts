@@ -2,7 +2,10 @@
 import { isAbsolute, join } from 'node:path';
 
 export function validateUserUnit(name: string): void {
-  if (typeof name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.-]*\.service$/.test(name)) throw new Error('E_HOST_UNIT: invalid user unit name');
+  if (typeof name !== 'string' || Buffer.byteLength(name, 'utf8') > 255
+    || !/^[A-Za-z0-9][A-Za-z0-9_.-]*\.service$/.test(name)) {
+    throw new Error('E_HOST_UNIT: invalid user unit name (max 255 bytes)');
+  }
 }
 function unitQuote(value: string, exec = false): string {
   if (!isAbsolute(value) || /[\0-\x1f\x7f]/.test(value)) throw new Error('E_HOST_UNIT: absolute control-free paths required');
@@ -11,13 +14,18 @@ function unitQuote(value: string, exec = false): string {
   return '"' + value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%') + '"';
 }
 export function renderUserUnit(installDir: string): string {
+  if (!isAbsolute(installDir) || /[\0-\x1f\x7f]/.test(installDir) || /\s$/.test(installDir)) {
+    throw new Error('E_HOST_UNIT: absolute control-free path without trailing whitespace required');
+  }
   return [
     '[Unit]',
     'Description=Connectome host',
+    'After=network-online.target',
     '',
     '[Service]',
     'Type=simple',
-    'WorkingDirectory=' + unitQuote(installDir),
+    // WorkingDirectory is not an Exec* command: quotes are literal.
+    'WorkingDirectory=' + installDir.replace(/%/g, '%%'),
     'ExecStart=/bin/bash ' + unitQuote(join(installDir, 'run.sh'), true) + ' --headless',
     'Restart=on-failure',
     'RestartSec=5s',

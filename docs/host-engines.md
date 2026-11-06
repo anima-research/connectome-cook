@@ -29,10 +29,13 @@ run.sh and lowered stdio commands named exactly node or bun use the operator's
 path, preserving multi-call shim dispatch. Build PATH prepends only the
 cook-owned `.cook-engines/bin` directory containing bun/node symlinks, not the
 engines' entire directories; unrelated executables keep their precedence.
+With selected engines, run.sh likewise prepends that private bin directory to
+the runtime PATH, after sourcing .env, for env-based node/bun shebangs.
 Empty inherited PATH segments are removed for selected-engine builds. The
 reserved `.cook-engines` directory is refreshed after confirmation and removed
 when returning to legacy engines. Git acquisition retains the operator's PATH.
-Arbitrary custom commands, npx, scripts' shebangs, and connector-specific
+Arbitrary custom commands and npx must themselves be available on the inherited
+runtime PATH (or named absolutely). Absolute shebangs and connector-specific
 runtime requirements are not rewritten or independently qualified. No engines
 are downloaded. Host build commands remain trusted operator-side code.
 

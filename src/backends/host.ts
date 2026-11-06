@@ -33,7 +33,7 @@
  */
 
 import { execFileSync, execSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
 import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
@@ -435,6 +435,11 @@ export function renderLauncher(
     '  set -a; . ./.env; set +a',
     'fi',
   ];
+  if (opts.engines) {
+    // Match selected-engine builds without importing unrelated engine siblings.
+    // PWD is the install root here; .env has already been sourced.
+    lines.push('export PATH="$PWD/.cook-engines/bin${PATH:+:$PATH}"');
+  }
   if (opts.hasSidecars) {
     lines.push(
       '',
@@ -486,7 +491,7 @@ export async function runHostBackend(
     assertCredentialFreeSourceUrl(source.url, `${sourceLocation(source)}.url`);
   }
   if (options.userUnit !== undefined) {
-    if (!options.bunPath || !options.nodePath) throw new Error('E_HOST_UNIT: legacy selected engines required');
+    if (!options.bunPath || !options.nodePath) throw new Error('E_HOST_UNIT: --user-unit requires both --bun-path and --node-path');
     validateUserUnit(options.userUnit);
     renderUserUnit(options.installDir);
   }
@@ -782,7 +787,12 @@ async function materializeHost(
       { mode: 0o755 },
     );
 
-    if (userUnit !== undefined) writeFileSync(join(installDir, options.userUnit!), userUnit, { mode: 0o600 });
+    if (userUnit !== undefined) {
+      const unitPath = join(installDir, options.userUnit!);
+      writeFileSync(unitPath, userUnit, { mode: 0o600 });
+      // writeFileSync's mode applies only to new files, not reconciled exports.
+      chmodSync(unitPath, 0o600);
+    }
 
     const lock: Lockfile = {
       version: 1,
