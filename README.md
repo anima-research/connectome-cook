@@ -229,3 +229,5 @@ Apache 2.0. See [LICENSE](./LICENSE).
 Host installs: [operator-selected engine preflight](docs/host-engines.md).
 
 Host installs: [static systemd user-unit export](docs/host-user-unit.md).
+
+Host installs: [opt-in split layout and manual handoff](docs/host-layout.md).
