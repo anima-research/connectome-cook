@@ -217,13 +217,16 @@ async function handleInstall(argv: string[]): Promise<number> {
   if (flags['pin-refs']) {
     log.step('pinning refs (git ls-remote)');
     pinSources(planResult.plan.sources);
-    const chLocation = `connectome-host (${chRepoUrl})`;
-    const chSha = resolveRemoteRef(chRepoUrl, chRef, false, chLocation);
-    if (chSha) {
-      chCommit = chSha;
-      log.info(`--pin-refs: ${chLocation}@${chRef} → ${chSha.slice(0, 12)}`);
-    } else {
-      throw new Error(`--pin-refs: ${chLocation}: ref not found: ${chRef}; no output written.`);
+    // Engine preflight fetches and binds the host itself; avoid ls-remote too.
+    if (flags['bun-path'] === undefined && flags['node-path'] === undefined) {
+      const chLocation = `connectome-host (${chRepoUrl})`;
+      const chSha = resolveRemoteRef(chRepoUrl, chRef, false, chLocation);
+      if (chSha) {
+        chCommit = chSha;
+        log.info(`--pin-refs: ${chLocation}@${chRef} → ${chSha.slice(0, 12)}`);
+      } else {
+        throw new Error(`--pin-refs: ${chLocation}: ref not found: ${chRef}; no output written.`);
+      }
     }
   }
 

@@ -26,6 +26,7 @@ function install(extra: string[] = []) {
 }
 test('engine preflight checks selected source, pins commit, and records absolute engines through CLI', () => {
   const checked = preflightHostEngines(repo, 'main', bun, node);
+  checked.cleanup();
   expect(checked.commit).toMatch(/^[a-f0-9]{40}$/);
   const result = install(['--bun-path', bun, '--node-path', node]);
   if (result.status) console.error(result.stdout, result.stderr);

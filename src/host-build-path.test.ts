@@ -1,19 +1,19 @@
 import { expect, test } from 'bun:test';
 import { hostBuildPath } from './host-engines.js';
 
-const engines = { bun: { path: '/opt/bun/bin/bun', version: '1.4.4' }, node: { path: '/opt/node/bin/node', version: '22.23.3' } };
+const bin = '/install/.cook-engines/bin';
 test('selected engine build PATH has no current-directory entry with no parent PATH', () => {
   const previous = process.env.PATH;
   try {
     delete process.env.PATH;
     expect(process.env.PATH).toBeUndefined();
-    expect(hostBuildPath(engines, process.env.PATH)).toBe('/opt/bun/bin:/opt/node/bin');
+    expect(hostBuildPath(bin, process.env.PATH)).toBe('/install/.cook-engines/bin');
   } finally {
     if (previous === undefined) delete process.env.PATH;
     else process.env.PATH = previous;
   }
 });
 test('selected engine build PATH filters all empty inherited segments', () => {
-  for (const parent of ['', ':', '::']) expect(hostBuildPath(engines, parent)).toBe('/opt/bun/bin:/opt/node/bin');
-  expect(hostBuildPath(engines, ':/usr/bin::/bin:')).toBe('/opt/bun/bin:/opt/node/bin:/usr/bin:/bin');
+  for (const parent of ['', ':', '::']) expect(hostBuildPath(bin, parent)).toBe('/install/.cook-engines/bin');
+  expect(hostBuildPath(bin, ':/usr/bin::/bin:')).toBe('/install/.cook-engines/bin:/usr/bin:/bin');
 });
