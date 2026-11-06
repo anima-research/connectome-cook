@@ -98,10 +98,14 @@ override, and exposes the answer as `$SPRING_HOME` — usable in recipe
 ### Source credentials
 
 Source URLs must not embed password/token userinfo. Bare usernames such as
-`https://user@host/repo.git` are allowed for credential-helper account selection,
-but known token prefixes (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`,
-`glpat-`) and token usernames (`oauth2`, `x-access-token`, `x-token-auth`) are
-rejected. Query strings and fragments are unsupported and rejected: source path
+`https://user-name.1@host/repo.git` are allowed for credential-helper account
+selection. After percent-decoding, usernames must be non-empty and contain only
+ASCII letters, digits, `.`, `_` and `-`. Any password component (even empty)
+is refused. Known token prefixes (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
+`github_pat_`, `glpat-`) are rejected anywhere in the decoded username, case-insensitively,
+as are token usernames (`oauth2`, `x-access-token`, `x-token-auth`).
+Protocol-relative (`//host/path`) spellings require an explicit scheme.
+Query strings and fragments are unsupported and rejected: source path
 derivation does not support these suffixes. This validation is not shell quoting
 and does not make generated Docker commands safe for arbitrary URLs or refs.
 Surrounding whitespace and ASCII control characters are also rejected. Unknown

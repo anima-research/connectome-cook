@@ -8,6 +8,9 @@ export function assertCredentialFreeSourceUrl(url: string, location = 'Source UR
   if (url !== url.trim() || /[\x00-\x1f\x7f]/.test(url)) {
     throw new Error(`${location}: source URLs must not contain surrounding whitespace or ASCII controls.`);
   }
+  if (url.startsWith('//')) {
+    throw new Error(`${location}: protocol-relative source URLs are not supported; use an explicit scheme.`);
+  }
   const checkUsername = (value: string) => {
     let username: string;
     try {
@@ -15,17 +18,25 @@ export function assertCredentialFreeSourceUrl(url: string, location = 'Source UR
     } catch {
       throw new Error(`${location}: invalid source URL; use a URL without embedded credentials.`);
     }
-    const tokenPrefix = /^(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-)/i;
+    const tokenPrefix = /(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-)/i;
     const tokenUser = /^(?:oauth2|x-access-token|x-token-auth)$/i;
-    // Reject invisible/format characters after decoding, before token matching.
-    // Default-ignorable characters include non-format marks such as U+034F.
-    if (/[\p{Cc}\p{Cf}\p{Z}\p{Default_Ignorable_Code_Point}\s]/u.test(username) || username.includes(':') || tokenPrefix.test(username) || tokenUser.test(username)) {
+    // A strict allowlist avoids Unicode normalization and invisible-character
+    // bypasses. Do not echo the rejected username: it may contain a secret.
+    if (!/^[A-Za-z0-9._-]+$/.test(username)) {
+      throw new Error(`${location}: embedded credentials are not allowed; username must be non-empty and contain only ASCII letters, digits, ".", "_" and "-" after percent-decoding.`);
+    }
+    if (tokenPrefix.test(username) || tokenUser.test(username)) {
       throw credentialError();
     }
   };
-  // Also cover local/scp-style forms that URL() cannot parse.
-  const userinfo = url.match(/^(?:[a-z][a-z0-9+.-]*:\/\/)?([^/?#]*)@/i)?.[1];
-  if (userinfo) checkUsername(userinfo);
+  // Also cover local/scp-style forms and slash/backslash spellings URL()
+  // normalizes. Inspect raw userinfo so empty usernames/passwords cannot vanish.
+  const userinfo = url.match(/^(?:[a-z][a-z0-9+.-]*:[/\\]+)?([^/?#]*)@/i)?.[1];
+  if (userinfo !== undefined) {
+    // A colon introduces a password component, including an empty password.
+    if (userinfo.includes(':')) throw credentialError();
+    checkUsername(userinfo);
+  }
   // Source path derivation does not support URL suffixes.
   if (url.includes('?') || url.includes('#')) {
     throw new Error(`${location}: query strings and fragments are not supported in source URLs.`);
@@ -39,9 +50,8 @@ export function assertCredentialFreeSourceUrl(url: string, location = 'Source UR
     // Never echo the rejected URL: it may contain a credential.
     throw new Error(`${location}: invalid source URL; use a URL without embedded credentials.`);
   }
-  checkUsername(parsed.username);
-  checkUsername(parsed.password);
   if (parsed.password) throw credentialError();
+  if (parsed.username) checkUsername(parsed.username);
 }
 
 /** Declaring location, without including potentially unvalidated URL contents. */

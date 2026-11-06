@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { assertCredentialFreeSourceUrl } from './source-url.js';
@@ -389,7 +389,7 @@ for (const [command, customRepo] of [['build', false], ['install', false], ['ins
   }
 }
 
-// Cover Cf and default-ignorable Mn characters, not just JavaScript whitespace.
+// Regressions for invisible characters, in literal and encoded userinfo.
 for (const char of ['\u200b', '\u200c', '\u200d', '\u2060', '\ufeff', '\u180e', '\u00ad', '\u034f', '\u0085', '\u2029', '\u3000']) {
   for (const spelling of [char, encodeURIComponent(char)]) {
     for (const part of ['username', 'password']) {
@@ -401,7 +401,7 @@ for (const char of ['\u200b', '\u200c', '\u200d', '\u2060', '\ufeff', '\u180e', 
   }
 }
 
-for (const url of ['git@host:org/repo.git', 'ssh://git@host:22/x', 'ssh://git@[::1]:22/x', 'https://user@[::1]/x', 'user@host:org/repo.git', 'user@', 'file:///tmp/repo', '/tmp/repo', './local repo', 'https://élève@host/x']) {
+for (const url of ['git@host:org/repo.git', 'ssh://git@host:22/x', 'ssh://git@[::1]:22/x', 'https://user@[::1]/x', 'user@host:org/repo.git', 'user@', 'file:///tmp/repo', '/tmp/repo', './local repo', 'https://user-name.1@host/x', 'https://host/x']) {
   test(`R2-1: legitimate source remains accepted: ${url}`, () => {
     expect(() => assertCredentialFreeSourceUrl(url)).not.toThrow();
   });
@@ -413,4 +413,39 @@ test('R2-1: cook build rejects encoded invisible token canary without any output
   expect(result.stdout + result.stderr).not.toContain('CANARY123');
   expect(gitCalls()).toBe('');
   expect(existsSync(join(dir, 'out'))).toBe(false);
+});
+
+// Production CLI probe: start with a real artifact bundle, then ensure rejected
+// URLs neither overwrite any artifact nor leave the canary in any output file.
+test('R3 production probe: all reviewed bypasses leave every generated file canary-free and unchanged', () => {
+  const out = join(dir, 'out');
+  const files = (path: string): string[] => readdirSync(path, { withFileTypes: true })
+    .flatMap(entry => entry.isDirectory() ? files(join(path, entry.name)) : [join(path, entry.name)]);
+  const control = run('build', { url: 'https://user-name.1@example.invalid/x.git' });
+  expect(control.status).toBe(0);
+  const before = new Map(files(out).map(path => [path, readFileSync(path, 'utf-8')]));
+  for (const name of ['Dockerfile', 'README.md', 'connectome.lock']) {
+    expect(before.has(join(out, name))).toBe(true);
+  }
+  expect([...before.keys()].some(path => path.includes('/recipes/'))).toBe(true);
+  const usernames = [
+    ...['\u200b', '\u200c', '\u200d', '\u180e', '\ufeff', '\u0301', '\u0300', '\u20dd', 'ｇ', ' ', '\t']
+      .flatMap(char => [char, encodeURIComponent(char)]).map(char => `${char}ghp_CANARY123`),
+    'user-GhP_CANARY123', 'user-%67hp_CANARY123', 'ｇｈｐ_CANARY123', '%25ghp_CANARY123',
+  ];
+  for (const extension of [false, true]) {
+    for (const username of usernames) {
+      const result = run('build', { url: `https://${username}@example.invalid/x.git` }, [], extension);
+      expect(result.stdout + result.stderr).not.toContain('CANARY123');
+      expect(files(out).sort()).toEqual([...before.keys()].sort());
+      for (const path of files(out)) {
+        const contents = readFileSync(path, 'utf-8');
+        expect(contents).not.toContain('CANARY123');
+        expect(contents).toBe(before.get(path)!);
+      }
+      expect(result.status).not.toBe(0);
+    }
+  }
+  expect(gitCalls()).toBe('');
+  console.log(`R3 production probe: ${usernames.length * 2} refused builds; ${before.size} files checked per build; no canary or writes`);
 });
