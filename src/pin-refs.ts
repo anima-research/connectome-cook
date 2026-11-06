@@ -36,19 +36,27 @@ export function resolveRemoteRef(
   assertCredentialFreeSourceUrl(url, location);
   if (looksLikeSha(ref)) return ref;
   for (const candidate of candidateRefNames(ref)) {
+    const args = [...(sslBypass ? ['-c', 'http.sslVerify=false'] : []), 'ls-remote', url, candidate];
     let output: string;
     try {
-      output = execFileSync('git', [...(sslBypass ? ['-c', 'http.sslVerify=false'] : []), 'ls-remote', url, candidate], {
+      output = execFileSync('git', args, {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 30_000,
       });
     } catch (err) {
       // Helper output and the execFileSync message may contain credentials.
-      // Report only the exit status, never stderr/stdout or the original error.
-      const status = (err as { status?: number }).status;
-      const outcome = typeof status === 'number' ? `exit ${status}` : 'did not complete';
-      throw new Error(`--pin-refs: ${location}: could not resolve ${url}@${ref}: remote unreachable or refused (git ls-remote ${outcome}); no output written.`);
+      // Report only spawn metadata, never stderr/stdout or the original error.
+      const { code, signal, status } = err as { code?: string; signal?: string; status?: number };
+      const outcome = code === 'ENOENT' ? 'git executable not found (ENOENT)'
+        : code === 'ETIMEDOUT' || signal ? 'git ls-remote timed out or was terminated'
+        : typeof status === 'number' ? `git ls-remote exit ${status}`
+        : 'git ls-remote could not start or complete';
+      // Quote argv for a POSIX shell so even local paths and unusual refs can be
+      // copied literally. The URL has already passed credential validation.
+      const command = ['git', ...args].map(arg => /^[a-z0-9_./:@=+-]+$/i.test(arg)
+        ? arg : "'" + arg.replaceAll("'", "'\\''") + "'").join(' ');
+      throw new Error(`--pin-refs: ${location}: could not resolve ${url}@${ref}: remote unreachable or refused (${outcome}); no output written. run \`${command}\` to see Git's diagnostics.`);
     }
     const sha = output.split('\n')[0]?.split('\t')[0]?.trim();
     if (sha && looksLikeSha(sha)) return sha;

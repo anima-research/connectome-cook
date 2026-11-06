@@ -57,6 +57,6 @@ for (const [name, payload, fd] of cases) {
   test(`pin failure omits all helper output: ${name}`, () => {
     const message = diagnostic(payload, fd);
     expect(message).not.toContain(CANARY);
-    expect(message).toBe('--pin-refs: fixture.source: could not resolve review://example.invalid/repo.git@main: remote unreachable or refused (git ls-remote exit 128); no output written.\n');
+    expect(message).toBe('--pin-refs: fixture.source: could not resolve review://example.invalid/repo.git@main: remote unreachable or refused (git ls-remote exit 128); no output written. run `git ls-remote review://example.invalid/repo.git refs/heads/main` to see Git\'s diagnostics.\n');
   });
 }
