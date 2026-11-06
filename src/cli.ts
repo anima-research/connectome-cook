@@ -21,7 +21,7 @@ import {
   DEFAULT_CH_REPO_URL,
   runHostBackend,
 } from './backends/host.js';
-import { validateUserUnit } from './host-unit.js';
+import { renderUserUnit, validateUserUnit } from './host-unit.js';
 import { pinSources, resolveRemoteRef } from './pin-refs.js';
 import { listTemplates, scaffoldRecipe, type TemplateName } from './init.js';
 
@@ -208,6 +208,9 @@ async function handleInstall(argv: string[]): Promise<number> {
     if (!flags['bun-path'] || !flags['node-path']) {
       throw new Error('E_HOST_UNIT: --user-unit requires both --bun-path and --node-path');
     }
+    // Explicit output paths are known before recipe resolution can prompt.
+    // The default is slug-derived and is validated by the host backend.
+    if (flags.out !== undefined) renderUserUnit(resolve(flags.out));
   }
 
   const planResult = await resolvePlan(recipePath, {

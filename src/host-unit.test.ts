@@ -14,7 +14,7 @@ test('R1-1: WorkingDirectory is bare with only percent escaped; ExecStart stays 
   expect(unit).not.toContain('Environment=');
 });
 test('R1-1: unit renderer refuses relative, control and trailing-whitespace paths', () => {
-  for (const path of ['relative', '/srv/a\nb', '/srv/a\0b', '/srv/a\tb', '/srv/a ', '/srv/a\u00a0']) {
+  for (const path of ['relative', '/srv/a\nb', '/srv/a\0b', '/srv/a\tb', '/srv/a\rb', '/srv/a\x7fb', ' /srv/a', '/srv/a ', '/srv/a\u00a0']) {
     expect(() => renderUserUnit(path)).toThrow('E_HOST_UNIT');
   }
 });
@@ -46,13 +46,31 @@ const skipReason = probe.error ? probe.error.message
 if (skipReason) console.warn('SKIP systemd parser tests: ' + skipReason);
 const parserTest = skipReason ? test.skip : test;
 parserTest('R1-1 parser: systemd-analyze --user verify accepts generated special paths' + (skipReason ? ' (skip: ' + skipReason + ')' : ''), () => {
-  const result = verify(renderUserUnit('/srv/example %h "quoted"\\root/$HOME'));
-  expect(result.stderr).not.toContain('WorkingDirectory=');
-  expect(result.status).toBe(0);
+  for (const path of ['/srv/ordinary', '/srv/space path', '/srv/percent %h', '/srv/unicode λ雪', '/srv/example %h "quoted"\\root/$HOME']) {
+    const result = verify(renderUserUnit(path));
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+  }
 });
 parserTest('R1-1 parser: systemd rejects quoted WorkingDirectory (negative control)' + (skipReason ? ' (skip: ' + skipReason + ')' : ''), () => {
   const unit = renderUserUnit('/srv/example').replace(/^WorkingDirectory=.*$/m, 'WorkingDirectory="/srv/example"');
   const result = verify(unit);
   expect(result.status).not.toBe(0);
   expect(result.stderr).toContain('WorkingDirectory= path is not absolute');
+});
+
+test('R2: unit renderer refuses terminal backslashes, including even runs', () => {
+  for (const count of [1, 2, 3]) {
+    expect(() => renderUserUnit('/srv/end' + '\\'.repeat(count)))
+      .toThrow('E_HOST_UNIT: installation path must not end in a backslash');
+  }
+});
+parserTest('R2 parser: terminal backslash consumes ExecStart (negative control)', () => {
+  const path = '/srv/end' + '\\';
+  // Bypass validation only to demonstrate why this input must be refused.
+  const unit = renderUserUnit('/srv/safe').replace('WorkingDirectory=/srv/safe', 'WorkingDirectory=' + path);
+  const result = verify(unit);
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain('Service has no ExecStart=');
+  expect(() => renderUserUnit(path)).toThrow('E_HOST_UNIT');
 });

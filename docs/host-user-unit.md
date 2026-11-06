@@ -18,7 +18,10 @@ PATH (or use an absolute command path). Those tools are not independently
 validated, and explicit absolute shebangs/engine paths are not rewritten.
 
 WorkingDirectory is the installation root, emitted as a bare path with only
-systemd's percent specifiers escaped. Paths ending in whitespace are refused.
+systemd's percent specifiers escaped. Unit export refuses paths containing
+ASCII control characters or ending in whitespace or a literal backslash (which can
+continue the line onto ExecStart); explicit `--out` paths are checked before
+recipe resolution, prompts or install writes. Quotes are not added.
 Restart is on-failure with a five-second delay; UMask is 0077. The unit orders
 after network-online.target but does not pull it in or prove network readiness.
 Output streams are connected to the journal, but connectome-host's --headless

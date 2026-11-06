@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { checkEngine, preflightHostEngines } from './host-engines.js';
@@ -132,4 +132,52 @@ test('R1 nits: repeated CLI export restores mode 0600 and retains differently na
   expect(existsSync(unit)).toBe(true);
   const lock = JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8'));
   expect(lock.launch.userUnit).toBe(join(out, 'renamed.service'));
+});
+
+test('R2 CLI: six-case path matrix preserves valid bare exports and refuses terminal backslash', () => {
+  // Like the renderer parser tests, establish parser availability independently.
+  const probe = join(dir, 'probe.service');
+  writeFileSync(probe, '[Service]\nExecStart=/bin/true\n');
+  const available = spawnSync('systemd-analyze', ['--user', 'verify', probe], { encoding: 'utf8' });
+  if (available.error || available.status !== 0) console.warn('SKIP CLI parser checks: ' + (available.error?.message ?? available.stderr));
+  for (const suffix of ['ordinary', 'space path', 'percent %h', 'unicode λ雪', 'install %h "quoted"\\path/$HOME', 'ends-in-backslash\\']) {
+    out = join(dir, suffix);
+    const result = install(['--bun-path', bun, '--node-path', node, '--user-unit', 'example.service']);
+    if (suffix.endsWith('\\')) {
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain('E_HOST_UNIT: installation path must not end in a backslash');
+      expect(existsSync(out)).toBe(false);
+      continue;
+    }
+    expect(result.status).toBe(0);
+    const file = join(out, 'example.service');
+    expect(readFileSync(file, 'utf8')).toContain('WorkingDirectory=' + out.replace(/%/g, '%%') + '\n');
+    if (!available.error && available.status === 0) {
+      const verified = spawnSync('systemd-analyze', ['--user', 'verify', file], { encoding: 'utf8' });
+      expect(verified.stderr).toBe('');
+      expect(verified.status).toBe(0);
+    }
+  }
+});
+
+test('R2 CLI: unsafe export paths fail before recipe loading, prompts or install writes', () => {
+  rmSync(recipe);
+  for (const suffix of ['end\\', 'end\\\\', 'end\\\\\\', 'new\nline', 'carriage\rreturn', 'trailing ']) {
+    out = join(dir, suffix);
+    for (const existing of [false, true]) {
+      if (existing) { mkdirSync(out); writeFileSync(join(out, 'sentinel'), 'unchanged'); }
+      const result = spawnSync(process.execPath, [resolve('bin/cook'), 'install', recipe, '--out', out,
+        '--ch-repo', repo, '--bun-path', bun, '--node-path', node, '--user-unit', 'example.service'],
+        { encoding: 'utf8', timeout: 5000 }); // Prompts enabled: validation must still be first.
+      expect(result.error).toBeUndefined();
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain('E_HOST_UNIT');
+      expect(result.stderr).not.toContain('ENOENT');
+      expect(result.stdout).not.toContain('Host install plan');
+      if (existing) {
+        expect(readdirSync(out)).toEqual(['sentinel']);
+        expect(readFileSync(join(out, 'sentinel'), 'utf8')).toBe('unchanged');
+      } else expect(existsSync(out)).toBe(false);
+    }
+  }
 });
