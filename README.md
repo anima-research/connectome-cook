@@ -129,6 +129,8 @@ private repos) fail before any files are written or clones/builds start. Private
 `authSecret` sources need an explicit full commit SHA when pinning. Only full
 40-hex SHA-1 or 64-hex SHA-256 object IDs are trusted without remote lookup;
 short hex strings are resolved as symbolic refs, like other branch/tag names.
+Abbreviated commit IDs cannot be pinned: use the full 40-hex ID from
+`git rev-parse <ref>` with `--pin-refs`.
 
 Compatibility: this also changes Docker `cook build --pin-refs`: an `authSecret`
 source tracking a branch now fails instead of warning and continuing unpinned.

@@ -190,7 +190,8 @@ describe('pin-refs', () => {
     expect(resolveRemoteRef(repo, 'no-such-branch')).toBeNull();
     execFileSync('git', ['tag', '20241105'], { cwd: repo });
     expect(resolveRemoteRef(repo, '20241105')).toBe(head);
-    expect(resolveRemoteRef(repo, 'deadbee')).toBeNull();
+    expect(() => resolveRemoteRef(repo, 'deadbee')).toThrow('looks like an abbreviated commit ID');
+    expect(() => resolveRemoteRef(repo, head.slice(0, 7))).toThrow('needs the full 40-hex ID');
     // Already a SHA — returned verbatim, no ls-remote.
     expect(resolveRemoteRef('https://invalid.invalid/x.git', head)).toBe(head);
   });

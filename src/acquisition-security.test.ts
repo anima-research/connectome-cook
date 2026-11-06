@@ -320,6 +320,8 @@ for (const ref of ['deadbee', '20241105', 'a'.repeat(39)]) {
     env.FAKE_EMPTY_URL = 'https://example.invalid/component.git';
     const result = run('build', { url: env.FAKE_EMPTY_URL, ref }, ['--pin-refs']);
     expect(result.status).not.toBe(0);
+    expect(result.stdout + result.stderr).toContain(`'${ref}' looks like an abbreviated commit ID`);
+    expect(result.stdout + result.stderr).toContain(`--pin-refs needs the full 40-hex ID (git rev-parse ${ref})`);
     expect(gitCalls()).toContain(`refs/heads/${ref}`);
     expect(existsSync(join(dir, 'out'))).toBe(false);
   });
@@ -358,5 +360,14 @@ test('R2-1: cook build rejects encoded-space token canary without writing any ou
   expect(result.status).not.toBe(0);
   expect(result.stdout + result.stderr).not.toContain('CANARY123');
   expect(gitCalls()).toBe('');
+  expect(existsSync(join(dir, 'out'))).toBe(false);
+});
+
+test('R2-3: --ch-ref abbreviated commit failure explains the full-ID requirement', () => {
+  env.FAKE_EMPTY_URL = 'https://example.invalid/host.git';
+  const result = run('install', undefined, ['--pin-refs', '--ch-repo', env.FAKE_EMPTY_URL, '--ch-ref', 'deadbee']);
+  expect(result.status).not.toBe(0);
+  expect(result.stdout + result.stderr).toContain("'deadbee' looks like an abbreviated commit ID");
+  expect(result.stdout + result.stderr).toContain('--pin-refs needs the full 40-hex ID (git rev-parse deadbee)');
   expect(existsSync(join(dir, 'out'))).toBe(false);
 });
