@@ -1,12 +1,13 @@
-import { afterEach, beforeEach, expect, test } from 'bun:test';
+import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
-import { archivePackage, recordInstalledHostDependencies, type LockedHostDependency } from './host-dependency.js';
+import * as fs from 'node:fs';
+import { archivePackage, preflightHostDependencies, parseHostDependencies } from './host-dependency.js';
 
 let dir: string, repo: string, out: string, recipe: string, archive: string, digest: string, shim: string;
 const realBun = process.execPath;
@@ -72,10 +73,9 @@ test('CLI installs the artifact version offline, previews and records direct/ove
   const d = lock.hostDependencies[0];
   expect(lock.version).toBe(1); expect(lock.connectomeHost.commit).toBe(commit);
   expect(d).toEqual({ name: 'fixture-local-input', originalRange: '^1.0.0', version: '1.2.3', sha256: digest, size: statSync(archive).size, snapshot: d.snapshot,
-    packageJsonDelta: { direct: { section: 'dependencies', name: 'fixture-local-input', before: '^1.0.0', after: 'file:' + d.snapshot }, override: { section: 'overrides', name: 'fixture-local-input', before: null, after: 'file:' + d.snapshot } },
-    installedCopies: [{ path: join(out, 'app/node_modules/fixture-local-input'), version: '1.2.3' }], duplicateCount: 0, censusStatus: 'complete', censusSkippedEntries: [] });
+    packageJsonDelta: { direct: { section: 'dependencies', name: 'fixture-local-input', before: '^1.0.0', after: 'file:' + d.snapshot }, override: { section: 'overrides', name: 'fixture-local-input', before: null, after: 'file:' + d.snapshot } } });
   expect(d.snapshot).toBe(join(out, 'host-inputs', digest + '.tgz'));
-  expect(r.stdout).toContain(`REPLACE dependency fixture-local-input ^1.0.0 → file:${d.snapshot} (sha256 ${digest.slice(0, 12)}…) + same-name override`);
+  expect(r.stdout).toContain(`REPLACE dependency fixture-local-input ^1.0.0 → file:${d.snapshot} (sha256 ${digest.slice(0, 12)}…) + same-name overrides`);
   expect(d.snapshot).not.toBe(archive); expect(statSync(d.snapshot).mode & 0o777).toBe(0o400);
   expect(statSync(dirname(d.snapshot)).mode & 0o777).toBe(0o700);
   const original = JSON.parse(git(['show', commit + ':package.json'])); original.dependencies['fixture-local-input'] = 'file:' + d.snapshot; original.overrides = { 'fixture-local-input': 'file:' + d.snapshot };
@@ -159,10 +159,10 @@ test('ambiguous sections and dependency overrides refuse rather than risk regist
     refused('E_HOST_DEPENDENCY_RANGE');
   }
 });
-test('removing the option restores original checkout rather than reusing the package.json delta', () => {
+test('explicitly dropping inputs restores original checkout rather than reusing the package.json delta', () => {
   expect(install().status).toBe(0);
   writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'synthetic-host', version: '1.0.0' })); git(['commit', '-am', 'No dependencies']);
-  expect(install([]).status).toBe(0);
+  expect(install(['--drop-host-dependencies']).status).toBe(0);
   expect(JSON.parse(readFileSync(join(out, 'app/package.json'), 'utf8')).dependencies).toBeUndefined();
   expect(JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8')).hostDependencies).toBeUndefined();
 });
@@ -179,7 +179,7 @@ test('durable input survives staging deletion and reinstall with an empty Bun ca
   expect(result.status).toBe(0);
   expect(JSON.parse(readFileSync(join(out, 'app/node_modules/fixture-local-input/package.json'), 'utf8')).version).toBe('1.2.3');
 });
-test('same-name transitive resolution uses the override artifact offline, and lock records the installed census', () => {
+test('same-name transitive resolution uses the override artifact offline, without recording an installed census', () => {
   const wrapper = join(dir, 'wrapper.tgz');
   writeFileSync(wrapper, gzipSync(tar([{ path: 'package/package.json', data: JSON.stringify({ name: 'synthetic-wrapper', version: '1.0.0', dependencies: { 'fixture-local-input': '^9.0.0' } }) }])));
   const pkg = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8')); pkg.dependencies['synthetic-wrapper'] = 'file:' + wrapper;
@@ -189,8 +189,7 @@ test('same-name transitive resolution uses the override artifact offline, and lo
   const resolved = fromNested.resolve('fixture-local-input/package.json');
   expect(JSON.parse(readFileSync(resolved, 'utf8')).version).toBe('1.2.3');
   const lock = JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8'));
-  expect(lock.hostDependencies[0].installedCopies).toContainEqual({ path: dirname(resolved), version: '1.2.3' });
-  expect(lock.hostDependencies[0].duplicateCount).toBe(0); // Bun hoists the identical override.
+  expect(lock.hostDependencies[0].installedCopies).toBeUndefined();
   expect(readFileSync(join(out, 'app/bun.lock'), 'utf8')).not.toContain('fixture-local-input@9.');
 });
 test('trusted dependency names refuse before output creation', () => {
@@ -212,7 +211,7 @@ test('superseded inputs are retained for operator-controlled rollback, including
   pack('fixture-local-input', '1.4.0'); expect(install().status).toBe(0);
   expect(existsSync(old)).toBe(true);
   writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'synthetic-host' })); git(['commit', '-am', 'No inputs']);
-  expect(install([]).status).toBe(0); expect(existsSync(old)).toBe(true);
+  expect(install(['--drop-host-dependencies']).status).toBe(0); expect(existsSync(old)).toBe(true);
 });
 test('post-install output failure removes the mutated checkout and only this attempts new snapshot', () => {
   expect(install().status).toBe(0); const old = join(out, 'host-inputs', digest + '.tgz');
@@ -227,18 +226,6 @@ test('declined confirm gate removes staging and creates no output', () => {
   const result = spawnSync(realBun, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, '--no-prompts', '--host-dependency', option()], { encoding: 'utf8', env: { ...process.env, TMPDIR: join(dir, 'staging') } });
   expect(result.status).toBe(1); expect(existsSync(out)).toBe(false);
   expect(readdirSync(join(dir, 'staging'))).toEqual([]);
-});
-test('installed-copy census reports scoped and nested duplicates without validating their ranges', () => {
-  const root = join(out, 'app'), name = '@fixture/pinned';
-  const copies = [join(root, 'node_modules', name), join(root, 'node_modules/wrapper/node_modules', name)] as const;
-  for (const [i, path] of copies.entries()) {
-    mkdirSync(path, { recursive: true }); writeFileSync(join(path, 'package.json'), JSON.stringify({ name, version: `${i + 1}.0.0` }));
-  }
-  writeFileSync(join(root, 'node_modules/wrapper/package.json'), JSON.stringify({ name: 'wrapper', version: '1.0.0' }));
-  const records = [{ name }] as LockedHostDependency[];
-  recordInstalledHostDependencies(root, records);
-  expect(records[0]!.installedCopies).toEqual([{ path: copies[0], version: '1.0.0' }, { path: copies[1], version: '2.0.0' }]);
-  expect(records[0]!.duplicateCount).toBe(1);
 });
 test('reused durable snapshots are rehashed before checkout mutation', () => {
   expect(install().status).toBe(0);
@@ -256,20 +243,6 @@ test('recipe writes cannot overlap durable host inputs', () => {
   expect(readdirSync(join(dir, 'staging'))).toEqual([]);
 });
 
-for (const kind of ['scope-file', 'bad-manifest']) test(`best-effort census notes ${kind} without failing a successful install`, () => {
-  const mutation = kind === 'scope-file'
-    ? "printf stray > node_modules/@stray"
-    : "mkdir -p node_modules/broken; printf '{' > node_modules/broken/package.json";
-  writeFileSync(join(shim, 'bun'), `#!/bin/sh\n'${realBun}' "$@" --offline || exit $?\n${mutation}\n`);
-  expect(install().status).toBe(0);
-  const record = JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8')).hostDependencies[0];
-  const skipped = kind === 'scope-file' ? join(out, 'app/node_modules/@stray') : join(out, 'app/node_modules/broken/package.json');
-  expect(record.censusStatus).toBe('incomplete');
-  expect(record.duplicateCount).toBeNull();
-  expect(record.censusSkippedEntries).toContainEqual({ path: skipped, reason: kind === 'scope-file' ? 'scope entry is not a directory' : 'manifest is unreadable or unparsable' });
-  expect(record.installedCopies).toEqual([{ path: join(out, 'app/node_modules/fixture-local-input'), version: '1.2.3' }]);
-  expect(existsSync(record.snapshot)).toBe(true);
-});
 for (const value of ['fixture-local-input', { 'fixture-local-input': true }, ['fixture-local-input', 123]]) test(`malformed trustedDependencies ${JSON.stringify(value)} refuses before output`, () => {
   const pkg = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8')); pkg.trustedDependencies = value;
   writeFileSync(join(repo, 'package.json'), JSON.stringify(pkg)); git(['commit', '-am', 'Malformed trusted dependencies']);
@@ -285,4 +258,272 @@ for (const reason of ['mode', 'size']) test(`retained snapshot ${reason} refusal
   expect(result.stderr).toContain(`E_HOST_DEPENDENCY_FILE: retained input ${snapshot} rejected: ${reason}`);
   expect(existsSync(join(out, 'app/node_modules/fixture-local-input/package.json'))).toBe(true);
   expect(existsSync(snapshot)).toBe(true);
+});
+
+// R1 regressions use only synthetic local repositories and offline Bun installs.
+for (const policy of ['overrides', 'resolutions']) test(`R1-1 composes with existing flat ${policy} without disabling unrelated pins`, () => {
+  const other = join(dir, 'other.tgz');
+  writeFileSync(other, gzipSync(tar([{ path: 'package/package.json', data: JSON.stringify({ name: 'fixture-r', version: '2.0.0' }) }])));
+  const pkg = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8'));
+  pkg.dependencies['fixture-r'] = '^1';
+  pkg[policy] = { 'fixture-r': 'file:' + other, '@scope/unrelated': '^1' };
+  const wrapper = join(dir, 'wrapper.tgz');
+  writeFileSync(wrapper, gzipSync(tar([{ path: 'package/package.json', data: JSON.stringify({ name: 'synthetic-wrapper', version: '1.0.0', dependencies: { 'fixture-local-input': '^9.0.0' } }) }])));
+  pkg.dependencies['synthetic-wrapper'] = 'file:' + wrapper;
+  writeFileSync(join(repo, 'package.json'), JSON.stringify(pkg)); git(['commit', '-am', 'Existing flat policy']);
+  const r = install(); expect(r.status).toBe(0);
+  const installed = JSON.parse(readFileSync(join(out, 'app/package.json'), 'utf8'));
+  const nested = createRequire(join(out, 'app/node_modules/synthetic-wrapper/package.json'));
+  expect(JSON.parse(readFileSync(nested.resolve('fixture-local-input/package.json'), 'utf8')).version).toBe('1.2.3');
+  expect(installed[policy === 'overrides' ? 'resolutions' : 'overrides']).toBeUndefined();
+  expect(installed[policy]['@scope/unrelated']).toBe('^1');
+  expect(installed[policy]['fixture-r']).toBe('file:' + other);
+  expect(installed[policy]['fixture-local-input']).toBe('file:' + join(out, 'host-inputs', digest + '.tgz'));
+  expect(JSON.parse(readFileSync(join(out, 'app/node_modules/fixture-r/package.json'), 'utf8')).version).toBe('2.0.0');
+  expect(JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8')).hostDependencies[0].packageJsonDelta.override.section).toBe(policy);
+});
+for (const policy of ['overrides', 'resolutions']) test(`R2 refuses reviewer nested-wrapper ${policy} before output`, () => {
+  const wrapper = join(dir, 'wrapper.tgz'), other = join(dir, 'other.tgz');
+  writeFileSync(wrapper, gzipSync(tar([{ path: 'package/package.json', data: JSON.stringify({ name: 'synthetic-wrapper', version: '1.0.0', dependencies: { 'fixture-local-input': '^9' } }) }])));
+  writeFileSync(other, gzipSync(tar([{ path: 'package/package.json', data: JSON.stringify({ name: 'fixture-local-input', version: '9.0.0' }) }])));
+  const pkg = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8'));
+  pkg.dependencies['synthetic-wrapper'] = 'file:' + wrapper;
+  pkg[policy] = policy === 'overrides' ? { 'synthetic-wrapper': { 'fixture-local-input': 'file:' + other } } : { 'synthetic-wrapper/fixture-local-input': 'file:' + other };
+  writeFileSync(join(repo, 'package.json'), JSON.stringify(pkg)); git(['commit', '-am', 'Nested policy bypass']);
+  const r = install();
+  expect(r.status).not.toBe(0); expect(r.stderr).toContain('E_HOST_DEPENDENCY_RANGE');
+  expect(r.stderr).toContain(policy); expect(r.stderr).toContain(policy === 'overrides' ? 'synthetic-wrapper' : 'fixture-local-input');
+  expect(existsSync(out)).toBe(false);
+});
+for (const policy of ['overrides', 'resolutions']) for (const key of [
+  'a/b/fixture-local-input', '**/fixture-local-input', 'fixture-local-input@^1',
+  '@scope/wrapper/fixture-local-input', 'fixture-*/**', '*',
+]) test(`R2 refuses ${policy} selector ${key} naming the policy key`, () => {
+  const pkg = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8'));
+  pkg[policy] = { [key]: '^9' };
+  writeFileSync(join(repo, 'package.json'), JSON.stringify(pkg)); git(['commit', '-am', 'Qualified policy']);
+  const r = install(); expect(r.status).not.toBe(0);
+  expect(r.stderr).toContain('E_HOST_DEPENDENCY_RANGE'); expect(r.stderr).toContain(policy);
+  expect(r.stderr).toContain(key); expect(existsSync(out)).toBe(false);
+});
+for (const policy of ['overrides', 'resolutions']) for (const value of [
+  { a: { b: { 'fixture-local-input': '^9' } } },
+  { a: { 'fixture-local-input@^1': { '.': '^9' } } },
+  { a: '$fixture-local-input' }, { a: { b: '$fixture-local-input' } },
+  { 'fixture-local-input': { '.': '^9' } },
+]) test(`R2 refuses ${policy} nested policy or reference ${JSON.stringify(value)}`, () => {
+  const pkg = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8')); pkg[policy] = value;
+  writeFileSync(join(repo, 'package.json'), JSON.stringify(pkg)); git(['commit', '-am', 'Nested or reference policy']);
+  const r = install(); expect(r.status).not.toBe(0); expect(r.stderr).toContain('E_HOST_DEPENDENCY_RANGE');
+  expect(r.stderr).toContain(policy); expect(existsSync(out)).toBe(false);
+});
+for (const [key, value] of [
+  ['a', { '.': '^1', b: '^2' }], // Reviewer's disjoint nested repro, after a flat entry.
+  ['@scope/unrelated', {}],
+  ['fixture-local-input', { '.': '^1' }],
+] as const) test(`R3 refuses any nested override ${key} before install writes`, () => {
+  const pkg = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8'));
+  pkg.overrides = { unrelated: '^1', [key]: value };
+  const manifest = JSON.stringify(pkg);
+  writeFileSync(join(repo, 'package.json'), manifest); git(['commit', '-am', 'Nested overrides']);
+  const marker = join(dir, 'install-ran');
+  writeFileSync(join(shim, 'bun'), `#!/bin/sh\ntouch '${marker}'\nexec env BUN_INSTALL_CACHE_DIR='${join(dir, 'cache')}' '${realBun}' "$@" --offline\n`);
+  const r = install();
+  expect(r.status).not.toBe(0); expect(r.stderr).toContain('E_HOST_DEPENDENCY_RANGE');
+  expect(r.stderr).toContain(`overrides[${JSON.stringify(key)}]`);
+  expect(r.stderr).toContain('nested overrides are not supported together with host dependency pins');
+  expect(r.stderr).not.toContain('E_HOST_DEPENDENCY_RESOLUTION');
+  expect(existsSync(marker)).toBe(false); expect(existsSync(out)).toBe(false);
+  expect(readdirSync(join(dir, 'staging'))).toEqual([]);
+  expect(readFileSync(join(repo, 'package.json'), 'utf8')).toBe(manifest);
+});
+for (const key of ['@fixture/second', 'wrapper/@fixture/second', '@fixture/second@^2', '**/@fixture/second']) test(`R2 refuses policy addressing scoped input ${key}`, () => {
+  pack('@fixture/second', '2.0.0');
+  const pkg = { name: 'synthetic-host', dependencies: { '@fixture/second': '^2' }, resolutions: { [key]: '^9' } };
+  writeFileSync(join(repo, 'package.json'), JSON.stringify(pkg)); git(['commit', '-am', 'Scoped input policy']);
+  const r = install(['--host-dependency', option('@fixture/second')]);
+  expect(r.status).not.toBe(0); expect(r.stderr).toContain('E_HOST_DEPENDENCY_RANGE');
+  expect(r.stderr).toContain(key); expect(existsSync(out)).toBe(false);
+});
+for (const corruption of ['nested-version', 'nested-same-version-bytes', 'integrity', 'missing', 'format', 'format-v3']) test(`R2 lock backstop refuses ${corruption} after real offline install`, () => {
+  const tamper = join(dir, 'tamper.ts');
+  writeFileSync(tamper, `import { readFileSync, writeFileSync, rmSync } from 'node:fs';
+const lock = Bun.JSONC.parse(readFileSync('bun.lock', 'utf8'));
+const entry = lock.packages['fixture-local-input'];
+if (${JSON.stringify(corruption)} === 'nested-version') lock.packages['synthetic-wrapper/fixture-local-input'] = ['fixture-local-input@9.0.0', '', {}, 'sha512-other'];
+if (${JSON.stringify(corruption)} === 'nested-same-version-bytes') lock.packages['synthetic-wrapper/fixture-local-input'] = ['fixture-local-input@' + ${JSON.stringify(archive)}, {}, entry[2]];
+if (${JSON.stringify(corruption)} === 'integrity') entry[2] = 'sha512-wrong';
+if (${JSON.stringify(corruption)} === 'format') lock.lockfileVersion = 999;
+if (${JSON.stringify(corruption)} === 'format-v3') lock.lockfileVersion = 3;
+writeFileSync('bun.lock', JSON.stringify(lock));
+if (${JSON.stringify(corruption)} === 'missing') rmSync('bun.lock');
+`);
+  writeFileSync(join(shim, 'bun'), `#!/bin/sh\nenv BUN_INSTALL_CACHE_DIR='${join(dir, 'cache')}' '${realBun}' "$@" --offline || exit $?\nexec '${realBun}' '${tamper}'\n`);
+  const r = install(); expect(r.status).not.toBe(0); expect(r.stderr).toContain('E_HOST_DEPENDENCY_RESOLUTION');
+  expect(r.stderr).toContain('bun.lock'); expect(existsSync(join(out, 'app'))).toBe(false);
+  if (['missing', 'format', 'format-v3'].includes(corruption)) {
+    expect(r.stderr).toContain('cannot verify pinned inputs: missing, malformed or unsupported text lockfile');
+    expect(r.stderr).toContain('supported lockfileVersion: 1 or 2');
+  } else {
+    expect(r.stderr).toContain('fixture-local-input'); expect(r.stderr).toContain(digest);
+  }
+  expect(existsSync(join(out, 'connectome.lock'))).toBe(false);
+  expect(existsSync(join(out, 'host-inputs', digest + '.tgz'))).toBe(false);
+});
+for (const fields of [
+  { overrides: {}, resolutions: {} }, { resolutions: [] }, { overrides: 'bad' }, { resolutions: null },
+]) test(`R1-1 refuses ambiguous or malformed resolution policy ${JSON.stringify(fields)}`, () => {
+  const pkg = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8'));
+  Object.assign(pkg, fields); writeFileSync(join(repo, 'package.json'), JSON.stringify(pkg)); git(['commit', '-am', 'Invalid policy']);
+  refused('E_HOST_DEPENDENCY_RANGE');
+});
+test('R1-2 plain reinstall refuses and preserves pinned checkout and lock', () => {
+  expect(install().status).toBe(0);
+  const before = readFileSync(join(out, 'connectome.lock'), 'utf8');
+  const result = install([]);
+  expect(result.status).not.toBe(0); expect(result.stderr).toContain('E_HOST_DEPENDENCY_REINSTALL');
+  expect(result.stderr).toContain('--drop-host-dependencies');
+  expect(readFileSync(join(out, 'connectome.lock'), 'utf8')).toBe(before);
+  expect(JSON.parse(readFileSync(join(out, 'app/node_modules/fixture-local-input/package.json'), 'utf8')).version).toBe('1.2.3');
+});
+test('R1-2 explicit drop rebuilds and removes even an unrecorded checkout pin', () => {
+  expect(install().status).toBe(0);
+  const lock = JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8'));
+  delete lock.hostDependencies; writeFileSync(join(out, 'connectome.lock'), JSON.stringify(lock));
+  const refused = install([]); expect(refused.status).not.toBe(0); expect(refused.stderr).toContain('E_HOST_DEPENDENCY_REINSTALL');
+  writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'synthetic-host', version: '1.0.0' })); git(['commit', '-am', 'Unpinned host']);
+  expect(install(['--drop-host-dependencies']).status).toBe(0);
+  expect(JSON.parse(readFileSync(join(out, 'app/package.json'), 'utf8')).dependencies).toBeUndefined();
+  expect(JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8')).hostDependencies).toBeUndefined();
+  expect(existsSync(join(out, 'host-inputs', digest + '.tgz'))).toBe(true);
+});
+test('R1-2 refuses contradictory drop and pin flags before output', () => refused('E_HOST_DEPENDENCY_OPTION', ['--host-dependency', option(), '--drop-host-dependencies']));
+test('R1-3 mixed top-level directories cannot shadow the validated package', () => {
+  for (const extra of ['zzz/package.json', 'zzz/README.md']) {
+    const bytes = gzipSync(tar([
+      { path: 'package/package.json', data: JSON.stringify({ name: 'fixture-local-input', version: '1.2.3' }) },
+      { path: extra, data: JSON.stringify({ name: 'fixture-local-input', version: '9.9.9' }) },
+    ]));
+    writeFileSync(archive, bytes); digest = createHash('sha256').update(bytes).digest('hex');
+    refused('E_HOST_DEPENDENCY_ARCHIVE');
+  }
+});
+for (const dangling of [true, false]) test(`R1-4 preserves pre-existing ${dangling ? 'dangling' : 'live'} snapshot symlink with typed refusal`, () => {
+  mkdirSync(join(out, 'host-inputs'), { recursive: true, mode: 0o700 });
+  const snapshot = join(out, 'host-inputs', digest + '.tgz');
+  symlinkSync(dangling ? join(dir, 'missing') : archive, snapshot);
+  const result = install();
+  expect(result.status).not.toBe(0); expect(result.stderr).toContain('E_HOST_DEPENDENCY_FILE');
+  expect(result.stderr).toContain(snapshot);
+  expect(lstatSync(snapshot).isSymbolicLink()).toBe(true);
+  expect(readFileSync(archive)).toEqual(gzipSync(tar([{ path: 'package/package.json', data: JSON.stringify({ name: 'fixture-local-input', version: '1.2.3' }) }])));
+});
+test('R1-5 rejects a symlinked output ancestor before preview or half-made tree', () => {
+  const actual = join(dir, 'actual'); mkdirSync(actual);
+  const link = join(dir, 'linked'); symlinkSync(actual, link);
+  out = join(link, 'new-install');
+  const result = install();
+  expect(result.status).not.toBe(0); expect(result.stderr).toContain('E_HOST_DEPENDENCY_STORAGE');
+  expect(result.stderr).toContain(out);
+  expect(result.stdout).not.toContain('Host install plan');
+  expect(existsSync(out)).toBe(false); expect(readdirSync(actual)).toEqual([]);
+});
+test('R1-5 rejects an unsafe existing input directory before preview', () => {
+  mkdirSync(join(out, 'host-inputs'), { recursive: true, mode: 0o755 });
+  const result = install(); expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain('E_HOST_DEPENDENCY_STORAGE');
+  expect(result.stdout).not.toContain('Host install plan');
+  expect(existsSync(join(out, 'recipes'))).toBe(false);
+});
+test('R1-6 file failures identify input, path and safe cause', () => {
+  for (const [path, reason] of [[join(dir, 'missing'), 'ENOENT'], [dir, 'not a regular file']] as const) {
+    const r = install(['--host-dependency', option('fixture-local-input', path)]);
+    expect(r.stderr).toContain('E_HOST_DEPENDENCY_FILE');
+    expect(r.stderr).toContain(path); expect(r.stderr).toContain(reason);
+  }
+  truncateSync(archive, 64 * 1024 * 1024 + 1);
+  expect(install().stderr).toContain('maximum 67108864');
+});
+test('R1-6 mismatches report expected and observed identity/range', () => {
+  const r = install(['--host-dependency', option('fixture-local-input', archive, '0'.repeat(64))]);
+  expect(r.stderr).toContain('expected ' + '0'.repeat(64)); expect(r.stderr).toContain('observed ' + digest);
+  pack('fixture-local-input', '2.0.0');
+  const version = install(); expect(version.stderr).toContain('2.0.0'); expect(version.stderr).toContain('^1.0.0');
+});
+test('R1-6 source failures distinguish missing ref from inaccessible repository without echoing helper output', () => {
+  const missingRef = install(['--host-dependency', option(), '--ch-ref', 'typo-ref']);
+  expect(missingRef.stderr).toContain('E_HOST_DEPENDENCY_SOURCE');
+  expect(missingRef.stderr).toContain('typo-ref'); expect(missingRef.stderr).toContain('ref not found');
+  rmSync(repo, { recursive: true });
+  const missingRepo = install();
+  expect(missingRepo.stderr).toContain(repo); expect(missingRepo.stderr).toContain('repository inaccessible');
+});
+test('R1-7 lock records policy inputs only, without a node_modules census', () => {
+  expect(install().status).toBe(0);
+  const record = JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8')).hostDependencies[0];
+  for (const field of ['installedCopies', 'duplicateCount', 'censusStatus', 'censusSkippedEntries']) expect(record[field]).toBeUndefined();
+});
+test('R1-9 reuses the acquired checkout instead of fetching the host twice', () => {
+  const calls = join(dir, 'git-calls');
+  writeFileSync(join(shim, 'git'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${calls}'\nexec /usr/bin/git "$@"\n`, { mode: 0o755 });
+  expect(install().status).toBe(0);
+  const lines = readFileSync(calls, 'utf8').trim().split('\n');
+  expect(lines.filter(line => /\bfetch\b/.test(line))).toHaveLength(1);
+  expect(lines.filter(line => /\bclone\b/.test(line))).toHaveLength(0);
+  expect(execFileSync('/usr/bin/git', ['remote', 'get-url', 'origin'], { cwd: join(out, 'app'), encoding: 'utf8' }).trim()).toBe(repo);
+});
+test('R1-nit extended headers report the unsupported entry, not just valid ustar magic', () => {
+  expect(() => archivePackage(gzipSync(tar([{ path: 'package/PaxHeader', type: 'x' }])))).toThrow('pax/extended header entry');
+});
+
+test('R1-5 unsupported platforms refuse read-only before staging or output', () => {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  try {
+    Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+    expect(() => preflightHostDependencies(repo, 'main', parseHostDependencies(option()), out)).toThrow('E_HOST_DEPENDENCY_STORAGE');
+    expect(existsSync(out)).toBe(false);
+    expect(readdirSync(join(dir, 'staging'))).toEqual([]);
+  } finally { Object.defineProperty(process, 'platform', platform); }
+});
+test('R1-nit durability syncs the snapshot before its containing directory', () => {
+  const synced: string[] = [], original = fs.fsyncSync;
+  const spy = spyOn(fs, 'fsyncSync').mockImplementation(fd => {
+    synced.push(fs.readlinkSync('/proc/self/fd/' + fd)); original(fd);
+  });
+  let checked: ReturnType<typeof preflightHostDependencies> | undefined;
+  try {
+    checked = preflightHostDependencies(repo, 'main', parseHostDependencies(option()), out);
+    checked.materialize();
+    const snapshot = join(out, 'host-inputs', digest + '.tgz');
+    expect(synced).toContain(snapshot);
+    expect(synced.lastIndexOf(join(out, 'host-inputs'))).toBeGreaterThan(synced.indexOf(snapshot));
+  } finally { spy.mockRestore(); checked?.cleanup(); checked?.discardNew(); }
+});
+test('R1-nit durability failure refuses and discards only the new snapshot', () => {
+  const checked = preflightHostDependencies(repo, 'main', parseHostDependencies(option()), out);
+  const snapshot = join(out, 'host-inputs', digest + '.tgz'), original = fs.fsyncSync;
+  const spy = spyOn(fs, 'fsyncSync').mockImplementation(fd => {
+    if (fs.readlinkSync('/proc/self/fd/' + fd) === snapshot) throw new Error('fixture fsync failure');
+    original(fd);
+  });
+  try {
+    expect(() => checked.materialize()).toThrow('E_HOST_DEPENDENCY_FILE');
+    expect(existsSync(snapshot)).toBe(false);
+  } finally { spy.mockRestore(); checked.cleanup(); checked.discardNew(); }
+});
+test('R1-4 an exclusive-create race never claims or deletes another snapshot', () => {
+  const checked = preflightHostDependencies(repo, 'main', parseHostDependencies(option()), out);
+  const snapshot = join(out, 'host-inputs', digest + '.tgz'), original = fs.openSync;
+  let injected = false;
+  const spy = spyOn(fs, 'openSync').mockImplementation((path, flags, mode) => {
+    if (!injected && path === snapshot && typeof flags === 'number' && (flags & fs.constants.O_CREAT)) {
+      injected = true;
+      fs.writeFileSync(snapshot, 'race winner', { mode: 0o400 });
+    }
+    return original(path, flags, mode);
+  });
+  try {
+    expect(() => checked.materialize()).toThrow('E_HOST_DEPENDENCY_FILE');
+    expect(readFileSync(snapshot, 'utf8')).toBe('race winner');
+  } finally { spy.mockRestore(); checked.cleanup(); checked.discardNew(); }
 });

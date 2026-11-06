@@ -1,7 +1,7 @@
 # Hash-pinned local host dependency inputs
 
-Legacy host installs can pin an existing direct dependency and same-name
-transitive dependencies to a local archive **before** installation:
+Host installs can replace an existing direct dependency with a hash-pinned local
+archive and add a same-name global resolution policy **before** installation:
 
 ```sh
 cook install recipe.json --out /srv/example/install --no-prompts --yes \
@@ -11,94 +11,123 @@ cook install recipe.json --out /srv/example/install --no-prompts --yes \
 
 Repeat `--host-dependency` for distinct names (including scoped names). Inputs
 must be absolute local regular files, not URLs, symlinks or directories. The
-name must exist in the acquired host's original `dependencies`,
-`devDependencies` or `optionalDependencies`. Multiple declarations of the same
-name, or a same-name `overrides`/`resolutions` entry, refuse as ambiguous.
-Names listed in `trustedDependencies` refuse with `E_HOST_DEPENDENCY_TRUSTED`,
-as does a present value that is not an array of strings. Preflight and checkout
-use the same validation. This prevents silently opting an input into host-declared
-lifecycle trust.
-Peer-only declarations are not direct install inputs. The original range must
-be a nonempty semver range: workspace, Git, file, link, npm aliases and URLs
-refuse. The archive's `package/package.json` name must match, and its version
-must satisfy that original direct range (including semver prerelease rules).
+name must exist in exactly one of the acquired host's original `dependencies`,
+`devDependencies` or `optionalDependencies`. Peer-only declarations are not
+direct install inputs. Existing `overrides`/`resolutions` entries naming a
+selected input refuse at any depth, including exact top-level entries. Cook
+does not model policy precedence: path selectors (including scoped paths), globs, version-qualified
+keys and `$refs` conservatively refuse even if they might target only unrelated
+names. Flat unrelated package-name entries (including scoped names) can be
+preserved in overrides or resolutions. With `--host-dependency`, **any nested
+(object-valued) npm override entry refuses**, related or not, before any install
+write. The typed `E_HOST_DEPENDENCY_RANGE` error names the key and explains that
+nested overrides are not supported together with host dependency pins. Bun can
+emit a different lock format for nested overrides even when they are disjoint.
+Malformed policy values also refuse. Diagnostics name the policy key. Names
+listed in `trustedDependencies` refuse, as does a present value that is not an
+array of strings. This prevents silently opting an input
+into host-declared lifecycle trust.
+
+The original range must be a nonempty semver range: workspace, Git, file, link,
+npm aliases and URLs refuse. The archive's package.json name must match, and
+its version must satisfy that direct range (including semver prerelease rules).
+
+## Preflight and storage
+
+**This opt-in input feature requires Linux with /proc, no symlink in any
+ancestor of the output/input directory, and an effective-user-owned 0700
+host-inputs directory if it already exists.** Existing ancestors need not be
+private. Cook validates these restrictions read-only before confirmation or
+creation of a fresh output tree. Flagless fresh installs retain their existing
+platform behavior. Later I/O errors or concurrent changes can still fail
+materialization; cook does not roll back newly created empty directories.
 
 Cook copies each input into private 0700 temporary staging and makes the
 archive 0400, then hashes and inspects **that copy**, reading through the open
 file descriptor. The source path is never passed to Bun. Source replacement
 after inspection cannot change what gets installed. Inspection is gzip plus a
-bounded ustar reader, with no disk extraction and no scripts. Limits: 64 MiB
-compressed input, 128 MiB decompressed tar, 10,000 entries, 1 MiB package.json.
-Only regular files/directories are supported; links, extended/PAX/GNU headers,
-duplicate/ambiguous paths, malformed headers and missing manifests refuse.
-Produce an archive with `npm pack`, `bun pm pack`, or, with a `package/`
-directory containing package.json, `tar --format=ustar -czf input.tgz package`.
-Plain GNU `tar czf` and `tar --format=pax` are not supported. Archive refusals
-include the observed magic (or `unavailable` if no header could be read).
+bounded ustar reader, without extraction or scripts. Limits: 64 MiB compressed,
+128 MiB decompressed tar, 10,000 entries, 1 MiB package.json. Only regular
+files/directories sharing **one top-level directory** are supported. The
+manifest must be directly inside that directory (usually package/package.json).
+Links, extended/PAX/GNU headers, duplicate/ambiguous paths, malformed headers
+and missing manifests refuse. Extended-header errors identify that entry type,
+not just its otherwise valid ustar magic.
 
-Cook inspects the selected host via a temporary bare fetch and pins checkout
-to that commit. The confirmation preview names each dependency, original range,
-planned `file:` location and SHA-256 prefix, and mentions the same-name override.
-Only after preflight and confirmation succeed does cook copy-then-rehash the
-verified input into `<installDir>/host-inputs/<sha256>.tgz` (0700 directory,
-0400 file). With split layout, installDir is the runtime root, not the config,
-state or workspace root. Temporary staging is removed before installation.
-An existing hash-named snapshot is reused only after its ownership, mode,
-size and hash are checked. Rejections for retained-input owner, mode or size
-identify the snapshot path and reason, distinct from source-file failures.
+Produce a compatible archive with `npm pack` or `bun pm pack` (without files
+requiring extended headers), or with a `package/` directory containing
+package.json: `tar --format=ustar -czf input.tgz package`.
+Plain GNU `tar czf` and `tar --format=pax` are not supported.
+
+Cook fetches the selected host once into temporary staging and reads its
+manifest from Git objects. The preview names each dependency, original range,
+planned `file:` location, SHA-256 prefix and selected resolution-policy field.
+Only after confirmation does cook materialize verified snapshots under
+`<installDir>/host-inputs/<sha256>.tgz` (0700 directory, 0400 file). New files
+and their directory entries are fsynced; sync failures refuse. An existing
+snapshot is reused only after checking ownership, mode, size and hash.
+Symlinks (including dangling ones) refuse without being removed.
+Cook transfers the fetched repository into app/, checks out the exact commit
+and applies the planned edits before Bun runs, without a second host fetch.
+Staging is removed on completion or normal failure/cancellation.
+
+## Install policy and lock
 
 Immediately before `bun install`, cook writes two explicit package.json edits:
 
 - the original direct entry becomes `file:<snapshot>`;
-- `overrides.<name>` is added with that same `file:<snapshot>` value, so
-  transitive same-name requests also use the pinned artifact.
+- a same-name entry with that value is added to the host's existing
+  `resolutions` or `overrides` object, preserving its other entries.
+  If neither exists, cook uses `overrides`. Both fields together, or a
+  malformed field, refuse: Bun does not compose those fields.
 
-**The override is a dependency-graph policy delta, not proof of dependent range
-or API compatibility.** Only the host's original direct range is checked.
-Dependents may have incompatible expectations even though installation succeeds.
-Cook does not build a generic graph validator. Installation otherwise runs as
-today; this does not sandbox trusted host/package code. No registry fallback for
-the selected name and no post-build overlay are provided. Other names may still
-use registries: this is not a frozen or offline closure of every dependency.
-Hold preparation rejects this option; existing held candidates still refuse.
+**This is a dependency-graph policy delta, not proof of dependent range or API
+compatibility.** Only the host's original direct range is checked. Dependents
+may have incompatible expectations even when installation succeeds.
+After installation, cook requires a supported text `bun.lock` (version 1 or 2,
+with Bun JSONC support). The selected root entry and every same-name package
+entry, including nested copies, must identify the snapshot path and SHA-512
+integrity of the validated archive. This binds the lock's resolutions to the
+input bytes and their inspected version; missing/unverifiable locks (including
+lockfileVersion 3) or divergent copies refuse with E_HOST_DEPENDENCY_RESOLUTION
+before writing connectome.lock. This fail-closed backstop runs only after policy
+preflight; it does not add support for nested npm overrides.
+This is a lock-graph backstop, not an audit of extracted files or runtime aliases,
+nor a guarantee about subsequent manual installs or code that rewrites the graph.
+This does not sandbox trusted host/package code. There is no registry fallback
+for the selected name and no post-build overlay. Other names may still use
+registries; this is not a frozen/offline closure of every dependency.
 
 `connectome.lock` stays version 1. Its optional `hostDependencies` array records
-name, originalRange, artifact version, sha256, compressed byte size, snapshot path
-and `packageJsonDelta`. The delta has `direct` and `override` entries, each with
-`section`, `name`, `before`, `after`; override.before is null (previously absent).
-The host commit remains in `connectomeHost.commit`. After install, each record
-also includes `installedCopies` (package directory path and observed version for
-each copy in the installed node_modules package tree, including scoped/nested
-packages and package links), and `duplicateCount` (copies beyond the first, or
-zero for a complete census). Bun may hoist/deduplicate the same-name override. This is an observed
-census for operator identity checks, not compatibility or content attestation.
-The census is best-effort: unreadable/unparsable manifests, non-directory scope
-entries and unscannable directories are skipped, not install failures. Each
-record includes `censusStatus` and `censusSkippedEntries` (paths and reasons).
-If anything was skipped, status is `incomplete` and `duplicateCount` is null
-(unknown), never a clean zero. Only a complete walk has status `complete` and a
-numeric duplicate count; partial installed-copy observations remain available.
-Installs with inputs rebuild the host; removing the option also forces a fresh
-host checkout and removes the direct rewrite and override from that checkout.
+name, originalRange, artifact version, sha256, compressed size, snapshot path
+and `packageJsonDelta`. The delta has `direct` and `override` entries with
+section/name/before/after; override.section is `overrides` or `resolutions`,
+and override.before is null. The host commit remains in connectomeHost.commit.
+Cook does not walk node_modules or persist an unused installed-copy census.
 
-Durable inputs survive temp cleanup and support later Bun installs with an
-empty cache. Superseded inputs are **retained**, even when the new lock no longer
-references them: they may be rollback artifacts. Removing old host-inputs files
-is the operator's call; cook does not garbage-collect them. Failed attempts
-remove only their own newly created snapshot files, never pre-existing ones.
-If an attempt fails after rewriting the checkout, cook removes that checkout
-before discarding its new input, so no surviving checkout points to a deleted
-snapshot. Temporary staging is always removed on normal failure/cancellation.
-Do not treat mode bits as protection against other code running as your user.
+Installs with inputs rebuild the host. A routine reinstall **must repeat every
+recorded input** with its hash, or it refuses with E_HOST_DEPENDENCY_REINSTALL,
+even with `--yes`. Omitting the flag never means silently removing a pin.
+To deliberately remove all pins and rebuild the unmodified host, pass
+`--drop-host-dependencies` instead (cannot combine with `--host-dependency`).
+Retained checkout edits are also checked when an older cook has dropped the
+lock field. Do not use older cooks for these installs: they do not enforce this
+contract, and lost lock records plus a lost checkout cannot be reconstructed.
+
+Snapshots survive temp cleanup and support later Bun installs with an empty
+cache. Superseded/dropped inputs are retained for operator-controlled rollback;
+cook does not garbage-collect them. Failed attempts remove only snapshots they
+successfully created, never pre-existing files. After a checkout rewrite,
+failure removes that checkout before discarding its new snapshots.
+Mode bits do not protect against other code running as your user.
 
 **A hash establishes identity only, not publisher or source authenticity.**
-Obtain and authenticate the artifact/hash through your own trusted process.
-This option does not establish provenance, download engines, or authorize
-publication or activation.
+Authenticate the artifact/hash through your own trusted process. This feature
+does not establish provenance, download engines, or authorize activation.
 
-Refusals use `E_HOST_DEPENDENCY_OPTION`, `DUPLICATE`, `FILE`, `HASH`, `ARCHIVE`,
-`NAME`, `SOURCE`, `UNDECLARED`, `RANGE`, `VERSION` or `TRUSTED` (each with the full
-`E_HOST_DEPENDENCY_` prefix). Preflight refusals precede checkout/install mutation
-and creation of a fresh output root. Later filesystem failures can occur during
-materialization. `--hold` rejects the legacy flag with `E_USAGE`; existing held
-roots and internal candidate use refuse with `E_HELD`.
+Refusals use the E_HOST_DEPENDENCY_ prefix: OPTION, DUPLICATE, FILE, HASH,
+ARCHIVE, NAME, SOURCE, UNDECLARED, RANGE, VERSION, TRUSTED, STORAGE, REINSTALL or
+RESOLUTION.
+Input errors identify paths/reasons; hash mismatches give expected/observed
+digests and version mismatches give version/range. Source errors identify
+repository/ref/operation and a safe cause, never arbitrary Git/helper output.

@@ -1,7 +1,7 @@
 /** Local host inputs: snapshot first, inspect without extraction, never execute. */
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, constants, fchmodSync, fstatSync, existsSync, readdirSync, realpathSync, statSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { closeSync, constants, fchmodSync, fstatSync, lstatSync, fsyncSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
@@ -15,19 +15,93 @@ export interface LockedHostDependency {
   name: string; originalRange: string; version: string; sha256: string; size: number; snapshot: string;
   packageJsonDelta: {
     direct: { section: Section; name: string; before: string; after: string };
-    override: { section: 'overrides'; name: string; before: null; after: string };
+    override: { section: 'overrides' | 'resolutions'; name: string; before: null; after: string };
   };
-  installedCopies?: Array<{ path: string; version: string }>;
-  duplicateCount?: number | null;
-  censusStatus?: 'complete' | 'incomplete';
-  censusSkippedEntries?: Array<{ path: string; reason: string }>;
 }
 export interface HostDependencyInput { name: string; path: string; sha256: string }
-function refuse(code: string): never { throw new Error(`${code}: local host dependency refused; no registry fallback`); }
+function refuse(code: string, detail = 'local host dependency refused'): never {
+  throw new Error(`${code}: ${detail}; no registry fallback`);
+}
+function resolutionSection(pkg: Record<string, unknown>): 'overrides' | 'resolutions' {
+  const fields = ['overrides', 'resolutions'].filter(key => Object.hasOwn(pkg, key));
+  if (fields.length > 1) refuse('E_HOST_DEPENDENCY_RANGE', 'both overrides and resolutions are present; Bun cannot compose them');
+  for (const key of fields) {
+    const value = pkg[key];
+    if (!value || typeof value !== 'object' || Array.isArray(value)) refuse('E_HOST_DEPENDENCY_RANGE', `${key} must be an object`);
+    // Nested npm overrides can change Bun's lock format even when disjoint.
+    // Refuse before materialization rather than reaching the lock backstop.
+    if (key === 'overrides') for (const [name, entry] of Object.entries(value)) {
+      if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+        refuse('E_HOST_DEPENDENCY_RANGE', `overrides[${JSON.stringify(name)}]: nested overrides are not supported together with host dependency pins`);
+      }
+    }
+  }
+  return fields[0] === 'resolutions' ? 'resolutions' : 'overrides';
+}
+/** Do not try to model installer precedence or selector dialects. Only literal
+ * unrelated package names can be proven disjoint; complex selectors and $refs
+ * conservatively refuse, even when they might not match a selected input. */
+function assertDisjointPolicy(entries: Record<string, unknown>, section: string, selected: string[]): void {
+  const visit = (object: Record<string, unknown>, path: string, depth: number): void => {
+    if (depth > 64) refuse('E_HOST_DEPENDENCY_RANGE', `${path}: resolution policy nesting exceeds 64`);
+    for (const [key, value] of Object.entries(object)) {
+      const at = `${path}[${JSON.stringify(key)}]`;
+      const literal = key !== '.' && key !== '..' && /^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/.test(key);
+      if (selected.includes(key) || (!literal && !(key === '.' && depth > 0))) {
+        refuse('E_HOST_DEPENDENCY_RANGE', `${at}: policy could address selected input (${selected.join(', ')}); cannot compose selectors`);
+      }
+      if (typeof value === 'string') {
+        if (value.trimStart().startsWith('$')) refuse('E_HOST_DEPENDENCY_RANGE', `${at}: policy reference ${JSON.stringify(value)} could address a selected input`);
+      } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+        visit(value as Record<string, unknown>, at, depth + 1);
+      } else {
+        refuse('E_HOST_DEPENDENCY_RANGE', `${at}: unsupported resolution policy value`);
+      }
+    }
+  };
+  visit(entries, section, 0);
+}
+function checkHash(bytes: Buffer, expected: string, path: string): string {
+  const observed = createHash('sha256').update(bytes).digest('hex');
+  if (observed !== expected) refuse('E_HOST_DEPENDENCY_HASH', `${path}: expected ${expected}, observed ${observed}`);
+  return observed;
+}
+/** Older cooks may have dropped the lock field while retaining our checkout edits. */
+export function assertHostDependencyReinstall(installDir: string, records: LockedHostDependency[] | undefined, inputs: HostDependencyInput[], drop = false): void {
+  if (drop && inputs.length) refuse('E_HOST_DEPENDENCY_OPTION', '--drop-host-dependencies cannot be combined with --host-dependency');
+  if (drop) return;
+  const names = new Set((records ?? []).map(record => record.name));
+  const manifest = join(installDir, 'app', 'package.json');
+  if (lstatIfPresent(join(installDir, 'host-inputs')) && lstatIfPresent(manifest)) {
+    let pkg: Record<string, unknown>;
+    try {
+      pkg = JSON.parse(readFileSync(manifest, 'utf8'));
+      if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)) throw new Error('invalid manifest');
+    }
+    catch { refuse('E_HOST_DEPENDENCY_REINSTALL', `cannot inspect retained checkout ${manifest}; repeat --host-dependency or pass --drop-host-dependencies`); }
+    for (const section of ['dependencies', 'devDependencies', 'optionalDependencies', 'overrides', 'resolutions']) {
+      const entries = pkg[section];
+      if (entries && typeof entries === 'object') for (const [name, value] of Object.entries(entries)) {
+        if (typeof value === 'string' && /^file:.*\/host-inputs\/[a-f0-9]{64}\.tgz$/.test(value)) names.add(name);
+      }
+    }
+  }
+  const missing = [...names].filter(name => !inputs.some(input => input.name === name));
+  if (!drop && missing.length) refuse('E_HOST_DEPENDENCY_REINSTALL',
+    `lock or checkout records host dependencies (${missing.join(', ')}); repeat --host-dependency for each or pass --drop-host-dependencies`);
+}
+function lstatIfPresent(path: string): ReturnType<typeof lstatSync> | undefined {
+  try { return lstatSync(path); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }
+}
+function storage(root: string, create: boolean): void {
+  try { provisionPrivateDirectory(root, create); }
+  catch (error) { refuse('E_HOST_DEPENDENCY_STORAGE', `${root}: ${(error as Error).message}; requires Linux /proc, real directory ancestors (no symlinks), and an owned 0700 host-inputs directory`); }
+}
 function isTrustedDependency(pkg: { trustedDependencies?: unknown }, name: string): boolean {
   if (!Object.hasOwn(pkg, 'trustedDependencies')) return false;
   const trusted = pkg.trustedDependencies;
-  if (!Array.isArray(trusted) || !trusted.every(value => typeof value === 'string')) refuse('E_HOST_DEPENDENCY_TRUSTED');
+  if (!Array.isArray(trusted) || !trusted.every(value => typeof value === 'string')) refuse('E_HOST_DEPENDENCY_TRUSTED', `${name}: host trustedDependencies must be an array of strings`);
   return trusted.includes(name);
 }
 export function parseHostDependencies(raw: unknown): HostDependencyInput[] {
@@ -44,10 +118,10 @@ export function parseHostDependencies(raw: unknown): HostDependencyInput[] {
 /** Deliberately bounded ustar subset: regular files/directories only. Reject
  * extensions/links rather than disagreeing with the installer's path rules. */
 export function archivePackage(bytes: Buffer): { name?: unknown; version?: unknown } {
-  let observedMagic = 'unavailable';
+  let observedMagic = 'unavailable', reason = 'malformed or unsupported ustar archive';
   try {
     const tar = gunzipSync(bytes, { maxOutputLength: MAX_TAR });
-    let offset = 0, entries = 0, manifest: Buffer | undefined, ended = false;
+    let offset = 0, entries = 0, manifest: Buffer | undefined, ended = false, root: string | undefined;
     const paths = new Set<string>();
     const field = (b: Buffer) => b.toString('utf8').replace(/\0.*$/s, '');
     const octal = (b: Buffer) => {
@@ -68,14 +142,22 @@ export function archivePackage(bytes: Buffer): { name?: unknown; version?: unkno
       const name = field(h.subarray(0, 100)), prefix = field(h.subarray(345, 500));
       const path = prefix ? prefix + '/' + name : name;
       const type = h[156];
+      if (type === 120 || type === 103 || type === 76 || type === 75) {
+        reason = 'pax/extended header entry is unsupported'; throw 0;
+      }
       if (type !== 0 && type !== 48 && type !== 53) throw 0;
       const normalized = type === 53 && path.endsWith('/') ? path.slice(0, -1) : path;
       if (!normalized || normalized.includes('\\') || normalized.split('/').some(p => !p || p === '..' || p === '.') || paths.has(normalized)) throw 0;
+      const parts = normalized.split('/');
+      root ??= parts[0];
+      if (parts[0] !== root || (parts.length === 1 && type !== 53)) {
+        reason = 'all entries must share one top-level directory'; throw 0;
+      }
       paths.add(normalized);
       const size = octal(h.subarray(124, 136));
       const next = offset + 512 + Math.ceil(size / 512) * 512;
       if (next > tar.length || (type === 53 && size !== 0)) throw 0;
-      if (path === 'package/package.json') {
+      if (normalized === root + '/package.json') {
         if (type === 53 || size > MAX_JSON) throw 0;
         manifest = tar.subarray(offset + 512, offset + 512 + size);
       }
@@ -85,11 +167,11 @@ export function archivePackage(bytes: Buffer): { name?: unknown; version?: unkno
     const pkg = JSON.parse(manifest.toString('utf8'));
     if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)) throw 0;
     return pkg;
-  } catch { throw new Error(`E_HOST_DEPENDENCY_ARCHIVE: local host dependency refused; observed magic=${observedMagic}; no registry fallback`); }
+  } catch { throw new Error(`E_HOST_DEPENDENCY_ARCHIVE: ${reason}; observed magic=${observedMagic}; no registry fallback`); }
 }
 function readSnapshot(fd: number): Buffer {
   const size = fstatSync(fd).size;
-  if (size > MAX_ARCHIVE) refuse('E_HOST_DEPENDENCY_FILE');
+  if (size > MAX_ARCHIVE) refuse('E_HOST_DEPENDENCY_FILE', `size ${size}; maximum ${MAX_ARCHIVE} bytes`);
   const bytes = Buffer.alloc(size);
   let offset = 0;
   while (offset < size) {
@@ -99,72 +181,97 @@ function readSnapshot(fd: number): Buffer {
   }
   return bytes;
 }
-function snapshot(source: string, dest: string): Buffer {
+function snapshot(source: string, dest: string, onCreated?: () => void): Buffer {
   let input: number | undefined, output: number | undefined;
   try {
     input = openSync(source, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const st = fstatSync(input);
-    if (!st.isFile() || st.size > MAX_ARCHIVE) throw 0;
-    output = openSync(dest, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL, 0o600);
+    if (!st.isFile()) throw new Error('not a regular file');
+    if (st.size > MAX_ARCHIVE) throw new Error(`size ${st.size}; maximum ${MAX_ARCHIVE} bytes`);
+    output = openSync(dest, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    onCreated?.();
     const chunk = Buffer.alloc(64 * 1024);
     let total = 0, count: number;
     while ((count = readSync(input, chunk, 0, chunk.length, null))) {
-      if ((total += count) > MAX_ARCHIVE) throw 0;
+      if ((total += count) > MAX_ARCHIVE) throw new Error(`maximum ${MAX_ARCHIVE} bytes exceeded during copy`);
       let written = 0;
       while (written < count) written += writeSync(output, chunk, written, count - written);
     }
     fchmodSync(output, 0o400);
+    fsyncSync(output);
     // Read/hash ONLY the owned copy, never the source path.
     return readSnapshot(output);
-  } catch { return refuse('E_HOST_DEPENDENCY_FILE'); }
+  } catch (error) {
+    const e = error as NodeJS.ErrnoException;
+    return refuse('E_HOST_DEPENDENCY_FILE', `${source} → ${dest}: ${e.code ?? e.message}`);
+  }
   finally { if (input !== undefined) closeSync(input); if (output !== undefined) closeSync(output); }
 }
-export function preflightHostDependencies(url: string, ref: string, inputs: HostDependencyInput[], installDir: string): { commit: string; records: LockedHostDependency[]; materialize: () => void; cleanup: () => void; discardNew: () => void } {
+export function preflightHostDependencies(url: string, ref: string, inputs: HostDependencyInput[], installDir: string): { commit: string; checkout: string; records: LockedHostDependency[]; materialize: () => void; cleanup: () => void; discardNew: () => void } {
   assertCredentialFreeSourceUrl(url);
+  const inputRoot = join(installDir, 'host-inputs');
+  storage(inputRoot, false); // read-only validation before preview or output mutation
   const root = mkdtempSync(join(tmpdir(), 'cook-host-dependency-')); // owned 0700; pre-mutation staging only
   const cleanup = () => rmSync(root, { recursive: true, force: true });
   try {
     const artifacts = inputs.map((input, i) => {
       const path = join(root, `${i}.tgz`), bytes = snapshot(input.path, path);
-      const sha256 = createHash('sha256').update(bytes).digest('hex');
-      if (sha256 !== input.sha256) refuse('E_HOST_DEPENDENCY_HASH');
-      const pkg = archivePackage(bytes);
-      if (pkg.name !== input.name) refuse('E_HOST_DEPENDENCY_NAME');
+      const sha256 = checkHash(bytes, input.sha256, `${input.name} (${input.path})`);
+      let pkg: ReturnType<typeof archivePackage>;
+      try { pkg = archivePackage(bytes); }
+      catch (error) { throw new Error((error as Error).message.replace(': ', `: ${input.name} (${input.path}): `)); }
+      if (pkg.name !== input.name) refuse('E_HOST_DEPENDENCY_NAME', `${input.path}: expected name ${input.name}, observed ${JSON.stringify(pkg.name)}`);
       return { input, path, size: bytes.length, sha256, pkg };
     });
     const git = (args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000, maxBuffer: MAX_JSON }).trim();
     let commit: string, host: Partial<Record<Section | 'overrides' | 'resolutions', Record<string, unknown>>> & { trustedDependencies?: unknown };
+    const checkout = join(root, 'source');
+    let operation = 'init';
     try {
-      git(['init', '--bare', 'source.git']);
-      const base = ['--git-dir=source.git'];
-      git([...base, 'fetch', '--depth=1', '--', url, ref]);
+      git(['init', checkout]);
+      const base = ['-C', checkout];
+      git([...base, 'remote', 'add', 'origin', url]);
+      operation = 'fetch';
+      git([...base, 'fetch', '--depth=1', '--', 'origin', ref]);
       commit = git([...base, 'rev-parse', 'FETCH_HEAD^{commit}']);
+      operation = 'read package.json';
       host = JSON.parse(git([...base, 'show', commit + ':package.json']));
-      if (!host || typeof host !== 'object') throw 0;
-    } catch { return refuse('E_HOST_DEPENDENCY_SOURCE'); }
+      if (!host || typeof host !== 'object' || Array.isArray(host)) throw new Error('manifest must be an object');
+    } catch (error) {
+      // Never echo arbitrary Git/helper output: it can contain authentication material.
+      const e = error as NodeJS.ErrnoException & { stderr?: Buffer; status?: number; signal?: string };
+      const stderr = String(e.stderr ?? '');
+      const cause = /couldn't find remote ref/.test(stderr) ? 'ref not found'
+        : /does not appear to be a git repository|not a git repository|repository .* not found/i.test(stderr) ? 'repository inaccessible'
+        : e.code ?? (e.signal ? 'terminated ' + e.signal : e.status !== undefined ? 'exit ' + e.status : 'invalid host manifest');
+      return refuse('E_HOST_DEPENDENCY_SOURCE', `${url}@${ref}: ${operation}: ${cause}; inspect with git fetch --depth=1 -- <repository> <ref>`);
+    }
+    const policy = resolutionSection(host);
+    assertDisjointPolicy(host[policy] ?? {}, policy, inputs.map(input => input.name));
     const records = artifacts.map(({ input, size, sha256, pkg }) => {
       const sections = (['dependencies', 'devDependencies', 'optionalDependencies'] as const).filter(s => host[s] && Object.hasOwn(host[s], input.name));
-      if (isTrustedDependency(host, input.name)) refuse('E_HOST_DEPENDENCY_TRUSTED');
-      if (!sections.length) refuse('E_HOST_DEPENDENCY_UNDECLARED');
-      if (sections.length !== 1 || Object.hasOwn(host.overrides ?? {}, input.name) || Object.hasOwn(host.resolutions ?? {}, input.name)) refuse('E_HOST_DEPENDENCY_RANGE');
+      if (isTrustedDependency(host, input.name)) refuse('E_HOST_DEPENDENCY_TRUSTED', `${input.name} (${input.path}): host explicitly trusts this dependency's lifecycle scripts`);
+      if (!sections.length) refuse('E_HOST_DEPENDENCY_UNDECLARED', `${input.name}: no direct declaration in acquired host`);
+      if (sections.length !== 1) refuse('E_HOST_DEPENDENCY_RANGE', `${input.name}: multiple direct declarations`);
       const section = sections[0]!, range = host[section]![input.name];
-      if (typeof range !== 'string' || !range.trim() || !validRange(range)) refuse('E_HOST_DEPENDENCY_RANGE');
-      if (typeof pkg.version !== 'string' || !valid(pkg.version) || !satisfies(pkg.version, range)) refuse('E_HOST_DEPENDENCY_VERSION');
+      if (typeof range !== 'string' || !range.trim() || !validRange(range)) refuse('E_HOST_DEPENDENCY_RANGE', `${input.name}: unsupported original range ${JSON.stringify(range)}`);
+      if (typeof pkg.version !== 'string' || !valid(pkg.version) || !satisfies(pkg.version, range)) refuse('E_HOST_DEPENDENCY_VERSION', `${input.name} (${input.path}): observed version ${JSON.stringify(pkg.version)}; expected range ${range}`);
       const path = join(installDir, 'host-inputs', sha256 + '.tgz'), after = 'file:' + path;
       return { name: input.name, originalRange: range, version: pkg.version, sha256, size, snapshot: path,
         packageJsonDelta: { direct: { section, name: input.name, before: range, after },
-          override: { section: 'overrides' as const, name: input.name, before: null, after } } };
+          override: { section: policy, name: input.name, before: null, after } } };
     });
-    rmSync(join(root, 'source.git'), { recursive: true, force: true });
     const created = new Set<string>();
     const discardNew = () => { for (const path of created) rmSync(path, { force: true }); };
     const materialize = () => {
-      provisionPrivateDirectory(join(installDir, 'host-inputs'));
+      storage(inputRoot, true);
+      let activePath = inputRoot;
       try {
         for (let i = 0; i < records.length; i++) {
           const record = records[i]!;
+          activePath = record.snapshot;
           let bytes: Buffer;
-          if (existsSync(record.snapshot)) {
+          if (lstatIfPresent(record.snapshot)) {
             const fd = openSync(record.snapshot, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
             try {
               const st = fstatSync(fd);
@@ -176,72 +283,59 @@ export function preflightHostDependencies(url: string, ref: string, inputs: Host
               bytes = readSnapshot(fd);
             } finally { closeSync(fd); }
           } else {
-            created.add(record.snapshot);
-            bytes = snapshot(artifacts[i]!.path, record.snapshot);
+            bytes = snapshot(artifacts[i]!.path, record.snapshot, () => created.add(record.snapshot));
           }
-          if (bytes.length !== record.size || createHash('sha256').update(bytes).digest('hex') !== record.sha256) refuse('E_HOST_DEPENDENCY_HASH');
+          checkHash(bytes, record.sha256, record.snapshot);
         }
-        cleanup(); // No successful checkout ever depends on staging tmp.
-      } catch (err) { discardNew(); throw err; }
+        const fd = openSync(inputRoot, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+        for (const artifact of artifacts) rmSync(artifact.path); // retain only the acquired checkout until transfer
+      } catch (err) {
+        discardNew();
+        if ((err as Error).message.startsWith('E_HOST_DEPENDENCY_')) throw err;
+        refuse('E_HOST_DEPENDENCY_FILE', `${activePath}: ${(err as NodeJS.ErrnoException).code ?? (err as Error).message}`);
+      }
     };
-    return { commit, records, materialize, cleanup, discardNew };
+    return { commit, checkout, records, materialize, cleanup, discardNew };
   } catch (err) { cleanup(); throw err; }
 }
-/** Called after pinned checkout and immediately before bun install. */
+/** The checkout is the exact preflight-validated commit; apply only its planned delta. */
 export function applyHostDependencies(checkout: string, records: LockedHostDependency[]): void {
   const path = join(checkout, 'package.json');
   const pkg = JSON.parse(readFileSync(path, 'utf8'));
   for (const { packageJsonDelta: { direct: d, override } } of records) {
-    if (pkg[d.section]?.[d.name] !== d.before) refuse('E_HOST_DEPENDENCY_SOURCE');
-    if (isTrustedDependency(pkg, d.name)) refuse('E_HOST_DEPENDENCY_TRUSTED');
-    if (Object.hasOwn(pkg.overrides ?? {}, d.name) || Object.hasOwn(pkg.resolutions ?? {}, d.name)) refuse('E_HOST_DEPENDENCY_SOURCE');
     pkg[d.section][d.name] = d.after;
-    pkg.overrides ??= {};
-    pkg.overrides[override.name] = override.after;
+    pkg[override.section] ??= {};
+    pkg[override.section][override.name] = override.after;
   }
   writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
 }
-
-/** Census only, not a range/API compatibility validator. Follow the installed
- * node_modules package tree, including scoped/nested copies and package links. */
-export function recordInstalledHostDependencies(checkout: string, records: LockedHostDependency[]): void {
-  for (const record of records) { record.installedCopies = []; record.duplicateCount = 0; }
-  const visited = new Set<string>(), skipped = new Map<string, string>();
-  const walk = (modules: string) => {
-    if (!existsSync(modules)) return;
-    // The census is observational: filesystem/metadata failures must not turn
-    // a successful build into install failure and cleanup of its checkout.
-    try {
-      const real = realpathSync(modules);
-      if (visited.has(real)) return;
-      visited.add(real);
-      const packages: string[] = [];
-      for (const name of readdirSync(modules).filter(n => !n.startsWith('.'))) {
-        const path = join(modules, name);
-        if (!name.startsWith('@')) { packages.push(path); continue; }
-        try {
-          if (!statSync(path).isDirectory()) { skipped.set(path, 'scope entry is not a directory'); continue; }
-          packages.push(...readdirSync(path).map(child => join(path, child)));
-        } catch { skipped.set(path, 'scope entry could not be scanned'); }
-      }
-      for (const path of packages) {
-        const manifest = join(path, 'package.json');
-        try {
-          const pkg = JSON.parse(readFileSync(manifest, 'utf8'));
-          if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)) { skipped.set(manifest, 'manifest is not a JSON object'); continue; }
-          for (const record of records) if (pkg.name === record.name) {
-            record.installedCopies!.push({ path, version: String(pkg.version) });
-          }
-        } catch { skipped.set(manifest, 'manifest is unreadable or unparsable'); continue; }
-        walk(join(path, 'node_modules'));
-      }
-    } catch { skipped.set(modules, 'node_modules directory could not be scanned'); }
-  };
-  walk(join(checkout, 'node_modules'));
+/** Backstop the installer's policy implementation: every lock copy of a selected
+ * name must identify the validated archive and its bytes, not just its version.
+ * No node_modules census, dependent range check or precedence-aware merging. */
+export function verifyHostDependencyResolutions(checkout: string, records: LockedHostDependency[]): void {
+  const path = join(checkout, 'bun.lock');
+  const reject = (detail: string): never => refuse('E_HOST_DEPENDENCY_RESOLUTION', `${path}: ${detail}`);
+  let packages: Record<string, unknown>;
+  try {
+    const lock = Bun.JSONC.parse(readFileSync(path, 'utf8'));
+    if (!lock || typeof lock !== 'object' || Array.isArray(lock)) throw 0;
+    const { lockfileVersion, packages: entries } = lock as Record<string, unknown>;
+    if ((lockfileVersion !== 1 && lockfileVersion !== 2) || !entries || typeof entries !== 'object' || Array.isArray(entries)) throw 0;
+    packages = entries as Record<string, unknown>;
+  } catch { return reject('cannot verify pinned inputs: missing, malformed or unsupported text lockfile (supported lockfileVersion: 1 or 2)'); }
   for (const record of records) {
-    record.installedCopies!.sort((a, b) => a.path.localeCompare(b.path));
-    record.censusStatus = skipped.size ? 'incomplete' : 'complete';
-    record.duplicateCount = skipped.size ? null : Math.max(0, record.installedCopies!.length - 1);
-    record.censusSkippedEntries = [...skipped].sort(([a], [b]) => a.localeCompare(b)).map(([path, reason]) => ({ path, reason }));
+    // The tarball's validated manifest version is bound by these exact bytes.
+    const bytes = readFileSync(record.snapshot);
+    checkHash(bytes, record.sha256, record.snapshot);
+    const integrity = 'sha512-' + createHash('sha512').update(bytes).digest('base64');
+    if (!Object.hasOwn(packages, record.name)) reject(`${record.name}: pinned root resolution is missing`);
+    for (const [key, entry] of Object.entries(packages)) {
+      const identity = Array.isArray(entry) ? entry[0] : undefined;
+      if (key !== record.name && !key.endsWith('/' + record.name) && !(typeof identity === 'string' && identity.startsWith(record.name + '@'))) continue;
+      if (!Array.isArray(entry) || identity !== `${record.name}@${record.snapshot}` || entry.length !== 3 || entry[2] !== integrity) {
+        reject(`${record.name}: resolution ${JSON.stringify(key)} is not pinned to ${record.snapshot} (version ${record.version}, sha256 ${record.sha256})`);
+      }
+    }
   }
 }

@@ -227,3 +227,5 @@ For now this lives in @Tengro's namespace. Once the CLI is meaningfully battle-t
 Apache 2.0. See [LICENSE](./LICENSE).
 
 Host installs: [hash-pinned local dependency inputs](docs/host-dependency.md).
+With `--host-dependency`, nested npm overrides (even unrelated ones) refuse
+before install writes; disjoint flat overrides and resolutions remain supported.

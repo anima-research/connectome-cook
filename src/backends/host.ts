@@ -1,4 +1,4 @@
-import { applyHostDependencies, recordInstalledHostDependencies, parseHostDependencies, preflightHostDependencies, type LockedHostDependency } from '../host-dependency.js';
+import { applyHostDependencies, assertHostDependencyReinstall, parseHostDependencies, preflightHostDependencies, verifyHostDependencyResolutions, type LockedHostDependency } from '../host-dependency.js';
 /**
  * Host backend — materializes an InstallPlan directly onto the operator's
  * machine instead of into a docker image. This is the "link against the
@@ -64,6 +64,8 @@ import type { BuildResult } from './docker.js';
 export interface HostBackendOptions {
   /** Repeatable name=absolute-archive#sha256=hex inputs. */
   hostDependencies?: string | string[];
+  /** Explicitly restore the unmodified host dependency declarations. */
+  dropHostDependencies?: boolean;
   /** Install root. Default: ~/.connectome/installs/<slug>. */
   installDir: string;
   /** Non-interactive mode (no prompts at all). */
@@ -213,7 +215,7 @@ export function renderActionPreview(actions: HostActions, options: HostBackendOp
     if (c.buildCommand) lines.push(`      then run: ${c.buildCommand}`);
     if (c.authSecret) lines.push(`      (private clone: token from $${c.authSecret})`);
   }
-  for (const d of dependencies) lines.push(`  - REPLACE dependency ${d.name} ${d.originalRange} → ${d.packageJsonDelta.direct.after} (sha256 ${d.sha256.slice(0, 12)}…) + same-name override`);
+  for (const d of dependencies) lines.push(`  - REPLACE dependency ${d.name} ${d.originalRange} → ${d.packageJsonDelta.direct.after} (sha256 ${d.sha256.slice(0, 12)}…) + same-name ${d.packageJsonDelta.override.section}`);
   for (const c of actions.copies) {
     lines.push(`  - COPY ${c.from} → ${c.target} (sibling checkout)`);
   }
@@ -276,47 +278,59 @@ function cloneUrlFor(action: CloneAction, values: Record<string, string>): strin
 
 /** Execute one clone+build action. Throws on failure; the caller removes
  *  the target on failure so no half-built checkout survives. */
-function executeClone(action: CloneAction, values: Record<string, string>, dependencies?: LockedHostDependency[], onDependencyMutation?: () => void): { commit?: string } {
+function executeClone(
+  action: CloneAction, values: Record<string, string>, dependencies?: LockedHostDependency[],
+  onDependencyMutation?: () => void, preparedCheckout?: string,
+): { commit?: string } {
   rmSync(action.target, { recursive: true, force: true });
   mkdirSync(resolve(action.target, '..'), { recursive: true });
 
-  const sslArgs = action.sslBypass ? ['-c', 'http.sslVerify=false'] : [];
-  log.step(`cloning ${log.dim(action.url)}${action.ref !== 'main' ? `@${action.ref}` : ''} → ${log.dim(action.target)}`);
-  execFileSync('git', [...sslArgs, 'clone', cloneUrlFor(action, values), action.target], {
-    stdio: ['ignore', 'inherit', 'inherit'],
-  });
-  if (action.authSecret) {
-    // Scrub the token from .git/config — the credentialed URL must not
-    // persist on disk (backups, shared machines, later `git fetch`).
-    execFileSync('git', ['remote', 'set-url', 'origin', action.url], {
+  if (preparedCheckout) {
+    log.step(`using preflight checkout → ${log.dim(action.target)}`);
+    cpSync(preparedCheckout, action.target, { recursive: true });
+    // Populate files only after confirmation; preflight reads Git objects, not a worktree.
+    execFileSync('git', ['checkout', '--detach', action.commit!], {
       cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
     });
-  }
-  if (action.commit) {
-    // Pinned build: check out the exact SHA the operator resolved at cook
-    // time, regardless of where the branch tip has moved since. A refspec
-    // pin (refs/merge-requests/*, refs/pull/*) isn't fetched by the plain
-    // clone — fetch the ref first so the SHA exists in the object store.
-    if (action.ref.startsWith('refs/')) {
-      execFileSync('git', ['fetch', 'origin', action.ref], {
+  } else {
+    const sslArgs = action.sslBypass ? ['-c', 'http.sslVerify=false'] : [];
+    log.step(`cloning ${log.dim(action.url)}${action.ref !== 'main' ? `@${action.ref}` : ''} → ${log.dim(action.target)}`);
+    execFileSync('git', [...sslArgs, 'clone', cloneUrlFor(action, values), action.target], {
+      stdio: ['ignore', 'inherit', 'inherit'],
+    });
+    if (action.authSecret) {
+      // Scrub the token from .git/config — the credentialed URL must not
+      // persist on disk (backups, shared machines, later `git fetch`).
+      execFileSync('git', ['remote', 'set-url', 'origin', action.url], {
         cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
       });
     }
-    execFileSync('git', ['checkout', action.commit], {
-      cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
-    });
-  } else if (action.ref && action.ref !== 'main') {
-    if (action.ref.startsWith('refs/')) {
-      execFileSync('git', ['fetch', 'origin', `${action.ref}:cook-install-checkout`], {
+    if (action.commit) {
+      // Pinned build: check out the exact SHA the operator resolved at cook
+      // time, regardless of where the branch tip has moved since. A refspec
+      // pin (refs/merge-requests/*, refs/pull/*) isn't fetched by the plain
+      // clone — fetch the ref first so the SHA exists in the object store.
+      if (action.ref.startsWith('refs/')) {
+        execFileSync('git', ['fetch', 'origin', action.ref], {
+          cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
+        });
+      }
+      execFileSync('git', ['checkout', action.commit], {
         cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
       });
-      execFileSync('git', ['checkout', 'cook-install-checkout'], {
-        cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
-      });
-    } else {
-      execFileSync('git', ['checkout', action.ref], {
-        cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
-      });
+    } else if (action.ref && action.ref !== 'main') {
+      if (action.ref.startsWith('refs/')) {
+        execFileSync('git', ['fetch', 'origin', `${action.ref}:cook-install-checkout`], {
+          cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
+        });
+        execFileSync('git', ['checkout', 'cook-install-checkout'], {
+          cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
+        });
+      } else {
+        execFileSync('git', ['checkout', action.ref], {
+          cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
+        });
+      }
     }
   }
   let commit: string | undefined;
@@ -339,6 +353,7 @@ function executeClone(action: CloneAction, values: Record<string, string>, depen
       env: process.env,
     });
   }
+  if (dependencies?.length) verifyHostDependencyResolutions(action.target, dependencies);
   return { ...(commit !== undefined ? { commit } : {}) };
 }
 
@@ -466,6 +481,14 @@ export async function runHostBackend(
   for (const source of plan.sources) {
     assertCredentialFreeSourceUrl(source.url, `${sourceLocation(source)}.url`);
   }
+  let existingLock: Lockfile | null = null;
+  try {
+    existingLock = readLockfile(installDir);
+  } catch (err) {
+    log.warn(`existing ${LOCKFILE_NAME} unreadable (${err instanceof Error ? err.message : String(err)}) — treating as fresh install`);
+  }
+
+  assertHostDependencyReinstall(installDir, existingLock?.hostDependencies, dependencyInputs, options.dropHostDependencies);
   const dependencies = dependencyInputs.length ? preflightHostDependencies(options.chRepoUrl, options.chCommit ?? options.chRef, dependencyInputs, installDir) : undefined;
   if (dependencies) options = { ...options, chCommit: dependencies.commit };
   let keepSnapshots = false;
@@ -496,13 +519,6 @@ export async function runHostBackend(
       throw new Error('E_HOST_DEPENDENCY_SOURCE: recipe target overlaps host inputs');
     }
   }
-  let existingLock: Lockfile | null = null;
-  try {
-    existingLock = readLockfile(installDir);
-  } catch (err) {
-    log.warn(`existing ${LOCKFILE_NAME} unreadable (${err instanceof Error ? err.message : String(err)}) — treating as fresh install`);
-  }
-
   // ---- Confirm gate: commands run on the operator's machine. ----
   process.stdout.write(renderActionPreview(actions, options, dependencies?.records) + '\n\n');
   if (options.noPrompts) {
@@ -523,23 +539,26 @@ export async function runHostBackend(
     }
   }
 
+  dependencies?.materialize();
   mkdirSync(installDir, { recursive: true });
   mkdirSync(join(installDir, 'recipes'), { recursive: true });
-  dependencies?.materialize();
 
   // ---- Clone + build components (idempotent against the lock). ----
   const lockedComponents: LockedComponent[] = [];
   let chCommit: string | undefined;
   for (const action of actions.clones) {
     let commit: string | undefined;
-    if (!(action.role === 'connectome-host' && (dependencies || existingLock?.hostDependencies?.length)) && isSatisfiedByLock(action, existingLock)) {
+    if (!(action.role === 'connectome-host' && (dependencies || options.dropHostDependencies || existingLock?.hostDependencies?.length)) && isSatisfiedByLock(action, existingLock)) {
       log.info(`unchanged ${log.dim(action.key)} — kept (${log.dim(action.target)})`);
       commit = action.role === 'connectome-host'
         ? existingLock!.connectomeHost.commit
         : existingLock!.components.find((c) => c.key === action.key)?.commit;
     } else {
       try {
-        commit = executeClone(action, plan.values, action.role === 'connectome-host' ? dependencies?.records : undefined, () => { keepSnapshots = true; }).commit;
+        commit = executeClone(
+          action, plan.values, action.role === 'connectome-host' ? dependencies?.records : undefined,
+          () => { keepSnapshots = true; }, action.role === 'connectome-host' ? dependencies?.checkout : undefined,
+        ).commit;
       } catch (err) {
         log.error(
           `install of ${action.key} failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -733,7 +752,6 @@ export async function runHostBackend(
       { mode: 0o755 },
     );
 
-    if (dependencies) recordInstalledHostDependencies(join(installDir, 'app'), dependencies.records);
     const lock: Lockfile = {
       version: 1,
       backend: 'host',
