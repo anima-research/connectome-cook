@@ -251,3 +251,15 @@ describe('pin-refs', () => {
     );
   });
 });
+
+test('R2-4: trusted uppercase object IDs are normalized on both pin entrypoints', () => {
+  for (const ref of ['B'.repeat(40), 'C'.repeat(64)]) {
+    expect(resolveRemoteRef('https://example.invalid/repo.git', ref)).toBe(ref.toLowerCase());
+    const source: McpSource = {
+      key: 'k', url: 'https://example.invalid/repo.git', ref,
+      install: { kind: 'npm' }, inContainerPath: '/x', refs: [], authSecret: 'TOKEN',
+    };
+    pinSources([source]);
+    expect(source.commit).toBe(ref.toLowerCase());
+  }
+});

@@ -34,7 +34,7 @@ export function resolveRemoteRef(
   url: string, ref: string, sslBypass = false, location = 'Source URL',
 ): string | null {
   assertCredentialFreeSourceUrl(url, location);
-  if (looksLikeSha(ref)) return ref;
+  if (looksLikeSha(ref)) return ref.toLowerCase();
   for (const candidate of candidateRefNames(ref)) {
     const args = [...(sslBypass ? ['-c', 'http.sslVerify=false'] : []), 'ls-remote', url, candidate];
     let output: string;
@@ -79,7 +79,7 @@ export function pinSources(sources: McpSource[]): void {
     if (!source.url || source.commit) continue;
     if (source.install.kind === 'npm-global' || source.install.kind === 'sibling-copy') continue;
     if (looksLikeSha(source.ref)) {
-      source.commit = source.ref;
+      source.commit = source.ref.toLowerCase();
       continue;
     }
     if (source.authSecret) {

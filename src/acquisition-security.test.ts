@@ -333,7 +333,7 @@ for (const ref of ['b'.repeat(40), 'B'.repeat(40), 'c'.repeat(64)]) {
     const result = run('build', { url, ref, authSecret: 'GIT_TOKEN' }, ['--pin-refs']);
     expect(result.status).toBe(0);
     expect(gitCalls()).not.toContain(url);
-    expect(readFileSync(join(dir, 'out/connectome.lock'), 'utf-8')).toContain(ref);
+    expect(readFileSync(join(dir, 'out/connectome.lock'), 'utf-8')).toContain(ref.toLowerCase());
   });
 }
 
