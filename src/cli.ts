@@ -1,4 +1,3 @@
-import { hostLayout } from './host-layout.js';
 import mri from 'mri';
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
@@ -205,6 +204,11 @@ async function handleInstall(argv: string[]): Promise<number> {
     return 1;
   }
 
+  // Layout flag shape errors must not trigger recipe prompts or source fetches.
+  if (flags.layout !== undefined) {
+    if (typeof flags.layout !== 'string' || !flags.layout.trim()) throw new Error('E_HOST_LAYOUT: --layout requires a nonempty local JSON path');
+    if (!flags['bun-path'] || !flags['node-path']) throw new Error('E_HOST_LAYOUT: --layout requires both --bun-path and --node-path');
+  }
   // Refuse unit options before recipe resolution can fetch or prompt.
   if (flags['user-unit'] !== undefined) {
     validateUserUnit(flags['user-unit']);
@@ -254,7 +258,7 @@ async function handleInstall(argv: string[]): Promise<number> {
   );
   const result = await runHostBackend(planResult.plan, {
     installDir,
-    layout: flags.layout ? hostLayout(JSON.parse(readFileSync(flags.layout, 'utf8')), installDir) : undefined,
+    layout: flags.layout !== undefined ? JSON.parse(readFileSync(flags.layout, 'utf8')) : undefined,
     userUnit: flags['user-unit'],
     bunPath: flags['bun-path'],
     nodePath: flags['node-path'],

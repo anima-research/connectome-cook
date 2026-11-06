@@ -47,3 +47,16 @@ test('provisioning refuses unsafe existing modes, symlinks, files and wrong owne
     expect(() => provisionPrivateDirectory(c.state)).toThrow('E_PRIVATE_OWNER');
   }
 });
+
+test('layout R1 diagnostics identify the root, path and unsafe property', () => {
+  const c = layout(); mkdirSync(c.state, { mode: 0o750 });
+  expect(() => hostLayout(c, c.runtime)).toThrow('state');
+  expect(() => hostLayout(c, c.runtime)).toThrow(c.state);
+  expect(() => hostLayout(c, c.runtime)).toThrow('E_PRIVATE_MODE');
+  chmodSync(c.state, 0o700); symlinkSync(c.state, c.workspace);
+  expect(() => hostLayout(c, c.runtime)).toThrow('workspace');
+  expect(() => hostLayout(c, c.runtime)).toThrow('E_PRIVATE_PATH');
+  rmSync(c.workspace);
+  expect(() => hostLayout({ ...c, config: c.state + '/nested' }, c.runtime)).toThrow('state');
+  expect(() => hostLayout({ ...c, config: 'relative' }, c.runtime)).toThrow('config');
+});
