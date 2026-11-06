@@ -68,6 +68,7 @@ import type { BuildResult } from './docker.js';
 export interface HostBackendOptions {
   /** Export a static user unit under the installation; never install/start it. */
   userUnit?: string;
+  /** Opt-in separate configuration, runtime, state, workspace and credential roots. */
   layout?: HostLayout;
   /** Both absolute paths opt into fail-closed host engine validation. */
   bunPath?: string;
@@ -411,6 +412,14 @@ function warnServiceNameNetworking(
   }
 }
 
+/** Stable comparison of JSON layout declarations, independent of key order. */
+function canonical(value: unknown): string {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + canonical((value as Record<string, unknown>)[key])).join(',') + '}';
+  }
+  return JSON.stringify(value);
+}
+
 /** Shell-safe single-quoted value for the sourceable .env. */
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -593,7 +602,10 @@ async function materializeHost(
     log.warn(`existing ${LOCKFILE_NAME} unreadable (${err instanceof Error ? err.message : String(err)}) — treating as fresh install`);
   }
 
-  if (existingLock && JSON.stringify(existingLock.layout) !== JSON.stringify(layout)) throw new Error('E_HOST_LAYOUT: layout changes require a fresh stopped installation');
+  const sameLayout = existingLock?.layout === undefined || layout === undefined
+    ? existingLock?.layout === layout
+    : canonical(existingLock.layout) === canonical(layout);
+  if (existingLock && !sameLayout) throw new Error('E_HOST_LAYOUT: layout changes require a fresh stopped installation');
   const hadSelectedEngines = existingLock?.engines !== undefined;
   if (JSON.stringify(existingLock?.engines) !== JSON.stringify(engines)) existingLock = null;
   // Preserve the operator hint separately from clone reuse invalidation.
