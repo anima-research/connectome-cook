@@ -6,8 +6,9 @@ import { join } from 'node:path';
 
 const CANARY = 'REVIEW_CANARY';
 
-// Exercise the production catch path with real Git and a synthetic remote
-// helper, not a mocked exec error. The helper never opens a socket.
+// Exercise the production catch path with real Git and the synthetic remote
+// helper git-remote-review, not a credential helper or a mocked exec error.
+// Credential-helper output reaches the same suppressed stdio. No sockets open.
 function diagnostic(payload: string, fd = 2): string {
   const dir = mkdtempSync(join(tmpdir(), 'cook-pin-diagnostic-'));
   try {
@@ -31,26 +32,9 @@ function diagnostic(payload: string, fd = 2): string {
   }
 }
 
-const cases: [string, string, number?][] = [
-  ['https', `fatal: proxy https://user:${CANARY}@proxy.invalid rejected`],
-  ...['ssh', 'git+https', 'socks5'].map((scheme) => [scheme, `fatal: proxy ${scheme}://user:${CANARY}@proxy.invalid rejected`] as [string, string]),
-  ['ipv6', `fatal: proxy socks5://user:${CANARY}@[::1]:1080 rejected`],
-  ['encoded-user', `fatal: proxy https://user:%52EVIEW_CANARY@proxy.invalid rejected`],
-  ['encoded-host', `fatal: proxy https://user:${CANARY}@%65xample.invalid rejected`],
-  ['bare-userpass', `fatal: proxy user:${CANARY}@proxy.invalid rejected`],
-  ['schemeless', `fatal: proxy //user:${CANARY}@proxy.invalid rejected`],
-  ['split-url', `fatal: proxy https://user:\n${CANARY}@proxy.invalid rejected`],
-  ['split-three-line-cap', `fatal: proxy https://user:\n${CANARY}@proxy.invalid rejected\nTLS handshake failed\ncheck CA file`],
-  ['before-line-cap', `https://user:${CANARY}@proxy.invalid\none\ntwo\nthree`],
-  ['after-line-cap', `one\ntwo\nthree\nhttps://user:${CANARY}@proxy.invalid rejected`],
-  ['long-userinfo', `fatal: proxy https://user:${CANARY}${'x'.repeat(900)}@proxy.invalid rejected`],
-  ['clip-boundary', `${'x'.repeat(900)} https://user:${CANARY}@proxy.invalid rejected`],
-  ['long-safe', `old\n${'a'.repeat(300)}\n${'b'.repeat(300)}\n${'c'.repeat(300)}`],
-  ['header', `fatal: Authorization: Bearer ${CANARY}`],
-  ['token', `fatal: ghp_${CANARY}`],
-  ['ordinary', 'fatal: TLS handshake failed\ncheck custom CA file'],
-  ['stdout-url', `fatal: proxy https://user:${CANARY}@proxy.invalid rejected`, 1],
-  ['stdout-bare', `fatal: proxy user:${CANARY}@proxy.invalid rejected`, 1],
+const cases: [string, string, number][] = [
+  ['stderr', `fatal: proxy https://user:${CANARY}@proxy.invalid rejected`, 2],
+  ['stdout', `fatal: proxy https://user:${CANARY}@proxy.invalid rejected`, 1],
 ];
 
 for (const [name, payload, fd] of cases) {

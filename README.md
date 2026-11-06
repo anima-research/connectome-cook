@@ -106,6 +106,7 @@ derivation does not support these suffixes. This validation is not shell quoting
 and does not make generated Docker commands safe for arbitrary URLs or refs.
 Surrounding whitespace and ASCII control characters are also rejected. Unknown
 token formats may not be recognized: never put credentials in a source URL.
+
 ### Sidecars in host mode
 
 `cook install` supports recipes with sidecar `services` and
@@ -131,10 +132,6 @@ private repos) fail before any files are written or clones/builds start. Private
 short hex strings are resolved as symbolic refs, like other branch/tag names.
 Abbreviated commit IDs cannot be pinned: use the full 40-hex ID from
 `git rev-parse <ref>` with `--pin-refs`.
-
-Compatibility: this also changes Docker `cook build --pin-refs`: an `authSecret`
-source tracking a branch now fails instead of warning and continuing unpinned.
-Without `--pin-refs`, host and Docker `authSecret` behavior is unchanged.
 
 ### Templates
 
