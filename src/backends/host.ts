@@ -1,4 +1,4 @@
-import { applyHostDependencies, parseHostDependencies, preflightHostDependencies, type LockedHostDependency } from '../host-dependency.js';
+import { applyHostDependencies, recordInstalledHostDependencies, parseHostDependencies, preflightHostDependencies, type LockedHostDependency } from '../host-dependency.js';
 /**
  * Host backend — materializes an InstallPlan directly onto the operator's
  * machine instead of into a docker image. This is the "link against the
@@ -63,7 +63,7 @@ import type { BuildResult } from './docker.js';
 
 export interface HostBackendOptions {
   /** Repeatable name=absolute-archive#sha256=hex inputs. */
-  hostDependencies?: string[];
+  hostDependencies?: string | string[];
   /** Install root. Default: ~/.connectome/installs/<slug>. */
   installDir: string;
   /** Non-interactive mode (no prompts at all). */
@@ -202,7 +202,7 @@ export function planHostActions(plan: InstallPlan, options: HostBackendOptions):
 }
 
 /** Render the confirm-gate preview. Pure (string). */
-export function renderActionPreview(actions: HostActions, options: HostBackendOptions): string {
+export function renderActionPreview(actions: HostActions, options: HostBackendOptions, dependencies: LockedHostDependency[] = []): string {
   const lines: string[] = [];
   lines.push(`Host install plan → ${options.installDir}`);
   lines.push('');
@@ -213,6 +213,7 @@ export function renderActionPreview(actions: HostActions, options: HostBackendOp
     if (c.buildCommand) lines.push(`      then run: ${c.buildCommand}`);
     if (c.authSecret) lines.push(`      (private clone: token from $${c.authSecret})`);
   }
+  for (const d of dependencies) lines.push(`  - REPLACE dependency ${d.name} ${d.originalRange} → ${d.packageJsonDelta.direct.after} (sha256 ${d.sha256.slice(0, 12)}…) + same-name override`);
   for (const c of actions.copies) {
     lines.push(`  - COPY ${c.from} → ${c.target} (sibling checkout)`);
   }
@@ -275,7 +276,7 @@ function cloneUrlFor(action: CloneAction, values: Record<string, string>): strin
 
 /** Execute one clone+build action. Throws on failure; the caller removes
  *  the target on failure so no half-built checkout survives. */
-function executeClone(action: CloneAction, values: Record<string, string>, dependencies?: LockedHostDependency[]): { commit?: string } {
+function executeClone(action: CloneAction, values: Record<string, string>, dependencies?: LockedHostDependency[], onDependencyMutation?: () => void): { commit?: string } {
   rmSync(action.target, { recursive: true, force: true });
   mkdirSync(resolve(action.target, '..'), { recursive: true });
 
@@ -326,7 +327,10 @@ function executeClone(action: CloneAction, values: Record<string, string>, depen
     // Non-fatal — lock entry just omits the commit.
   }
 
-  if (dependencies?.length) applyHostDependencies(action.target, dependencies);
+  if (dependencies?.length) {
+    applyHostDependencies(action.target, dependencies);
+    onDependencyMutation?.();
+  }
   if (action.buildCommand) {
     log.step(`building ${log.dim(action.target)}: ${action.buildCommand}`);
     execSync(action.buildCommand, {
@@ -462,9 +466,10 @@ export async function runHostBackend(
   for (const source of plan.sources) {
     assertCredentialFreeSourceUrl(source.url, `${sourceLocation(source)}.url`);
   }
-  const dependencies = dependencyInputs.length ? preflightHostDependencies(options.chRepoUrl, options.chCommit ?? options.chRef, dependencyInputs) : undefined;
+  const dependencies = dependencyInputs.length ? preflightHostDependencies(options.chRepoUrl, options.chCommit ?? options.chRef, dependencyInputs, installDir) : undefined;
   if (dependencies) options = { ...options, chCommit: dependencies.commit };
   let keepSnapshots = false;
+  let completed = false;
   try {
   const parent = plan.parentWalk.recipe;
   const hasSidecars = (parent.services ?? []).length > 0;
@@ -483,6 +488,14 @@ export async function runHostBackend(
   }
 
   const actions = planHostActions(plan, options);
+  if (dependencies) {
+    const inputRoot = join(installDir, 'host-inputs');
+    const targets = [...actions.clones.map(a => a.target), ...actions.copies.map(a => a.target),
+      ...runtimeFiles.map(f => f.kind === 'sidecar-template' ? resolve(installDir, f.relPath) : hostPathFor(installDir, f.inContainer!))];
+    if (targets.some(target => target === inputRoot || target.startsWith(inputRoot + '/') || inputRoot.startsWith(target + '/'))) {
+      throw new Error('E_HOST_DEPENDENCY_SOURCE: recipe target overlaps host inputs');
+    }
+  }
   let existingLock: Lockfile | null = null;
   try {
     existingLock = readLockfile(installDir);
@@ -491,7 +504,7 @@ export async function runHostBackend(
   }
 
   // ---- Confirm gate: commands run on the operator's machine. ----
-  process.stdout.write(renderActionPreview(actions, options) + '\n\n');
+  process.stdout.write(renderActionPreview(actions, options, dependencies?.records) + '\n\n');
   if (options.noPrompts) {
     if (!options.yes) {
       log.error('host install runs commands on this machine; non-interactive mode requires --yes');
@@ -512,6 +525,7 @@ export async function runHostBackend(
 
   mkdirSync(installDir, { recursive: true });
   mkdirSync(join(installDir, 'recipes'), { recursive: true });
+  dependencies?.materialize();
 
   // ---- Clone + build components (idempotent against the lock). ----
   const lockedComponents: LockedComponent[] = [];
@@ -525,7 +539,7 @@ export async function runHostBackend(
         : existingLock!.components.find((c) => c.key === action.key)?.commit;
     } else {
       try {
-        commit = executeClone(action, plan.values, action.role === 'connectome-host' ? dependencies?.records : undefined).commit;
+        commit = executeClone(action, plan.values, action.role === 'connectome-host' ? dependencies?.records : undefined, () => { keepSnapshots = true; }).commit;
       } catch (err) {
         log.error(
           `install of ${action.key} failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -719,6 +733,7 @@ export async function runHostBackend(
       { mode: 0o755 },
     );
 
+    if (dependencies) recordInstalledHostDependencies(join(installDir, 'app'), dependencies.records);
     const lock: Lockfile = {
       version: 1,
       backend: 'host',
@@ -754,7 +769,13 @@ export async function runHostBackend(
   log.success(`host install complete → ${installDir}`);
   log.info('');
   log.info(`Next: ${log.bold(`${join(installDir, 'run.sh')}`)}`);
-  keepSnapshots = true;
+  completed = true;
   return { exitCode: 0, outDir: installDir };
-  } finally { if (!keepSnapshots) dependencies?.cleanup(); }
+  } finally {
+    dependencies?.cleanup();
+    if (!completed) {
+      if (keepSnapshots) rmSync(join(installDir, 'app'), { recursive: true, force: true });
+      dependencies?.discardNew();
+    }
+  }
 }
