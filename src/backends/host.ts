@@ -1,3 +1,5 @@
+import { guard, noLinks, publish, syncDir, syncTree } from '../candidate/io.js';
+import { canonical, fail } from '../candidate/schema.js';
 /**
  * Host backend — materializes an InstallPlan directly onto the operator's
  * machine instead of into a docker image. This is the "link against the
@@ -33,9 +35,10 @@
  */
 
 import { execFileSync, execSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { constants as fsConstants, closeSync, fchmodSync, fsyncSync, openSync, cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
+import { candidateGitEnvironment, gitEnvironment, processAllowlistEnv } from '../process-env.js';
 import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
 import { log } from '../log.js';
 import type { GeneratorInput, McpSource } from '../types.js';
@@ -58,9 +61,28 @@ import {
   type Lockfile,
   type LockedComponent,
 } from '../lockfile.js';
+import { credentialBindings, credentialSecretFiles, renderCredentialAdapter, validateCredentialConsumers, type CredentialBindings } from '../host-credentials.js';
+import { provisionSecretFiles } from '../secret-save.js';
+import { provisionPrivateDirectory } from '../private-directory.js';
+import { applyConnectorState, hostLayout, provisionLayout, validateLayoutConsumers, type HostLayout } from '../host-layout.js';
+import { privateWrite } from '../private-write.js';
+import { renderUserUnit, validateUserUnit } from '../host-unit.js';
+import { hostBuildPath, preflightHostEngines, type HostEngines } from '../host-engines.js';
 import type { BuildResult } from './docker.js';
 
 export interface HostBackendOptions {
+  /** Internal held-candidate preparation; CLI cannot bypass the hold guard. */
+  candidate?: boolean;
+  /** Export a static user unit under the installation; never install/start it. */
+  userUnit?: string;
+  /** Opt-in separate configuration, runtime, state, workspace and credential roots. */
+  layout?: HostLayout;
+  /** Nonsecret file bindings for named stdio consumer launch adapters. */
+  credentials?: CredentialBindings;
+  /** Both absolute paths opt into fail-closed host engine validation. */
+  bunPath?: string;
+  /** Absolute Node path, required together with bunPath. */
+  nodePath?: string;
   /** Install root. Default: ~/.connectome/installs/<slug>. */
   installDir: string;
   /** Non-interactive mode (no prompts at all). */
@@ -255,39 +277,28 @@ export function isSatisfiedByLock(
     && (action.commit === undefined || entry.commit === action.commit);
 }
 
-/** Clone URL with an optional token (resolved values > environment; never
- *  logged). The credentialed form is briefly visible in the process list
- *  during the clone; executeClone scrubs it from .git/config afterwards. */
-function cloneUrlFor(action: CloneAction, values: Record<string, string>): string {
-  if (!action.authSecret) return action.url;
-  const token = values[action.authSecret] ?? process.env[action.authSecret];
-  if (!token) {
-    throw new Error(
-      `clone of ${action.url} needs a value for ${action.authSecret} ` +
-      `(supply via prompt, --env-file, or the environment)`,
-    );
+/** Build tools get only allowlisted process/network settings and declared
+ * host requirements, not the runtime value bag or arbitrary parent variables. */
+function buildEnvironment(plan: InstallPlan): NodeJS.ProcessEnv {
+  const env = processAllowlistEnv();
+  for (const requirement of plan.requirements) {
+    if (requirement.value !== undefined) env[requirement.envName] = requirement.value;
   }
-  return action.url.replace(/^https?:\/\//, (m) => `${m}oauth2:${token}@`);
+  return env;
 }
 
 /** Execute one clone+build action. Throws on failure; the caller removes
  *  the target on failure so no half-built checkout survives. */
-function executeClone(action: CloneAction, values: Record<string, string>): { commit?: string } {
+function executeClone(action: CloneAction, buildEnv: NodeJS.ProcessEnv, quiet = false): { commit?: string } {
   rmSync(action.target, { recursive: true, force: true });
   mkdirSync(resolve(action.target, '..'), { recursive: true });
 
+  const gitEnv = quiet ? candidateGitEnvironment(buildEnv) : gitEnvironment(buildEnv);
   const sslArgs = action.sslBypass ? ['-c', 'http.sslVerify=false'] : [];
   log.step(`cloning ${log.dim(action.url)}${action.ref !== 'main' ? `@${action.ref}` : ''} → ${log.dim(action.target)}`);
-  execFileSync('git', [...sslArgs, 'clone', cloneUrlFor(action, values), action.target], {
-    stdio: ['ignore', 'inherit', 'inherit'],
+  execFileSync('git', [...sslArgs, 'clone', action.url, action.target], {
+    stdio: quiet ? 'ignore' : ['ignore', 'inherit', 'inherit'], env: gitEnv,
   });
-  if (action.authSecret) {
-    // Scrub the token from .git/config — the credentialed URL must not
-    // persist on disk (backups, shared machines, later `git fetch`).
-    execFileSync('git', ['remote', 'set-url', 'origin', action.url], {
-      cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
-    });
-  }
   if (action.commit) {
     // Pinned build: check out the exact SHA the operator resolved at cook
     // time, regardless of where the branch tip has moved since. A refspec
@@ -295,29 +306,29 @@ function executeClone(action: CloneAction, values: Record<string, string>): { co
     // clone — fetch the ref first so the SHA exists in the object store.
     if (action.ref.startsWith('refs/')) {
       execFileSync('git', ['fetch', 'origin', action.ref], {
-        cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
+        cwd: action.target, stdio: quiet ? 'ignore' : ['ignore', 'inherit', 'inherit'], env: gitEnv,
       });
     }
     execFileSync('git', ['checkout', action.commit], {
-      cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
+      cwd: action.target, stdio: quiet ? 'ignore' : ['ignore', 'inherit', 'inherit'], env: gitEnv,
     });
   } else if (action.ref && action.ref !== 'main') {
     if (action.ref.startsWith('refs/')) {
       execFileSync('git', ['fetch', 'origin', `${action.ref}:cook-install-checkout`], {
-        cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
+        cwd: action.target, stdio: quiet ? 'ignore' : ['ignore', 'inherit', 'inherit'], env: gitEnv,
       });
       execFileSync('git', ['checkout', 'cook-install-checkout'], {
-        cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
+        cwd: action.target, stdio: quiet ? 'ignore' : ['ignore', 'inherit', 'inherit'], env: gitEnv,
       });
     } else {
       execFileSync('git', ['checkout', action.ref], {
-        cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
+        cwd: action.target, stdio: quiet ? 'ignore' : ['ignore', 'inherit', 'inherit'], env: gitEnv,
       });
     }
   }
   let commit: string | undefined;
   try {
-    commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: action.target })
+    commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: action.target, env: gitEnv })
       .toString().trim();
   } catch {
     // Non-fatal — lock entry just omits the commit.
@@ -327,8 +338,8 @@ function executeClone(action: CloneAction, values: Record<string, string>): { co
     log.step(`building ${log.dim(action.target)}: ${action.buildCommand}`);
     execSync(action.buildCommand, {
       cwd: action.target,
-      stdio: ['ignore', 'inherit', 'inherit'],
-      env: process.env,
+      stdio: quiet ? 'ignore' : ['ignore', 'inherit', 'inherit'],
+      env: buildEnv,
     });
   }
   return { ...(commit !== undefined ? { commit } : {}) };
@@ -395,15 +406,24 @@ export interface LauncherEnvsubst {
 
 export function renderLauncher(
   parentRecipeBasename: string,
-  opts: { hasSidecars: boolean; envsubstFiles: LauncherEnvsubst[] },
+  opts: { hasSidecars: boolean; envsubstFiles: LauncherEnvsubst[]; candidate?: boolean; engines?: HostEngines; layout?: HostLayout },
 ): string {
+  if (opts.candidate) return [
+    '#!/usr/bin/env bash', '# connectome.candidate-launcher/v1 — one-way hold',
+    'set -euo pipefail', 'cd "$(dirname "$0")"',
+    'echo "E_HELD: disposable candidate is held; activation is not supported." >&2',
+    'exit 4', '',
+  ].join('\n');
   const lines = [
     '#!/usr/bin/env bash',
     '# Generated by connectome-cook (host backend). Launches the deployment.',
     'set -euo pipefail',
     'cd "$(dirname "$0")"',
-    'if [ -f ./.env ]; then',
-    '  set -a; . ./.env; set +a',
+    'if [ -e ./.cook/hold.json ] || [ -L ./.cook/hold.json ] || [ -e ./.cook ] || [ -L ./.cook ] || [ -e ./connectome.deployment.json ] || [ -L ./connectome.deployment.json ]; then',
+    '  echo "E_HELD: candidate metadata refuses launch." >&2; exit 4',
+    'fi',
+    'if [ -f ' + (opts.layout ? shellQuote(join(opts.layout.config, '.env')) : './.env') + ' ]; then',
+    '  set -a; . ' + (opts.layout ? shellQuote(join(opts.layout.config, '.env')) : './.env') + '; set +a',
     'fi',
   ];
   if (opts.hasSidecars) {
@@ -435,14 +455,25 @@ export function renderLauncher(
       lines.push(`chmod ${f.mode} "${f.target}"`);
     }
   }
-  lines.push(
-    '',
-    'export DATA_DIR="${DATA_DIR:-$PWD/data}"',
-    'mkdir -p "$DATA_DIR"',
-    'cd app',
-    `exec bun src/index.ts "../recipes/${parentRecipeBasename}" "$@"`,
-    '',
-  );
+  if (opts.layout) {
+    lines.push(
+      'umask 077',
+      'export DATA_DIR=' + shellQuote(opts.layout.state),
+      'export WORKSPACE_DIR=' + shellQuote(opts.layout.workspace),
+      'cd ' + shellQuote(opts.layout.workspace),
+      'exec ' + shellQuote(opts.engines!.bun.path) + ' ' + shellQuote(join(opts.layout.runtime, 'app/src/index.ts')) + ' ' + shellQuote(join(opts.layout.config, 'recipes', parentRecipeBasename)) + ' "$@"',
+      '',
+    );
+  } else {
+    lines.push(
+      '',
+      'export DATA_DIR="${DATA_DIR:-$PWD/data}"',
+      'mkdir -p "$DATA_DIR"',
+      'cd app',
+      `exec ${opts.engines ? shellQuote(opts.engines.bun.path) : "bun"} src/index.ts "../recipes/${parentRecipeBasename}" "$@"`,
+      '',
+    );
+  }
   return lines.join('\n');
 }
 
@@ -452,11 +483,71 @@ export async function runHostBackend(
   options: HostBackendOptions,
 ): Promise<BuildResult> {
   const installDir = options.installDir;
+  if (!options.candidate) guard(installDir);
+  const layout = options.layout === undefined ? undefined : hostLayout(options.layout, installDir);
+  if (layout) {
+    if (options.candidate || !options.bunPath || !options.nodePath) throw new Error('E_HOST_LAYOUT: selected engines and legacy install required');
+    if (plan.credentialFiles.length || (plan.parentWalk.recipe.services ?? []).length || plan.walks.some(w => (w.recipe.containerTemplateFiles ?? []).length)) throw new Error('E_HOST_LAYOUT: sidecars, legacy credential files and templates require the default layout');
+    if (Object.hasOwn(plan.values, 'DATA_DIR') || Object.hasOwn(plan.values, 'WORKSPACE_DIR')) throw new Error('E_HOST_LAYOUT: layout owns runtime roots');
+    validateLayoutConsumers(layout, plan.walks.map(w => w.recipe));
+  }
+  const credentials = options.credentials === undefined ? undefined : credentialBindings(options.credentials);
+  if (credentials) {
+    if (options.candidate || !options.bunPath || !options.nodePath || plan.credentialFiles.length) throw new Error('E_CREDENTIAL_BINDINGS: selected legacy engines without legacy credential files required');
+    validateCredentialConsumers(credentials, plan.walks.map(w => w.recipe), installDir, layout?.credentials);
+    if (layout) for (const [consumer, mapping] of Object.entries(credentials.consumers)) {
+      if (Object.keys(mapping).some(name => Object.hasOwn(layout.connectorState[consumer] ?? {}, name))) throw new Error('E_CREDENTIAL_BINDINGS: conflicting state and credential environment');
+    }
+  }
+  const adapterDir = join(installDir, 'credential-adapters');
+  const configDir = layout?.config ?? installDir;
+  const writeOutput = (path: string, content: string, opts?: { mode: number }) => {
+    if (layout) {
+      const root = path.startsWith(configDir + '/') ? configDir : installDir;
+      const result = privateWrite(root, relative(root, path), content, { allowTightening: true });
+      if (result.durability !== 'synced') throw new Error('E_PRIVATE_IO');
+      if (opts?.mode === 0o700) {
+        const fd = openSync(path, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW);
+        try { fchmodSync(fd, 0o700); fsyncSync(fd); } finally { closeSync(fd); }
+      }
+      return;
+    }
+    if (!options.candidate) { writeFileSync(path, content, opts); return; }
+    noLinks(dirname(path));
+    // Generated files are private, except the 0700 immutable refusal launcher.
+    publish(path, content);
+    if (opts?.mode === 0o700) {
+      const fd = openSync(path, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW);
+      try { fchmodSync(fd, 0o700); fsyncSync(fd); } finally { closeSync(fd); }
+      syncDir(dirname(path));
+    }
+  };
   // Preflight every source before previewing URLs or making any changes.
   assertCredentialFreeSourceUrl(options.chRepoUrl, '--ch-repo');
   for (const source of plan.sources) {
     assertCredentialFreeSourceUrl(source.url, `${sourceLocation(source)}.url`);
+    if (source.authSecret) {
+      throw new Error(
+        'Host installs do not support authSecret: no safe credential handoff is available. ' +
+        'Use a credential-free URL with externally configured Git authentication.',
+      );
+    }
   }
+  let userUnit: string | undefined;
+  if (options.userUnit !== undefined) {
+    if (options.candidate || !options.bunPath || !options.nodePath) throw new Error('E_HOST_UNIT: legacy selected engines required');
+    validateUserUnit(options.userUnit);
+    userUnit = renderUserUnit(installDir, layout?.workspace);
+  }
+  let engines: HostEngines | undefined;
+  if (options.bunPath !== undefined || options.nodePath !== undefined) {
+    if (options.candidate || !options.bunPath || !options.nodePath) throw new Error('E_HOST_ENGINE: both paths are required for legacy installs');
+    const checked = preflightHostEngines(options.chRepoUrl, options.chCommit ?? options.chRef, options.bunPath, options.nodePath);
+    engines = checked.engines;
+    options = { ...options, chCommit: checked.commit };
+  }
+  const buildEnv = buildEnvironment(plan);
+  if (engines) buildEnv.PATH = hostBuildPath(engines, buildEnv.PATH);
   const parent = plan.parentWalk.recipe;
   const hasSidecars = (parent.services ?? []).length > 0;
 
@@ -469,11 +560,36 @@ export async function runHostBackend(
   // real file), runtime-rendered ones as `.tmpl` for run.sh's envsubst.
   const valueBag = buildValueBag(plan);
   const runtimeFiles = renderRuntimeFiles(plan, valueBag);
+  if (layout && runtimeFiles.length) throw new Error('E_HOST_LAYOUT: templates require the default layout');
   if (!enforceCompleteTemplates(runtimeFiles, options.allowIncompleteTemplates)) {
     return { exitCode: 2, outDir: installDir };
   }
 
   const actions = planHostActions(plan, options);
+  if (layout) for (const target of [...actions.clones.map(a => a.target), ...actions.copies.map(a => a.target)]) {
+    const rel = relative(installDir, target);
+    if (!rel || rel.startsWith('..') || /^(?:run\.sh|connectome\.lock|\.cook)(?:\/|$)/.test(rel)) throw new Error('E_HOST_LAYOUT: code target escapes runtime root');
+  }
+  if (credentials) for (const target of [...actions.clones.map(a => a.target), ...actions.copies.map(a => a.target)]) {
+    if (target === adapterDir || target.startsWith(adapterDir + '/') || adapterDir.startsWith(target + '/')) throw new Error('E_CREDENTIAL_BINDINGS: code target overlaps adapters');
+  }
+  if (engines) actions.clones[0]!.buildCommand = shellQuote(engines.bun.path) + ' install';
+  if (options.candidate) {
+    // Never allow a recipe write to collide with controls or history. Builds
+    // remain trusted code, not sandboxed by this check or by a hold.
+    const targets = [...actions.clones.map(a => a.target), ...actions.copies.map(a => a.target)];
+    for (const target of targets) {
+      const rel = relative(installDir, target);
+      if (!rel || rel.startsWith('..') || /^(?:data|\.cook|recipes|connectome\.lock|connectome\.deployment\.json|run\.sh)(?:\/|$)/.test(rel)) fail('E_PATH');
+    }
+    for (const f of runtimeFiles) {
+      const rel = relative(installDir, f.kind === 'sidecar-template' ? resolve(installDir, f.relPath) : hostPathFor(installDir, f.inContainer!));
+      if (!rel || rel.startsWith('..') || /^(?:data|\.cook|recipes|connectome\.lock|connectome\.deployment\.json|run\.sh|\.env)(?:\/|$)/.test(rel)) fail('E_PATH');
+    }
+    for (const svc of parent.services ?? []) for (const name of svc.secrets ?? []) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || ['data', 'app', 'recipes'].includes(name)) fail('E_PATH');
+    }
+  }
   let existingLock: Lockfile | null = null;
   try {
     existingLock = readLockfile(installDir);
@@ -481,8 +597,14 @@ export async function runHostBackend(
     log.warn(`existing ${LOCKFILE_NAME} unreadable (${err instanceof Error ? err.message : String(err)}) — treating as fresh install`);
   }
 
+  const sameLayout = existingLock?.layout === undefined || layout === undefined
+    ? existingLock?.layout === layout
+    : canonical(existingLock.layout) === canonical(layout);
+  if (existingLock && !sameLayout) throw new Error('E_HOST_LAYOUT: layout changes require a fresh stopped installation');
+  if (engines && JSON.stringify(existingLock?.engines) !== JSON.stringify(engines)) existingLock = null;
+
   // ---- Confirm gate: commands run on the operator's machine. ----
-  process.stdout.write(renderActionPreview(actions, options) + '\n\n');
+  if (!options.candidate) process.stdout.write(renderActionPreview(actions, options) + '\n\n');
   if (options.noPrompts) {
     if (!options.yes) {
       log.error('host install runs commands on this machine; non-interactive mode requires --yes');
@@ -501,8 +623,16 @@ export async function runHostBackend(
     }
   }
 
-  mkdirSync(installDir, { recursive: true });
-  mkdirSync(join(installDir, 'recipes'), { recursive: true });
+  if (layout) provisionLayout(layout);
+  else {
+    mkdirSync(installDir, { recursive: true });
+    mkdirSync(join(installDir, 'recipes'), { recursive: true });
+  }
+
+  if (credentials) {
+    provisionSecretFiles(credentialSecretFiles(credentials));
+    provisionPrivateDirectory(adapterDir);
+  }
 
   // ---- Clone + build components (idempotent against the lock). ----
   const lockedComponents: LockedComponent[] = [];
@@ -516,7 +646,7 @@ export async function runHostBackend(
         : existingLock!.components.find((c) => c.key === action.key)?.commit;
     } else {
       try {
-        commit = executeClone(action, plan.values).commit;
+        commit = executeClone(action, buildEnv, options.candidate).commit;
       } catch (err) {
         log.error(
           `install of ${action.key} failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -604,8 +734,22 @@ export async function runHostBackend(
   try {
     for (const walk of plan.walks) {
       const configuration = lowerToConfiguration(walk.recipe, overlays.get(walk.path), walk.path);
-      writeFileSync(
-        join(installDir, 'recipes', recipeFilename(walk.path)),
+      if (layout) applyConnectorState(configuration, layout);
+      if (engines) for (const server of Object.values(configuration.mcpServers ?? {})) {
+        if (server.command === 'node') server.command = engines.node.path;
+        if (server.command === 'bun') server.command = engines.bun.path;
+      }
+      if (credentials) for (const consumer of Object.keys(credentials.consumers)) {
+        const server = configuration.mcpServers?.[consumer];
+        if (!server) continue;
+        const name = recipeFilename(walk.path) + '.' + consumer + '.mjs';
+        const script = renderCredentialAdapter(credentials, consumer, server.command!, server.args ?? []);
+        if (privateWrite(adapterDir, name, script).durability !== 'synced') throw new Error('E_PRIVATE_IO');
+        server.command = engines!.node.path;
+        server.args = [join(adapterDir, name)];
+      }
+      writeOutput(
+        join(configDir, 'recipes', recipeFilename(walk.path)),
         JSON.stringify(configuration, null, 2) + '\n',
       );
     }
@@ -637,7 +781,7 @@ export async function runHostBackend(
       }
       const mode = cf.mode ? parseInt(cf.mode, 8) : 0o600;
       mkdirSync(resolve(target, '..'), { recursive: true });
-      writeFileSync(target, serializeCredentialFile(cf, values), { mode });
+      writeOutput(target, serializeCredentialFile(cf, values), { mode });
     }
 
     // Sidecar secret files — same file-per-secret shape as docker; the
@@ -647,7 +791,7 @@ export async function runHostBackend(
       new Set(),
       `hand-place the file (mode 0600) in ${installDir} before launching`,
     )) {
-      writeFileSync(join(installDir, sec.name), sec.value, { mode: 0o600 });
+      writeOutput(join(installDir, sec.name), sec.value, { mode: 0o600 });
     }
 
     // Rendered runtime files. Guard every write against path escape — the
@@ -659,7 +803,7 @@ export async function runHostBackend(
         throw new Error(`rendered file "${target}" resolves outside the install dir — refusing to write`);
       }
       mkdirSync(resolve(resolved, '..'), { recursive: true });
-      writeFileSync(resolved, content, { mode });
+      writeOutput(resolved, content, { mode });
     };
     for (const f of runtimeFiles) {
       if (f.kind === 'sidecar-template') {
@@ -694,7 +838,7 @@ export async function runHostBackend(
       },
     });
     if (sidecarCompose !== null) {
-      writeFileSync(join(installDir, SIDECAR_COMPOSE_FILENAME), sidecarCompose);
+      writeOutput(join(installDir, SIDECAR_COMPOSE_FILENAME), sidecarCompose);
       warnServiceNameNetworking(
         plan,
         runtimeFiles.filter((f) => f.kind === 'container-template'),
@@ -702,17 +846,22 @@ export async function runHostBackend(
     }
 
     if (Object.keys(plan.values).length > 0) {
-      writeFileSync(join(installDir, '.env'), renderShellEnvFile(plan.values), { mode: 0o600 });
+      writeOutput(join(configDir, '.env'), renderShellEnvFile(plan.values), { mode: 0o600 });
     }
-    writeFileSync(
+    writeOutput(
       join(installDir, 'run.sh'),
-      renderLauncher(parentRecipeBasename, { hasSidecars, envsubstFiles }),
-      { mode: 0o755 },
+      renderLauncher(parentRecipeBasename, { hasSidecars, envsubstFiles, candidate: options.candidate, engines, layout }),
+      { mode: options.candidate || layout ? 0o700 : 0o755 },
     );
+
+    if (userUnit !== undefined) writeOutput(join(installDir, options.userUnit!), userUnit, { mode: 0o600 });
 
     const lock: Lockfile = {
       version: 1,
       backend: 'host',
+      ...(engines ? { engines } : {}),
+      ...(layout ? { layout } : {}),
+      ...(credentials ? { credentials } : {}),
       recipePath: plan.recipePath,
       createdAt: new Date().toISOString(),
       connectomeHost: {
@@ -733,9 +882,11 @@ export async function runHostBackend(
         origin: r.origin,
         ...(r.value !== undefined ? { value: r.value } : {}),
       })),
-      launch: { kind: 'script', script: join(installDir, 'run.sh') },
+      launch: { kind: 'script', script: join(installDir, 'run.sh'), ...(userUnit !== undefined ? { userUnit: join(installDir, options.userUnit!) } : {}) },
     };
-    writeLockfile(installDir, lock);
+    if (options.candidate) { syncTree(installDir); publish(join(installDir, LOCKFILE_NAME), JSON.stringify(lock, null, 2) + '\n'); }
+    else if (layout) writeOutput(join(installDir, LOCKFILE_NAME), JSON.stringify(lock, null, 2) + '\n');
+    else writeLockfile(installDir, lock);
   } catch (err) {
     log.error(`write failed: ${err instanceof Error ? err.message : String(err)}`);
     return { exitCode: 3, outDir: installDir };

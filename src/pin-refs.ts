@@ -11,6 +11,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { gitEnvironment } from './process-env.js';
 import { assertCredentialFreeSourceUrl, sourceLocation } from './source-url.js';
 import { log } from './log.js';
 import type { McpSource } from './types.js';
@@ -31,7 +32,7 @@ export function candidateRefNames(ref: string): string[] {
  * Returns null if no candidate ref exists; throws with diagnostics on remote failure.
  */
 export function resolveRemoteRef(
-  url: string, ref: string, sslBypass = false, location = 'Source URL',
+  url: string, ref: string, sslBypass = false, location = 'Source URL', env = gitEnvironment(),
 ): string | null {
   assertCredentialFreeSourceUrl(url, location);
   if (looksLikeSha(ref)) return ref.toLowerCase();
@@ -41,6 +42,7 @@ export function resolveRemoteRef(
     try {
       output = execFileSync('git', args, {
         encoding: 'utf-8',
+        env,
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 30_000,
       });
@@ -72,7 +74,7 @@ export function resolveRemoteRef(
  * sibling-copy, and already-pinned entries. Private symbolic refs are
  * refused: pinning does not implement an authSecret handoff.
  */
-export function pinSources(sources: McpSource[]): void {
+export function pinSources(sources: McpSource[], env = gitEnvironment()): void {
   for (const source of sources) {
     const location = sourceLocation(source);
     assertCredentialFreeSourceUrl(source.url, `${location}.url`);
@@ -85,7 +87,7 @@ export function pinSources(sources: McpSource[]): void {
     if (source.authSecret) {
       throw new Error(`--pin-refs: ${location}: cannot resolve private refs with authSecret; supply a full commit SHA.`);
     }
-    const sha = resolveRemoteRef(source.url, source.ref, source.sslBypass, location);
+    const sha = resolveRemoteRef(source.url, source.ref, source.sslBypass, location, env);
     if (sha) {
       source.commit = sha;
       log.info(`--pin-refs: ${log.dim(source.url)}@${source.ref} → ${sha.slice(0, 12)}`);
