@@ -17,7 +17,9 @@ export function assertCredentialFreeSourceUrl(url: string, location = 'Source UR
     }
     const tokenPrefix = /^(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-)/i;
     const tokenUser = /^(?:oauth2|x-access-token|x-token-auth)$/i;
-    if (/\s/u.test(username) || username.includes(':') || tokenPrefix.test(username) || tokenUser.test(username)) {
+    // Reject invisible/format characters after decoding, before token matching.
+    // Default-ignorable characters include non-format marks such as U+034F.
+    if (/[\p{Cc}\p{Cf}\p{Z}\p{Default_Ignorable_Code_Point}\s]/u.test(username) || username.includes(':') || tokenPrefix.test(username) || tokenUser.test(username)) {
       throw credentialError();
     }
   };
@@ -38,6 +40,7 @@ export function assertCredentialFreeSourceUrl(url: string, location = 'Source UR
     throw new Error(`${location}: invalid source URL; use a URL without embedded credentials.`);
   }
   checkUsername(parsed.username);
+  checkUsername(parsed.password);
   if (parsed.password) throw credentialError();
 }
 

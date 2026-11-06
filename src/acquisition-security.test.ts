@@ -388,3 +388,29 @@ for (const [command, customRepo] of [['build', false], ['install', false], ['ins
     });
   }
 }
+
+// Cover Cf and default-ignorable Mn characters, not just JavaScript whitespace.
+for (const char of ['\u200b', '\u200c', '\u200d', '\u2060', '\ufeff', '\u180e', '\u00ad', '\u034f', '\u0085', '\u2029', '\u3000']) {
+  for (const spelling of [char, encodeURIComponent(char)]) {
+    for (const part of ['username', 'password']) {
+      test(`R2-1: invisible userinfo ${char.codePointAt(0)!.toString(16)} ${spelling === char ? 'literal' : 'encoded'} ${part}`, () => {
+        const userinfo = part === 'username' ? `${spelling}ghp_CANARY123` : `git:${spelling}ghp_CANARY123`;
+        expect(() => assertCredentialFreeSourceUrl(`https://${userinfo}@example.invalid/x.git`)).toThrow('embedded credentials');
+      });
+    }
+  }
+}
+
+for (const url of ['git@host:org/repo.git', 'ssh://git@host:22/x', 'ssh://git@[::1]:22/x', 'https://user@[::1]/x', 'user@host:org/repo.git', 'user@', 'file:///tmp/repo', '/tmp/repo', './local repo', 'https://élève@host/x']) {
+  test(`R2-1: legitimate source remains accepted: ${url}`, () => {
+    expect(() => assertCredentialFreeSourceUrl(url)).not.toThrow();
+  });
+}
+
+test('R2-1: cook build rejects encoded invisible token canary without any output', () => {
+  const result = run('build', { url: 'https://%E2%80%8Bghp_CANARY123@example.invalid/x.git' });
+  expect(result.status).not.toBe(0);
+  expect(result.stdout + result.stderr).not.toContain('CANARY123');
+  expect(gitCalls()).toBe('');
+  expect(existsSync(join(dir, 'out'))).toBe(false);
+});
