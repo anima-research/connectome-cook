@@ -14,6 +14,11 @@ function unitQuote(value: string, exec = false): string {
   return '"' + value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%') + '"';
 }
 export function renderUserUnit(installDir: string): string {
+  // A terminal backslash can continue this bare value onto ExecStart.
+  // Refuse all terminal runs rather than attempting another representation.
+  if (installDir.endsWith('\\')) {
+    throw new Error('E_HOST_UNIT: installation path must not end in a backslash');
+  }
   if (!isAbsolute(installDir) || /[\0-\x1f\x7f]/.test(installDir) || /\s$/.test(installDir)) {
     throw new Error('E_HOST_UNIT: absolute control-free path without trailing whitespace required');
   }
