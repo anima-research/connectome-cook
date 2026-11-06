@@ -6,19 +6,18 @@
  * recorded in connectome.lock. Resolution uses `git ls-remote` — network
  * access at cook time, none at build time beyond the clones themselves.
  *
- * Failure policy: warn-and-continue per source. A ref that can't be
- * resolved (offline, auth, typo'd branch) keeps its symbolic form — the
- * build behaves exactly as without --pin-refs for that source, and the
- * warning names it.
+ * Failure policy: fail closed. An unresolved requested pin aborts before
+ * any backend materializes the plan.
  */
 
 import { execFileSync } from 'node:child_process';
+import { assertCredentialFreeSourceUrl, sourceLocation } from './source-url.js';
 import { log } from './log.js';
 import type { McpSource } from './types.js';
 
-/** 40-char (or abbreviated 7+) hex string — already a commit, nothing to do. */
+/** Only full SHA-1 or SHA-256 object IDs are trusted without remote lookup. */
 export function looksLikeSha(ref: string): boolean {
-  return /^[0-9a-f]{7,40}$/.test(ref);
+  return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(ref);
 }
 
 /** Candidate remote ref names to try for a symbolic ref, in order. */
@@ -29,52 +28,69 @@ export function candidateRefNames(ref: string): string[] {
 
 /**
  * Resolve `ref` on `url` to a commit SHA via `git ls-remote`.
- * Returns null when the remote is unreachable or the ref doesn't exist.
+ * Returns null if no candidate ref exists; throws with diagnostics on remote failure.
  */
-export function resolveRemoteRef(url: string, ref: string): string | null {
-  if (looksLikeSha(ref)) return ref;
+export function resolveRemoteRef(
+  url: string, ref: string, sslBypass = false, location = 'Source URL',
+): string | null {
+  assertCredentialFreeSourceUrl(url, location);
+  if (looksLikeSha(ref)) return ref.toLowerCase();
   for (const candidate of candidateRefNames(ref)) {
+    const args = [...(sslBypass ? ['-c', 'http.sslVerify=false'] : []), 'ls-remote', url, candidate];
     let output: string;
     try {
-      output = execFileSync('git', ['ls-remote', url, candidate], {
+      output = execFileSync('git', args, {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 30_000,
       });
-    } catch {
-      return null; // Remote unreachable — retrying other candidates won't help.
+    } catch (err) {
+      // Helper output and the execFileSync message may contain credentials.
+      // Report only spawn metadata, never stderr/stdout or the original error.
+      const { code, signal, status } = err as { code?: string; signal?: string; status?: number };
+      const outcome = code === 'ENOENT' ? 'git executable not found (ENOENT)'
+        : code === 'ETIMEDOUT' || signal ? 'git ls-remote timed out or was terminated'
+        : typeof status === 'number' ? `git ls-remote exit ${status}`
+        : 'git ls-remote could not start or complete';
+      // Quote argv for a POSIX shell so even local paths and unusual refs can be
+      // copied literally. The URL has already passed credential validation.
+      const command = ['git', ...args].map(arg => /^[a-z0-9_./:@=+-]+$/i.test(arg)
+        ? arg : "'" + arg.replaceAll("'", "'\\''") + "'").join(' ');
+      throw new Error(`--pin-refs: ${location}: could not resolve ${url}@${ref}: remote unreachable or refused (${outcome}); no output written. run \`${command}\` to see Git's diagnostics.`);
     }
     const sha = output.split('\n')[0]?.split('\t')[0]?.trim();
     if (sha && looksLikeSha(sha)) return sha;
+  }
+  if (/^[0-9a-f]{7,39}$/i.test(ref)) {
+    throw new Error(`--pin-refs: ${location}: '${ref}' looks like an abbreviated commit ID; --pin-refs needs the full 40-hex ID (git rev-parse ${ref}); no output written.`);
   }
   return null;
 }
 
 /**
  * Pin every git source in place (sets `source.commit`). Skips registry,
- * sibling-copy, and already-pinned entries. Private sources (authSecret)
- * are skipped with a note — ls-remote would need the credential and cook
- * shouldn't spray tokens at pin time; their clone step still authenticates
- * normally at build time.
+ * sibling-copy, and already-pinned entries. Private symbolic refs are
+ * refused: pinning does not implement an authSecret handoff.
  */
 export function pinSources(sources: McpSource[]): void {
   for (const source of sources) {
+    const location = sourceLocation(source);
+    assertCredentialFreeSourceUrl(source.url, `${location}.url`);
     if (!source.url || source.commit) continue;
     if (source.install.kind === 'npm-global' || source.install.kind === 'sibling-copy') continue;
-    if (source.authSecret) {
-      log.warn(`--pin-refs: ${source.key}: private source (authSecret) — left unpinned`);
-      continue;
-    }
     if (looksLikeSha(source.ref)) {
-      source.commit = source.ref;
+      source.commit = source.ref.toLowerCase();
       continue;
     }
-    const sha = resolveRemoteRef(source.url, source.ref);
+    if (source.authSecret) {
+      throw new Error(`--pin-refs: ${location}: cannot resolve private refs with authSecret; supply a full commit SHA.`);
+    }
+    const sha = resolveRemoteRef(source.url, source.ref, source.sslBypass, location);
     if (sha) {
       source.commit = sha;
       log.info(`--pin-refs: ${log.dim(source.url)}@${source.ref} → ${sha.slice(0, 12)}`);
     } else {
-      log.warn(`--pin-refs: could not resolve ${source.url}@${source.ref} — left unpinned`);
+      throw new Error(`--pin-refs: ${location}: ref not found: ${source.url}@${source.ref}; no output written.`);
     }
   }
 }

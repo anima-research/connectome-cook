@@ -95,6 +95,22 @@ Cook probes the candidates, suggests the first hit, lets you confirm or
 override, and exposes the answer as `$SPRING_HOME` — usable in recipe
 `${VAR}` references and install steps, and recorded in the lock.
 
+### Source credentials
+
+Source URLs must not embed password/token userinfo. Bare usernames such as
+`https://user-name.1@host/repo.git` are allowed for credential-helper account
+selection. After percent-decoding, usernames must be non-empty and contain only
+ASCII letters, digits, `.`, `_` and `-`. Any password component (even empty)
+is refused. Known token prefixes (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
+`github_pat_`, `glpat-`) are rejected anywhere in the decoded username, case-insensitively,
+as are token usernames (`oauth2`, `x-access-token`, `x-token-auth`).
+Protocol-relative (`//host/path`) spellings require an explicit scheme.
+Query strings and fragments are unsupported and rejected: source path
+derivation does not support these suffixes. This validation is not shell quoting
+and does not make generated Docker commands safe for arbitrary URLs or refs.
+Surrounding whitespace and ASCII control characters are also rejected. Unknown
+token formats may not be recognized: never put credentials in a source URL.
+
 ### Sidecars in host mode
 
 `cook install` supports recipes with sidecar `services` and
@@ -114,7 +130,12 @@ components and connectome-host itself — to its current commit SHA via
 `git ls-remote` at cook time. The SHA is baked into clone/checkout steps
 (and the `CH_REF` build-arg default) and recorded in `connectome.lock`,
 so rebuilding later reproduces the exact trees. Unresolvable refs (offline,
-private repos) warn and stay symbolic.
+private repos) fail before any files are written or clones/builds start. Private
+`authSecret` sources need an explicit full commit SHA when pinning. Only full
+40-hex SHA-1 or 64-hex SHA-256 object IDs are trusted without remote lookup;
+short hex strings are resolved as symbolic refs, like other branch/tag names.
+Abbreviated commit IDs cannot be pinned: use the full 40-hex ID from
+`git rev-parse <ref>` with `--pin-refs`.
 
 ### Templates
 
@@ -130,7 +151,7 @@ private repos) warn and stay symbolic.
 --image-name <name>    Override the generated image name
 --no-prompts           Non-interactive; warn-and-continue on missing values
 --env-file <path>      Read variable values from this file before prompting
---pin-refs             Resolve branch refs to current SHAs (Phase 4 — TODO)
+--pin-refs             Resolve branch refs to current SHAs; fail if unresolved
 ```
 
 ### Anthropic credentials

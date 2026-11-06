@@ -166,7 +166,8 @@ describe('renderRuntimeFiles', () => {
 describe('pin-refs', () => {
   test('looksLikeSha and candidateRefNames', () => {
     expect(looksLikeSha('a'.repeat(40))).toBe(true);
-    expect(looksLikeSha('abc1234')).toBe(true);
+    expect(looksLikeSha('abc1234')).toBe(false);
+    expect(looksLikeSha('a'.repeat(64))).toBe(true);
     expect(looksLikeSha('main')).toBe(false);
     expect(candidateRefNames('dev')).toEqual(['refs/heads/dev', 'refs/tags/dev', 'dev']);
     expect(candidateRefNames('refs/merge-requests/1/head')).toEqual(['refs/merge-requests/1/head']);
@@ -187,11 +188,15 @@ describe('pin-refs', () => {
 
     expect(resolveRemoteRef(repo, 'main')).toBe(head);
     expect(resolveRemoteRef(repo, 'no-such-branch')).toBeNull();
+    execFileSync('git', ['tag', '20241105'], { cwd: repo });
+    expect(resolveRemoteRef(repo, '20241105')).toBe(head);
+    expect(() => resolveRemoteRef(repo, 'deadbee')).toThrow('looks like an abbreviated commit ID');
+    expect(() => resolveRemoteRef(repo, head.slice(0, 7))).toThrow('needs the full 40-hex ID');
     // Already a SHA — returned verbatim, no ls-remote.
     expect(resolveRemoteRef('https://invalid.invalid/x.git', head)).toBe(head);
   });
 
-  test('pinSources pins plain git sources, skips private/registry/pinned', () => {
+  test('pinSources pins plain git sources, skips registry and refuses private symbolic refs', () => {
     const repo = join(dir, 'repo2');
     execFileSync('git', ['init', '-q', '-b', 'main', repo]);
     writeFileSync(join(repo, 'f.txt'), 'x');
@@ -212,10 +217,14 @@ describe('pin-refs', () => {
     const priv = mk({ key: 'priv', authSecret: 'TOKEN' });
     const registry = mk({ key: 'npm:p', url: '', install: { kind: 'npm-global', package: 'p' } });
     const shaRef = mk({ key: 'sha', ref: head });
-    pinSources([plain, priv, registry, shaRef]);
+    pinSources([plain, registry, shaRef]);
+    expect(() => pinSources([priv])).toThrow('cannot resolve private refs');
 
     expect(plain.commit).toBe(head);
     expect(priv.commit).toBeUndefined();
+    const privateSha = mk({ authSecret: 'TOKEN', ref: head });
+    pinSources([privateSha]);
+    expect(privateSha.commit).toBe(head);
     expect(registry.commit).toBeUndefined();
     expect(shaRef.commit).toBe(head);
   });
@@ -241,4 +250,16 @@ describe('pin-refs', () => {
       ' && git fetch origin refs/merge-requests/5/head && git checkout abc1234def',
     );
   });
+});
+
+test('R2-4: trusted uppercase object IDs are normalized on both pin entrypoints', () => {
+  for (const ref of ['B'.repeat(40), 'C'.repeat(64)]) {
+    expect(resolveRemoteRef('https://example.invalid/repo.git', ref)).toBe(ref.toLowerCase());
+    const source: McpSource = {
+      key: 'k', url: 'https://example.invalid/repo.git', ref,
+      install: { kind: 'npm' }, inContainerPath: '/x', refs: [], authSecret: 'TOKEN',
+    };
+    pinSources([source]);
+    expect(source.commit).toBe(ref.toLowerCase());
+  }
 });
