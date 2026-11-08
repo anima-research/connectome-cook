@@ -527,8 +527,13 @@ async function materializeHost(
     log.warn(`existing ${LOCKFILE_NAME} unreadable (${err instanceof Error ? err.message : String(err)}) — treating as fresh install`);
   }
 
-  const hadSelectedEngines = existingLock?.engines !== undefined;
-  if (JSON.stringify(existingLock?.engines) !== JSON.stringify(engines)) existingLock = null;
+  const engineBindingChanged = JSON.stringify(existingLock?.engines) !== JSON.stringify(engines);
+  // Retire the disk lock before any destructive work if ANY clone cannot be
+  // reused. Otherwise an interrupted ref/build/engine change could leave an
+  // old lock authorizing a newly built checkout on the next run.
+  const invalidateLock = !existingLock || engineBindingChanged
+    || actions.clones.some(action => !isSatisfiedByLock(action, existingLock));
+  if (engineBindingChanged) existingLock = null;
 
   // ---- Confirm gate: commands run on the operator's machine. ----
   process.stdout.write(renderActionPreview(actions, options) + '\n\n');
@@ -550,10 +555,13 @@ async function materializeHost(
     }
   }
 
+  if (invalidateLock) rmSync(join(installDir, LOCKFILE_NAME), { force: true });
+
   mkdirSync(installDir, { recursive: true });
   mkdirSync(join(installDir, 'recipes'), { recursive: true });
   const engineRoot = join(installDir, '.cook-engines');
-  if (engines || hadSelectedEngines) rmSync(engineRoot, { recursive: true, force: true });
+  // Also remove links left by a failed selected-engine install with no lock.
+  rmSync(engineRoot, { recursive: true, force: true });
   if (engines) {
     const binDir = join(engineRoot, 'bin');
     mkdirSync(binDir, { recursive: true, mode: 0o700 });

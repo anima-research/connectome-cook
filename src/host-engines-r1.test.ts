@@ -147,3 +147,26 @@ test('R1 pinned acquisition: --pin-refs does not look up the host twice', () => 
   const lines = readFileSync(trace, 'utf8').split('\n').filter(line => line.includes(repo) && /^(fetch|clone|ls-remote) /.test(line));
   expect(lines.length).toBe(1); expect(lines[0]).toContain('fetch');
 });
+
+for (const initial of [false, true]) test(`failed engine transition ${initial ? 'selected to legacy' : 'legacy to selected'} cannot reuse an old lock`, () => {
+  const mcp = join(dir, 'mcp'); mkdirSync(mcp);
+  execFileSync('git', ['init', '-b', 'main', mcp], { stdio: 'pipe' });
+  execFileSync('git', ['-C', mcp, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-m', 'fixture'], { stdio: 'pipe' });
+  const fail = join(dir, 'fail');
+  writeFileSync(recipe, JSON.stringify({ name: 'Fixture', agent: { systemPrompt: 'x' }, mcpServers: { fixture: { command: 'node', source: { url: mcp, install: { kind: 'custom', run: `test ! -e '${fail}' && echo built > build-marker`, runtime: 'custom' } } } } }));
+  // Distinguish the engines' installed dependency trees, not merely the launcher.
+  const tools = join(dir, 'legacy-tools'); mkdirSync(tools);
+  script(join(tools, 'bun'), 'echo legacy > engine-built');
+  script(bun, 'if [ "$1" = --version ]; then echo 1.4.4; else echo selected > engine-built; fi');
+  const env = { ...process.env, PATH: tools + ':' + process.env.PATH };
+  expect(install(initial, env).status).toBe(0);
+  writeFileSync(fail, 'fail');
+  expect(install(!initial, env).status).toBe(3);
+  expect(existsSync(join(out, 'connectome.lock'))).toBe(false);
+  rmSync(fail);
+  const retry = install(initial, env); expect(retry.status).toBe(0);
+  expect(retry.stdout).not.toContain('unchanged');
+  expect(readFileSync(join(out, 'app/engine-built'), 'utf8').trim()).toBe(initial ? 'selected' : 'legacy');
+  expect(existsSync(join(out, '.cook-engines'))).toBe(initial);
+});
+
