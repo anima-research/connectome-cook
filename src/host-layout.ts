@@ -1,5 +1,5 @@
 /** Explicit, opt-in standalone legacy layout. No data discovery or migration. */
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve, isAbsolute } from 'node:path';
 import { privatePathParts, provisionPrivateDirectory } from './private-directory.js';
 import type { Recipe } from './vendor/recipe.js';
 
@@ -33,6 +33,8 @@ export function hostLayout(value: unknown, installDir: string): HostLayout {
   if (!c.connectorState || typeof c.connectorState !== 'object' || Array.isArray(c.connectorState)) fail('connectorState', 'expected an object');
   for (const [consumer, env] of Object.entries(c.connectorState)) {
     if (!/^[A-Za-z0-9_-]+$/.test(consumer) || !env || typeof env !== 'object' || Array.isArray(env) || !Object.keys(env).length) fail(`connectorState.${consumer}`, 'expected a named consumer and nonempty env mapping');
+    const files = Object.values(env);
+    if (files.some((file, i) => typeof file === 'string' && files.some((other, j) => i !== j && typeof other === 'string' && other.startsWith(file + '/')))) fail(`connectorState.${consumer}`, 'a file cannot also be a parent directory');
     for (const [name, path] of Object.entries(env)) {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || typeof path !== 'string') fail(`connectorState.${consumer}.${name}`, 'expected an env name and relative file path');
       try { privatePathParts(path); }
@@ -40,8 +42,16 @@ export function hostLayout(value: unknown, installDir: string): HostLayout {
     }
   }
   // Check all existing roots before creating any. Retain both role and cause.
+  const identities = new Set<string>();
   for (const { role, path } of paths) {
-    try { provisionPrivateDirectory(path, false); }
+    try {
+      const stat = provisionPrivateDirectory(path, false);
+      if (stat) {
+        const identity = `${stat.dev}:${stat.ino}`;
+        if (identities.has(identity)) fail(role, 'root aliases another root (device/inode)');
+        identities.add(identity);
+      }
+    }
     catch (err) { fail(role, `${path}: ${err instanceof Error ? err.message : String(err)} (requires effective-user ownership, mode 0700 and no symlink/non-directory ancestors)`); }
   }
   return c;
@@ -75,4 +85,26 @@ export function applyConnectorState(configuration: Recipe, layout: HostLayout): 
     server.env = { ...server.env };
     for (const [name, path] of Object.entries(mapping)) server.env[name] = join(layout.state, 'connectors', consumer, path);
   }
+}
+
+/** Only paths move: preserve mount names, permissions and all other options. */
+export function applyWorkspaceMounts(configuration: Recipe, layout: HostLayout): void {
+  const workspace = configuration.modules?.workspace;
+  if (workspace === false) return;
+  const mounts = typeof workspace === 'object' ? workspace.mounts : [
+    { name: 'input', path: './input', mode: 'read-only' as const },
+    { name: 'products', path: './output', mode: 'read-write' as const },
+  ];
+  const reserved = [layout.state, layout.config, layout.runtime, layout.credentials];
+  const lowered = mounts.map(mount => {
+    const path = isAbsolute(mount.path) ? resolve(mount.path) : resolve(layout.workspace, mount.path);
+    // Also reject ancestors exposing a reserved root (e.g. '..' or '/').
+    if (reserved.some(root => path === root || path.startsWith(root + '/') || root.startsWith(path + '/'))) {
+      throw new Error('E_HOST_LAYOUT: workspace mount exposes a reserved root: ' + mount.path);
+    }
+    return { ...mount, path };
+  });
+  configuration.modules = { ...configuration.modules, workspace: {
+    ...(typeof workspace === 'object' ? workspace : {}), mounts: lowered,
+  } };
 }

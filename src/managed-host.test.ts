@@ -329,7 +329,7 @@ test('layout R1 runtime: real launcher isolates Bun autoload and cwd state, unit
     writeFileSync(join(root, 'bunfig.toml'), 'preload = ["./injection.ts"]\n');
     writeFileSync(join(root, 'injection.ts'), `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(join(c.workspace, 'injected'))}, 'bad');`);
   }
-  const launched = spawnSync('/bin/bash', [join(out, 'run.sh'), '--headless'], { encoding: 'utf8', env: { ...process.env, COOK_LAYOUT_INJECTED: undefined } });
+  const launched = spawnSync('/bin/bash', [join(out, 'run.sh'), '--headless'], { encoding: 'utf8', env: { ...process.env, COOK_LAYOUT_INJECTED: undefined, BUN_OPTIONS: '--preload ./injection.ts' } });
   expect(launched.status).toBe(0);
   const probe = JSON.parse(readFileSync(join(c.state, 'probe.json'), 'utf8'));
   expect(probe.cwd).toBe(c.state);
@@ -399,8 +399,12 @@ test('layout R1 unit: bare state path matrix and terminal-backslash refusal', ()
     expect(result.status).toBe(0);
     const unitPath = join(out, 'example.service');
     expect(readFileSync(unitPath, 'utf8')).toContain('WorkingDirectory=' + state.replace(/%/g, '%%') + '\n');
-    const verify = spawnSync('systemd-analyze', ['--user', 'verify', unitPath], { encoding: 'utf8', env: { ...process.env, XDG_RUNTIME_DIR: '/run/user/1002' } });
-    expect(verify.status).toBe(0);
+    const runtime = process.env.XDG_RUNTIME_DIR ?? (process.getuid ? `/run/user/${process.getuid()}` : undefined);
+    if (runtime && existsSync(runtime) && spawnSync('systemd-analyze', ['--version']).status === 0) {
+      const verify = spawnSync('systemd-analyze', ['--user', 'verify', unitPath], { encoding: 'utf8', env: { ...process.env, XDG_RUNTIME_DIR: runtime } });
+      expect(verify.status).toBe(0);
+      expect(verify.stderr).not.toMatch(/example\.service:\d+:/);
+    }
   }
   rmSync(out, { recursive: true, force: true });
   for (const state of [join(dir, 'terminal\\'), join(dir, 'trailing ')]) {
@@ -408,4 +412,96 @@ test('layout R1 unit: bare state path matrix and terminal-backslash refusal', ()
     expect(install(['--layout', file, '--bun-path', bun, '--node-path', node, '--user-unit', 'example.service']).stderr).toContain('E_HOST_UNIT');
     expect(existsSync(out)).toBe(false);
   }
+});
+
+test('split workspace mounts rebase structure and preserve mount options, defaults and false', () => {
+  const c = splitLayout(), path = layoutFile();
+  const original = JSON.parse(readFileSync(recipe, 'utf8'));
+  const args = ['--layout', path, '--bun-path', bun, '--node-path', node];
+  for (const workspace of [undefined, true, false, { configMount: false, mounts: [
+    { name: 'ws', path: './nested/output', mode: 'read-write', watch: 'never' },
+    { name: 'all', path: '.' }, { name: 'external', path: join(dir, 'external'), mode: 'read-only' },
+  ] }]) {
+    writeFileSync(recipe, JSON.stringify({ ...original, modules: { workspace } }));
+    expect(install(args).status).toBe(0);
+    const lowered = JSON.parse(readFileSync(join(c.config, 'recipes/recipe.json'), 'utf8')).modules.workspace;
+    if (workspace === false) expect(lowered).toBe(false);
+    else if (typeof workspace === 'object') expect(lowered).toEqual({ ...workspace, mounts: workspace.mounts.map(m => ({ ...m, path: resolve(c.workspace, m.path) })) });
+    else expect(lowered.mounts).toEqual([
+      { name: 'input', path: join(c.workspace, 'input'), mode: 'read-only' },
+      { name: 'products', path: join(c.workspace, 'output'), mode: 'read-write' },
+    ]);
+  }
+});
+
+test('split workspace refuses reserved-root mounts before any build', () => {
+  const c = splitLayout(), args = ['--layout', layoutFile(), '--bun-path', bun, '--node-path', node];
+  const original = JSON.parse(readFileSync(recipe, 'utf8'));
+  for (const path of [c.state, join(c.state, 'sessions'), c.config, c.runtime, c.credentials, '../state', '..']) {
+    writeFileSync(recipe, JSON.stringify({ ...original, modules: { workspace: { mounts: [{ name: 'unsafe', path }] } } }));
+    const result = install(args);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('E_HOST_LAYOUT');
+    expect(existsSync(out)).toBe(false);
+  }
+});
+
+test('split failed first build resumes only the same layout', () => {
+  const file = layoutFile(), args = ['--layout', file, '--bun-path', bun, '--node-path', node];
+  writeFileSync(bun, '#!/bin/sh\nif [ "$1" = --version ]; then echo 1.4.4; else exit 42; fi\n');
+  expect(install(args).status).toBe(3);
+  expect(existsSync(join(out, '.cook-layout.json'))).toBe(true);
+  expect(existsSync(join(out, 'connectome.lock'))).toBe(false);
+  expect(existsSync(join(out, 'run.sh'))).toBe(false);
+  expect(install(['--bun-path', bun, '--node-path', node]).stderr).toContain('E_HOST_LAYOUT');
+  writeFileSync(file, JSON.stringify({ ...splitLayout(), state: join(dir, 'other-state') }));
+  expect(install(args).stderr).toContain('E_HOST_LAYOUT');
+  writeFileSync(file, JSON.stringify(splitLayout()));
+  writeFileSync(bun, '#!/bin/sh\nif [ "$1" = --version ]; then echo 1.4.4; fi\n');
+  expect(install(args).status).toBe(0);
+  expect(install(args).status).toBe(0);
+});
+
+test('split failed reinstall retires reuse lock and remains resumable', () => {
+  const args = ['--layout', layoutFile(), '--bun-path', bun, '--node-path', node];
+  expect(install(args).status).toBe(0);
+  writeFileSync(join(repo, 'new-file'), 'changed');
+  execFileSync('git', ['add', 'new-file'], { cwd: repo });
+  execFileSync('git', ['commit', '-m', 'Change host'], { cwd: repo, stdio: 'pipe' });
+  writeFileSync(bun, '#!/bin/sh\nif [ "$1" = --version ]; then echo 1.4.4; else exit 42; fi\n');
+  expect(install(args).status).toBe(3);
+  expect(existsSync(join(out, 'connectome.lock'))).toBe(false);
+  expect(existsSync(join(out, 'run.sh'))).toBe(true);
+  writeFileSync(bun, '#!/bin/sh\nif [ "$1" = --version ]; then echo 1.4.4; fi\n');
+  expect(install(args).status).toBe(0);
+});
+
+test('split layout refuses default-install artifacts without a readable lock', () => {
+  const args = ['--layout', layoutFile(), '--bun-path', bun, '--node-path', node];
+  mkdirSync(out, { mode: 0o700 });
+  for (const artifact of ['run.sh', 'recipes', 'data']) {
+    if (artifact === 'run.sh') writeFileSync(join(out, artifact), '#!/bin/sh\nexec bun app/src/index.ts\n');
+    else mkdirSync(join(out, artifact));
+    writeFileSync(join(out, 'connectome.lock'), '{');
+    const result = install(args);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('E_HOST_LAYOUT');
+    expect(existsSync(join(out, '.cook-layout.json'))).toBe(false);
+    rmSync(join(out, artifact), { recursive: true });
+  }
+});
+
+test('layout parse, IO, overlap and state-unit errors precede recipe resolution', () => {
+  rmSync(recipe);
+  const file = layoutFile();
+  for (const content of ['{', JSON.stringify({ ...splitLayout(), state: out }), JSON.stringify({ ...splitLayout(), state: join(dir, 'bad\\') })]) {
+    writeFileSync(file, content);
+    const result = install(['--layout', file, '--bun-path', bun, '--node-path', node, '--user-unit', 'example.service', '--pin-refs']);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('E_HOST_LAYOUT: --layout ' + file + ':');
+    expect(result.stdout).not.toContain('walking recipe');
+    expect(existsSync(out)).toBe(false);
+  }
+  rmSync(file);
+  expect(install(['--layout', file, '--bun-path', bun, '--node-path', node]).stderr).toContain('E_HOST_LAYOUT: --layout ' + file + ':');
 });

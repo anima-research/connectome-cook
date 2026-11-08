@@ -21,6 +21,7 @@ import {
   DEFAULT_CH_REPO_URL,
   runHostBackend,
 } from './backends/host.js';
+import { hostLayout, type HostLayout } from './host-layout.js';
 import { renderUserUnit, validateUserUnit } from './host-unit.js';
 import { pinSources, resolveRemoteRef } from './pin-refs.js';
 import { listTemplates, scaffoldRecipe, type TemplateName } from './init.js';
@@ -62,6 +63,7 @@ ${log.bold('Flags:')}
   --image-name <name>    Override the generated image name
   --no-prompts           Non-interactive; warn-and-continue on missing values
   --env-file <path>      Read variable values from this file before prompting
+  --layout <local-json>  Opt-in split roots and explicit connector-state mappings
   --pin-refs             Resolve branch refs to commit SHAs (reproducible build)
   --allow-incomplete-templates
                          Write templated config files even when \${VAR}
@@ -175,8 +177,8 @@ ${log.bold('Flags:')}
                          Write templated config files even when \${VAR}
                          references render as empty (default: refuse)
   --env-file <path>      Read variable values from this file before prompting
-  --ch-repo <url>        connectome-host repo (default: ${DEFAULT_CH_REPO_URL})
   --layout <local-json>  Opt-in split roots and explicit connector-state mappings
+  --ch-repo <url>        connectome-host repo (default: ${DEFAULT_CH_REPO_URL})
   --ch-ref <ref>         connectome-host ref (default: ${DEFAULT_CH_REF})
   --bun-path <absolute>  Validate host engines (requires --node-path)
   --node-path <absolute> Node for host builds and runtime PATH consumers
@@ -204,10 +206,19 @@ async function handleInstall(argv: string[]): Promise<number> {
     return 1;
   }
 
+  let layout: HostLayout | undefined;
   // Layout flag shape errors must not trigger recipe prompts or source fetches.
   if (flags.layout !== undefined) {
     if (typeof flags.layout !== 'string' || !flags.layout.trim()) throw new Error('E_HOST_LAYOUT: --layout requires a nonempty local JSON path');
     if (!flags['bun-path'] || !flags['node-path']) throw new Error('E_HOST_LAYOUT: --layout requires both --bun-path and --node-path');
+    try {
+      const value = JSON.parse(readFileSync(flags.layout, 'utf8'));
+      // With no --out, the recipe-derived default is checked after resolution.
+      layout = hostLayout(value, flags.out !== undefined ? resolve(flags.out) : value?.runtime);
+      if (flags['user-unit'] !== undefined) renderUserUnit(layout.runtime, flags['user-unit'], layout.state);
+    } catch (error) {
+      throw new Error(`E_HOST_LAYOUT: --layout ${flags.layout}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   // Refuse unit options before recipe resolution can fetch or prompt.
   if (flags['user-unit'] !== undefined) {
@@ -217,7 +228,7 @@ async function handleInstall(argv: string[]): Promise<number> {
     }
     // Explicit output paths are known before recipe resolution can prompt.
     // The default is slug-derived and is validated by the host backend.
-    if (flags.out !== undefined) renderUserUnit(resolve(flags.out), flags['user-unit']);
+    if (flags.out !== undefined) renderUserUnit(resolve(flags.out), flags['user-unit'], layout?.state);
   }
 
   const planResult = await resolvePlan(recipePath, {
@@ -258,7 +269,7 @@ async function handleInstall(argv: string[]): Promise<number> {
   );
   const result = await runHostBackend(planResult.plan, {
     installDir,
-    layout: flags.layout !== undefined ? JSON.parse(readFileSync(flags.layout, 'utf8')) : undefined,
+    layout,
     userUnit: flags['user-unit'],
     bunPath: flags['bun-path'],
     nodePath: flags['node-path'],
