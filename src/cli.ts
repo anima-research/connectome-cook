@@ -176,10 +176,11 @@ ${log.bold('Flags:')}
                          references render as empty (default: refuse)
   --env-file <path>      Read variable values from this file before prompting
   --ch-repo <url>        connectome-host repo (default: ${DEFAULT_CH_REPO_URL})
-  --user-unit <name.service> Export a user unit only (requires selected engines)
   --ch-ref <ref>         connectome-host ref (default: ${DEFAULT_CH_REF})
   --bun-path <absolute>  Validate host engines (requires --node-path)
-  --node-path <absolute> Node for host builds and command: node servers
+  --node-path <absolute> Node for host builds and runtime PATH consumers
+  --user-unit <name.service>
+                         Export a user unit only (requires selected engines)
   --help, -h             Show this message
 `;
 
@@ -210,7 +211,7 @@ async function handleInstall(argv: string[]): Promise<number> {
     }
     // Explicit output paths are known before recipe resolution can prompt.
     // The default is slug-derived and is validated by the host backend.
-    if (flags.out !== undefined) renderUserUnit(resolve(flags.out));
+    if (flags.out !== undefined) renderUserUnit(resolve(flags.out), flags['user-unit']);
   }
 
   const planResult = await resolvePlan(recipePath, {

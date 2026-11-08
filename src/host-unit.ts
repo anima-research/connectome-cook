@@ -1,5 +1,6 @@
 /** Static user-unit export only. No systemd or service side effects. */
 import { isAbsolute, join } from 'node:path';
+import { assertHostEnginePath } from './host-engine-path.js';
 
 export function validateUserUnit(name: string): void {
   if (typeof name !== 'string' || Buffer.byteLength(name, 'utf8') > 255
@@ -13,7 +14,9 @@ function unitQuote(value: string, exec = false): string {
   // Unit specifiers expand even in quoted strings.
   return '"' + value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%') + '"';
 }
-export function renderUserUnit(installDir: string): string {
+export function renderUserUnit(installDir: string, name = 'connectome.service'): string {
+  assertHostEnginePath(installDir);
+  validateUserUnit(name);
   // A terminal backslash can continue this bare value onto ExecStart.
   // Refuse all terminal runs rather than attempting another representation.
   if (installDir.endsWith('\\')) {
@@ -24,8 +27,9 @@ export function renderUserUnit(installDir: string): string {
   }
   return [
     '[Unit]',
-    'Description=Connectome host',
-    'After=network-online.target',
+    'Description=Connectome host (' + name + ')',
+    'StartLimitIntervalSec=300',
+    'StartLimitBurst=5',
     '',
     '[Service]',
     'Type=simple',

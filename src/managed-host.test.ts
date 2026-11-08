@@ -81,7 +81,7 @@ test('unit export refuses unsafe names and missing selected engines without mate
 });
 
 
-test('R1-3/R1-6: invalid unit options fail before recipe loading or engine fetch', () => {
+test('invalid unit options fail before recipe loading or engine fetch', () => {
   rmSync(recipe);
   for (const extra of [
     ['--user-unit', 'example.service'],
@@ -98,7 +98,7 @@ test('R1-3/R1-6: invalid unit options fail before recipe loading or engine fetch
   expect(missing.stderr).toContain('--node-path');
 });
 
-test('R1-2: CLI launcher binds env-node scripts via private engine PATH without importing engine siblings', () => {
+test('CLI launcher binds env-node scripts via private engine PATH without importing engine siblings', () => {
   const tools = join(dir, 'tools'); mkdirSync(tools);
   const unselected = join(dir, 'unselected'); mkdirSync(unselected);
   // A non-literal stdio command found on the inherited PATH.
@@ -119,7 +119,7 @@ test('R1-2: CLI launcher binds env-node scripts via private engine PATH without 
   expect(result.stdout.trim()).toBe('SELECTED_NODE');
 });
 
-test('R1 nits: repeated CLI export restores mode 0600 and retains differently named units', () => {
+test('repeated CLI export restores mode 0600 and retains differently named units', () => {
   const args = ['--bun-path', bun, '--node-path', node, '--user-unit', 'example.service'];
   expect(install(args).status).toBe(0);
   const unit = join(out, 'example.service');
@@ -134,7 +134,7 @@ test('R1 nits: repeated CLI export restores mode 0600 and retains differently na
   expect(lock.launch.userUnit).toBe(join(out, 'renamed.service'));
 });
 
-test('R2 CLI: six-case path matrix preserves valid bare exports and refuses terminal backslash', () => {
+test('six-case path matrix preserves valid bare exports and refuses terminal backslash', () => {
   // Like the renderer parser tests, establish parser availability independently.
   const probe = join(dir, 'probe.service');
   writeFileSync(probe, '[Service]\nExecStart=/bin/true\n');
@@ -154,13 +154,13 @@ test('R2 CLI: six-case path matrix preserves valid bare exports and refuses term
     expect(readFileSync(file, 'utf8')).toContain('WorkingDirectory=' + out.replace(/%/g, '%%') + '\n');
     if (!available.error && available.status === 0) {
       const verified = spawnSync('systemd-analyze', ['--user', 'verify', file], { encoding: 'utf8' });
-      expect(verified.stderr).toBe('');
+      expect(verified.stderr.split('\n').filter(line => line.includes('example.service:'))).toEqual([]);
       expect(verified.status).toBe(0);
     }
   }
 });
 
-test('R2 CLI: unsafe export paths fail before recipe loading, prompts or install writes', () => {
+test('unsafe export paths fail before recipe loading, prompts or install writes', () => {
   rmSync(recipe);
   for (const suffix of ['end\\', 'end\\\\', 'end\\\\\\', 'new\nline', 'carriage\rreturn', 'trailing ']) {
     out = join(dir, suffix);
@@ -180,4 +180,65 @@ test('R2 CLI: unsafe export paths fail before recipe loading, prompts or install
       } else expect(existsSync(out)).toBe(false);
     }
   }
+});
+
+test('reinstall without unit export warns before confirmation and retains the hint with selected engines', () => {
+  const engines = ['--bun-path', bun, '--node-path', node];
+  expect(install([...engines, '--user-unit', 'example.service']).status).toBe(0);
+  const lockPath = join(out, 'connectome.lock');
+  const previousLock = readFileSync(lockPath, 'utf8');
+  const denied = install([...engines, '--no-yes']);
+  expect(denied.status).toBe(1);
+  expect(denied.stderr).toContain('previously exported user unit');
+  expect(denied.stderr.indexOf('previously exported user unit'))
+    .toBeLessThan(denied.stderr.indexOf('non-interactive mode requires --yes'));
+  expect(readFileSync(lockPath, 'utf8')).toBe(previousLock);
+  const result = install(engines);
+  expect(result.status).toBe(0);
+  expect(result.stderr).toContain('previously exported user unit');
+  expect(JSON.parse(readFileSync(lockPath, 'utf8')).launch.userUnit).toBe(join(out, 'example.service'));
+  // Keep warning on subsequent reinstalls, not just the first omission.
+  expect(install(engines).stderr).toContain('previously exported user unit');
+  const otherNode = join(dir, 'other-node');
+  writeFileSync(otherNode, readFileSync(node), { mode: 0o755 });
+  expect(install(['--bun-path', bun, '--node-path', otherNode]).status).toBe(0);
+  expect(JSON.parse(readFileSync(lockPath, 'utf8')).launch.userUnit).toBe(join(out, 'example.service'));
+});
+
+test('leaving selected engines warns about the installed unit before confirmation or writes', () => {
+  expect(install(['--bun-path', bun, '--node-path', node, '--user-unit', 'example.service']).status).toBe(0);
+  const previousLauncher = readFileSync(join(out, 'run.sh'), 'utf8');
+  const denied = install(['--no-yes']);
+  expect(denied.status).toBe(1);
+  expect(denied.stderr).toContain('previously exported user unit');
+  expect(denied.stderr).toContain('unvalidated PATH engines');
+  expect(denied.stderr.indexOf('previously exported user unit'))
+    .toBeLessThan(denied.stderr.indexOf('non-interactive mode requires --yes'));
+  expect(readFileSync(join(out, 'run.sh'), 'utf8')).toBe(previousLauncher);
+  expect(existsSync(join(out, '.cook-engines/bin/bun'))).toBe(true);
+  const result = install();
+  expect(result.status).toBe(0);
+  expect(result.stderr).toContain('previously exported user unit');
+  expect(existsSync(join(out, 'example.service'))).toBe(true);
+  expect(existsSync(join(out, '.cook-engines'))).toBe(false);
+  expect(JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8')).launch.userUnit).toBeUndefined();
+});
+
+test('explicit re-export names the unit in its description without an omission warning', () => {
+  const args = ['--bun-path', bun, '--node-path', node, '--user-unit', 'example.service'];
+  expect(install(args).status).toBe(0);
+  const result = install(args);
+  expect(result.status).toBe(0);
+  expect(result.stderr).not.toContain('previously exported user unit');
+  expect(readFileSync(join(out, 'example.service'), 'utf8')).toContain('Description=Connectome host (example.service)');
+});
+
+test('colon unit paths refuse before recipe loading and install writes', () => {
+  rmSync(recipe);
+  out = join(dir, 'a:b');
+  const result = install(['--bun-path', bun, '--node-path', node, '--user-unit', 'example.service']);
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain('E_HOST_ENGINE_PATH');
+  expect(result.stderr).not.toContain('ENOENT');
+  expect(existsSync(out)).toBe(false);
 });

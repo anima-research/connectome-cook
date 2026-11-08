@@ -5,13 +5,14 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { satisfies, valid, validRange } from 'semver';
 import { assertCredentialFreeSourceUrl } from './source-url.js';
+import { assertHostEnginePath } from './host-engine-path.js';
 
 export interface HostEngine { path: string; realPath: string; version: string }
 export interface HostEngines { bun: HostEngine; node: HostEngine }
 
 /** Only the cook-owned bin directory precedes the operator's search path. */
 export function hostBuildPath(binDir: string, parentPath?: string): string {
-  if (binDir.includes(':')) throw new Error('E_HOST_ENGINE_PATH: selected-engine install path must not contain ":" (build PATH separator)');
+  assertHostEnginePath(binDir);
   return [binDir, ...(parentPath?.split(':') ?? [])].filter(Boolean).join(':');
 }
 

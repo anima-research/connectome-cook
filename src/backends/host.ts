@@ -59,6 +59,7 @@ import {
   type LockedComponent,
 } from '../lockfile.js';
 import { renderUserUnit, validateUserUnit } from '../host-unit.js';
+import { assertHostEnginePath } from '../host-engine-path.js';
 import type { HostEngines, HostEnginePreflight } from '../host-engines.js';
 import type { BuildResult } from './docker.js';
 
@@ -500,11 +501,11 @@ export async function runHostBackend(
   if (options.userUnit !== undefined) {
     if (!options.bunPath || !options.nodePath) throw new Error('E_HOST_UNIT: --user-unit requires both --bun-path and --node-path');
     validateUserUnit(options.userUnit);
-    renderUserUnit(options.installDir);
+    renderUserUnit(options.installDir, options.userUnit);
   }
   if (options.bunPath !== undefined || options.nodePath !== undefined) {
     if (!options.bunPath || !options.nodePath) throw new Error('E_HOST_ENGINE_PATH: both --bun-path and --node-path are required');
-    if (resolve(options.installDir).includes(':')) throw new Error('E_HOST_ENGINE_PATH: selected-engine install path must not contain ":" (build PATH separator)');
+    assertHostEnginePath(resolve(options.installDir));
     const { preflightHostEngines } = await import('../host-engines.js').catch(() => {
       throw new Error('E_HOST_ENGINE_DEPENDENCY: cannot load engine preflight dependencies; run bun install');
     });
@@ -538,7 +539,7 @@ async function materializeHost(
 ): Promise<BuildResult> {
   const installDir = options.installDir;
   const engines = checked?.engines;
-  const userUnit = options.userUnit !== undefined ? renderUserUnit(installDir) : undefined;
+  const userUnit = options.userUnit !== undefined ? renderUserUnit(installDir, options.userUnit) : undefined;
   const buildEnv = { ...process.env };
   const parent = plan.parentWalk.recipe;
   const hasSidecars = (parent.services ?? []).length > 0;
@@ -564,6 +565,17 @@ async function materializeHost(
   } catch (err) {
     log.warn(`existing ${LOCKFILE_NAME} unreadable (${err instanceof Error ? err.message : String(err)}) — treating as fresh install`);
   }
+
+  // Preserve the operator hint separately from clone reuse invalidation.
+  const previousUserUnit = existingLock?.launch.kind === 'script' ? existingLock.launch.userUnit : undefined;
+  if (previousUserUnit && (options.userUnit === undefined || !engines)) {
+    log.warn('previously exported user unit may still be installed and launches this run.sh; '
+      + (engines
+        ? 'no --user-unit supplied: export is not refreshed; review installed copies'
+        : 'selected engines are being removed: installed copies may fail or use unvalidated PATH engines; review or disable them'));
+  }
+  const userUnitHint = userUnit !== undefined ? join(installDir, options.userUnit!)
+    : engines ? previousUserUnit : undefined;
 
   const engineBindingChanged = JSON.stringify(existingLock?.engines) !== JSON.stringify(engines);
   // Retire the disk lock before any destructive work if ANY clone cannot be
@@ -850,7 +862,7 @@ async function materializeHost(
         origin: r.origin,
         ...(r.value !== undefined ? { value: r.value } : {}),
       })),
-      launch: { kind: 'script', script: join(installDir, 'run.sh'), ...(userUnit !== undefined ? { userUnit: join(installDir, options.userUnit!) } : {}) },
+      launch: { kind: 'script', script: join(installDir, 'run.sh'), ...(userUnitHint !== undefined ? { userUnit: userUnitHint } : {}) },
     };
     writeLockfile(installDir, lock);
   } catch (err) {
