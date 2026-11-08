@@ -38,6 +38,7 @@ import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
 import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
 import { log } from '../log.js';
+import { shellQuote } from '../env-encoding.js';
 import type { GeneratorInput, McpSource } from '../types.js';
 import type { Recipe } from '../vendor/recipe.js';
 import type { InstallPlan } from '../plan.js';
@@ -57,6 +58,13 @@ import {
   writeLockfile,
   type Lockfile,
   type LockedComponent,
+  type LockfileV2,
+  deploymentRecord,
+  fullCommit,
+  outputRecords,
+  createOutputHasher,
+  type PublicOutputDigest,
+  resolveNpmComponents,
 } from '../lockfile.js';
 import type { BuildResult } from './docker.js';
 
@@ -272,7 +280,7 @@ function cloneUrlFor(action: CloneAction, values: Record<string, string>): strin
 
 /** Execute one clone+build action. Throws on failure; the caller removes
  *  the target on failure so no half-built checkout survives. */
-function executeClone(action: CloneAction, values: Record<string, string>): { commit?: string } {
+function executeClone(action: CloneAction, values: Record<string, string>): { commit: string } {
   rmSync(action.target, { recursive: true, force: true });
   mkdirSync(resolve(action.target, '..'), { recursive: true });
 
@@ -315,13 +323,8 @@ function executeClone(action: CloneAction, values: Record<string, string>): { co
       });
     }
   }
-  let commit: string | undefined;
-  try {
-    commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: action.target })
-      .toString().trim();
-  } catch {
-    // Non-fatal — lock entry just omits the commit.
-  }
+  const commit = fullCommit(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: action.target })
+    .toString().trim(), action.key);
 
   if (action.buildCommand) {
     log.step(`building ${log.dim(action.target)}: ${action.buildCommand}`);
@@ -331,7 +334,7 @@ function executeClone(action: CloneAction, values: Record<string, string>): { co
       env: process.env,
     });
   }
-  return { ...(commit !== undefined ? { commit } : {}) };
+  return { commit };
 }
 
 /** Warn when operator values or recipe defaults address a sidecar by its
@@ -369,11 +372,6 @@ function warnServiceNameNetworking(
       `the native agent must use the sidecar's published localhost port (e.g. http://localhost:<port>).`,
     );
   }
-}
-
-/** Shell-safe single-quoted value for the sourceable .env. */
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 function renderShellEnvFile(values: Record<string, string>): string {
@@ -473,12 +471,19 @@ export async function runHostBackend(
     return { exitCode: 2, outDir: installDir };
   }
 
+  let npmComponents: ReturnType<typeof resolveNpmComponents>;
+  try { npmComponents = resolveNpmComponents(plan.sources); }
+  catch (err) {
+    log.error(err instanceof Error ? err.message : String(err));
+    return { exitCode: 2, outDir: installDir };
+  }
   const actions = planHostActions(plan, options);
   let existingLock: Lockfile | null = null;
   try {
     existingLock = readLockfile(installDir);
   } catch (err) {
-    log.warn(`existing ${LOCKFILE_NAME} unreadable (${err instanceof Error ? err.message : String(err)}) — treating as fresh install`);
+    log.error(`existing ${LOCKFILE_NAME} unreadable (${err instanceof Error ? err.message : String(err)}) — refusing reconcile`);
+    return { exitCode: 2, outDir: installDir };
   }
 
   // ---- Confirm gate: commands run on the operator's machine. ----
@@ -511,9 +516,12 @@ export async function runHostBackend(
     let commit: string | undefined;
     if (isSatisfiedByLock(action, existingLock)) {
       log.info(`unchanged ${log.dim(action.key)} — kept (${log.dim(action.target)})`);
-      commit = action.role === 'connectome-host'
-        ? existingLock!.connectomeHost.commit
-        : existingLock!.components.find((c) => c.key === action.key)?.commit;
+      try {
+        commit = fullCommit(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: action.target }).toString().trim(), action.key);
+      } catch {
+        log.error(`${action.key}: cannot read full checkout commit — refusing reconcile`);
+        return { exitCode: 3, outDir: installDir };
+      }
     } else {
       try {
         commit = executeClone(action, plan.values).commit;
@@ -531,13 +539,14 @@ export async function runHostBackend(
       chCommit = commit;
     } else {
       lockedComponents.push({
+        kind: 'git',
         key: action.key,
         role: action.role,
         url: action.url,
         ref: action.ref,
         path: action.target,
         install: action.buildCommand || 'clone-only',
-        ...(commit !== undefined ? { commit } : {}),
+        commit: fullCommit(commit, action.key),
       });
     }
   }
@@ -556,14 +565,6 @@ export async function runHostBackend(
     cpSync(copy.from, copy.target, {
       recursive: true,
       filter: (src) => basename(src) !== '.git',
-    });
-    lockedComponents.push({
-      key: copy.key,
-      role: 'mcp',
-      url: '',
-      ref: '',
-      path: copy.target,
-      install: 'sibling-copy',
     });
   }
 
@@ -601,11 +602,17 @@ export async function runHostBackend(
   }
 
   const parentRecipeBasename = recipeFilename(plan.parentWalk.path);
+  const hashOutput = createOutputHasher(plan.requirements);
+  const publicOutputs = new Map<string, PublicOutputDigest>();
+  const writePublic = (path: string, content: string, mode?: number) => {
+    publicOutputs.set(path, hashOutput(content));
+    writeFileSync(join(installDir, path), content, { mode });
+  };
   try {
     for (const walk of plan.walks) {
       const configuration = lowerToConfiguration(walk.recipe, overlays.get(walk.path), walk.path);
-      writeFileSync(
-        join(installDir, 'recipes', recipeFilename(walk.path)),
+      writePublic(
+        `recipes/${recipeFilename(walk.path)}`,
         JSON.stringify(configuration, null, 2) + '\n',
       );
     }
@@ -694,7 +701,7 @@ export async function runHostBackend(
       },
     });
     if (sidecarCompose !== null) {
-      writeFileSync(join(installDir, SIDECAR_COMPOSE_FILENAME), sidecarCompose);
+      writePublic(SIDECAR_COMPOSE_FILENAME, sidecarCompose);
       warnServiceNameNetworking(
         plan,
         runtimeFiles.filter((f) => f.kind === 'container-template'),
@@ -704,35 +711,36 @@ export async function runHostBackend(
     if (Object.keys(plan.values).length > 0) {
       writeFileSync(join(installDir, '.env'), renderShellEnvFile(plan.values), { mode: 0o600 });
     }
-    writeFileSync(
-      join(installDir, 'run.sh'),
+    writePublic(
+      'run.sh',
       renderLauncher(parentRecipeBasename, { hasSidecars, envsubstFiles }),
-      { mode: 0o755 },
+      0o755,
     );
 
-    const lock: Lockfile = {
-      version: 1,
+    const connectomeHost = {
+      url: options.chRepoUrl, ref: options.chRef, path: join(installDir, 'app'),
+      commit: fullCommit(chCommit, 'connectome-host'),
+    };
+    lockedComponents.push(...npmComponents);
+    const lock: LockfileV2 = {
+      version: 2,
       backend: 'host',
       recipePath: plan.recipePath,
       createdAt: new Date().toISOString(),
-      connectomeHost: {
-        url: options.chRepoUrl,
-        ref: options.chRef,
-        path: join(installDir, 'app'),
-        ...(chCommit !== undefined ? { commit: chCommit } : {}),
-      },
-      components: lockedComponents,
-      localExtensions: plan.localExtensions.map((ext) => ({
-        name: ext.name,
-        hostDir: ext.hostDir,
-        path: join(ext.hostDir, ext.entryBasename),
+      connectomeHost, components: lockedComponents,
+      ...deploymentRecord(plan, 'host', installDir, connectomeHost, lockedComponents, {
+        strict: plan.options.strict, allowIncompleteTemplates: options.allowIncompleteTemplates,
+      }),
+      localExtensions: plan.localExtensions.map(ext => ({
+        name: ext.name, hostDir: ext.hostDir, path: join(ext.hostDir, ext.entryBasename),
       })),
-      requirements: plan.requirements.map((r) => ({
-        name: r.name,
-        envName: r.envName,
-        origin: r.origin,
-        ...(r.value !== undefined ? { value: r.value } : {}),
-      })),
+      outputs: outputRecords(installDir, publicOutputs, [
+        ...plan.credentialFiles.filter(cf => !cf.path.startsWith('/')).map(cf => relative(installDir, resolve(join(installDir, 'app'), cf.path)))
+          .filter(p => p !== '..' && !p.startsWith('../')),
+        ...(parent.services ?? []).flatMap(s => s.secrets ?? []),
+        ...runtimeFiles.map(f => f.kind === 'sidecar-template' ? f.relPath
+          : relative(installDir, hostPathFor(installDir, f.inContainer!) + (f.runtime ? '.tmpl' : ''))),
+      ]),
       launch: { kind: 'script', script: join(installDir, 'run.sh') },
     };
     writeLockfile(installDir, lock);

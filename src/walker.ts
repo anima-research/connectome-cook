@@ -18,6 +18,7 @@
  * via `loadRecipeRaw`.
  */
 
+import { createHash } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import {
   loadRecipeRaw,
@@ -66,8 +67,9 @@ export async function walkRecipe(rootPath: string): Promise<WalkResult[]> {
     if (visited.has(loc)) return;
     visited.add(loc);
 
-    const recipe = await loadRecipeRaw(loc);
-    results.push({ path: loc, recipe });
+    let sourceSha256: string | undefined;
+    const recipe = await loadRecipeRaw(loc, text => { sourceSha256 = createHash('sha256').update(text).digest('hex'); });
+    results.push({ path: loc, recipe, sourceSha256 });
 
     const base = sourceBaseFor(loc);
     for (const child of getFleetChildren(recipe)) {
