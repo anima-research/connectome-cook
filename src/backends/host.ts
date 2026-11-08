@@ -474,7 +474,30 @@ export async function runHostBackend(
   plan: InstallPlan,
   options: HostBackendOptions,
 ): Promise<BuildResult> {
-  const installDir = options.installDir;
+  // Keep signal handling opt-in: the flagless backend remains unchanged.
+  if (options.hostDependencies === undefined) return materializeHost(plan, options);
+  let removeStaging = () => {};
+  const signals = ['SIGINT', 'SIGTERM'] as const;
+  const cleanup = () => {
+    removeStaging();
+    signals.forEach((signal, i) => process.off(signal, handlers[i]!));
+  };
+  const handlers = signals.map(signal => () => { cleanup(); process.kill(process.pid, signal); });
+  signals.forEach((signal, i) => process.on(signal, handlers[i]!));
+  try {
+    return await materializeHost(plan, options, cleanup => { removeStaging = cleanup; });
+  } finally {
+    // Sync Git/build subprocesses defer JS signals. Drain before unregistering
+    // handlers (and before the CLI calls process.exit), as in PR #6.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    cleanup();
+  }
+}
+
+async function materializeHost(
+  plan: InstallPlan, options: HostBackendOptions, onStaged?: (cleanup: () => void) => void,
+): Promise<BuildResult> {
+  let installDir = options.installDir;
   const dependencyInputs = parseHostDependencies(options.hostDependencies);
   // Preflight every source before previewing URLs or making any changes.
   assertCredentialFreeSourceUrl(options.chRepoUrl, '--ch-repo');
@@ -488,11 +511,22 @@ export async function runHostBackend(
     log.warn(`existing ${LOCKFILE_NAME} unreadable (${err instanceof Error ? err.message : String(err)}) — treating as fresh install`);
   }
 
-  assertHostDependencyReinstall(installDir, existingLock?.hostDependencies, dependencyInputs, options.dropHostDependencies);
-  const dependencies = dependencyInputs.length ? preflightHostDependencies(options.chRepoUrl, options.chCommit ?? options.chRef, dependencyInputs, installDir) : undefined;
-  if (dependencies) options = { ...options, chCommit: dependencies.commit };
+  const hasRecordedPins = assertHostDependencyReinstall(installDir, existingLock?.hostDependencies, dependencyInputs, options.dropHostDependencies);
+  const dependencies = dependencyInputs.length ? preflightHostDependencies(options.chRepoUrl, options.chCommit ?? options.chRef, dependencyInputs, installDir, onStaged) : undefined;
+  if (dependencies) {
+    installDir = dependencies.installDir;
+    options = { ...options, installDir, chCommit: dependencies.commit };
+  }
   let keepSnapshots = false;
   let completed = false;
+  const cleanup = () => {
+    dependencies?.cleanup();
+    if (!completed) {
+      if (keepSnapshots) rmSync(join(installDir, 'app'), { recursive: true, force: true });
+      dependencies?.discardNew();
+    }
+  };
+  if (dependencies) onStaged?.(cleanup);
   try {
   const parent = plan.parentWalk.recipe;
   const hasSidecars = (parent.services ?? []).length > 0;
@@ -516,7 +550,7 @@ export async function runHostBackend(
     const targets = [...actions.clones.map(a => a.target), ...actions.copies.map(a => a.target),
       ...runtimeFiles.map(f => f.kind === 'sidecar-template' ? resolve(installDir, f.relPath) : hostPathFor(installDir, f.inContainer!))];
     if (targets.some(target => target === inputRoot || target.startsWith(inputRoot + '/') || inputRoot.startsWith(target + '/'))) {
-      throw new Error('E_HOST_DEPENDENCY_SOURCE: recipe target overlaps host inputs');
+      throw new Error('E_HOST_DEPENDENCY_OVERLAP: recipe target overlaps host inputs');
     }
   }
   // ---- Confirm gate: commands run on the operator's machine. ----
@@ -548,7 +582,7 @@ export async function runHostBackend(
   let chCommit: string | undefined;
   for (const action of actions.clones) {
     let commit: string | undefined;
-    if (!(action.role === 'connectome-host' && (dependencies || options.dropHostDependencies || existingLock?.hostDependencies?.length)) && isSatisfiedByLock(action, existingLock)) {
+    if (!(action.role === 'connectome-host' && (dependencies || (options.dropHostDependencies && hasRecordedPins) || existingLock?.hostDependencies?.length)) && isSatisfiedByLock(action, existingLock)) {
       log.info(`unchanged ${log.dim(action.key)} — kept (${log.dim(action.target)})`);
       commit = action.role === 'connectome-host'
         ? existingLock!.connectomeHost.commit
@@ -790,10 +824,6 @@ export async function runHostBackend(
   completed = true;
   return { exitCode: 0, outDir: installDir };
   } finally {
-    dependencies?.cleanup();
-    if (!completed) {
-      if (keepSnapshots) rmSync(join(installDir, 'app'), { recursive: true, force: true });
-      dependencies?.discardNew();
-    }
+    cleanup();
   }
 }

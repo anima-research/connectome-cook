@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { satisfies, valid, validRange } from 'semver';
-import { provisionPrivateDirectory } from './private-directory.js';
+import { provisionPrivateDirectory, resolvePrivateDirectoryPath } from './private-directory.js';
 import { assertCredentialFreeSourceUrl } from './source-url.js';
 
 const MAX_ARCHIVE = 64 * 1024 * 1024, MAX_TAR = 128 * 1024 * 1024, MAX_JSON = 1024 * 1024, MAX_ENTRIES = 10000;
@@ -20,11 +20,12 @@ export interface LockedHostDependency {
 }
 export interface HostDependencyInput { name: string; path: string; sha256: string }
 function refuse(code: string, detail = 'local host dependency refused'): never {
-  throw new Error(`${code}: ${detail}; no registry fallback`);
+  const usage = code === 'E_HOST_DEPENDENCY_OPTION' || code === 'E_HOST_DEPENDENCY_DUPLICATE';
+  throw new Error(`${code}: ${detail}${usage ? '' : '; no registry fallback'}`);
 }
 function resolutionSection(pkg: Record<string, unknown>): 'overrides' | 'resolutions' {
   const fields = ['overrides', 'resolutions'].filter(key => Object.hasOwn(pkg, key));
-  if (fields.length > 1) refuse('E_HOST_DEPENDENCY_RANGE', 'both overrides and resolutions are present; Bun cannot compose them');
+  if (fields.length > 1) refuse('E_HOST_DEPENDENCY_POLICY_FIELDS', 'both overrides and resolutions are present; Bun cannot compose them');
   for (const key of fields) {
     const value = pkg[key];
     if (!value || typeof value !== 'object' || Array.isArray(value)) refuse('E_HOST_DEPENDENCY_RANGE', `${key} must be an object`);
@@ -67,28 +68,35 @@ function checkHash(bytes: Buffer, expected: string, path: string): string {
   return observed;
 }
 /** Older cooks may have dropped the lock field while retaining our checkout edits. */
-export function assertHostDependencyReinstall(installDir: string, records: LockedHostDependency[] | undefined, inputs: HostDependencyInput[], drop = false): void {
+export function assertHostDependencyReinstall(installDir: string, records: LockedHostDependency[] | undefined, inputs: HostDependencyInput[], drop = false): boolean {
   if (drop && inputs.length) refuse('E_HOST_DEPENDENCY_OPTION', '--drop-host-dependencies cannot be combined with --host-dependency');
-  if (drop) return;
   const names = new Set((records ?? []).map(record => record.name));
   const manifest = join(installDir, 'app', 'package.json');
-  if (lstatIfPresent(join(installDir, 'host-inputs')) && lstatIfPresent(manifest)) {
+  let snapshotsMissing = false;
+  if (lstatIfPresent(manifest)) {
     let pkg: Record<string, unknown>;
     try {
       pkg = JSON.parse(readFileSync(manifest, 'utf8'));
       if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)) throw new Error('invalid manifest');
     }
-    catch { refuse('E_HOST_DEPENDENCY_REINSTALL', `cannot inspect retained checkout ${manifest}; repeat --host-dependency or pass --drop-host-dependencies`); }
+    catch {
+      if (drop) return true; // explicit recovery must rebuild an uninspectable checkout
+      refuse('E_HOST_DEPENDENCY_REINSTALL', `cannot inspect retained checkout ${manifest}; repeat --host-dependency or pass --drop-host-dependencies`);
+    }
     for (const section of ['dependencies', 'devDependencies', 'optionalDependencies', 'overrides', 'resolutions']) {
       const entries = pkg[section];
       if (entries && typeof entries === 'object') for (const [name, value] of Object.entries(entries)) {
-        if (typeof value === 'string' && /^file:.*\/host-inputs\/[a-f0-9]{64}\.tgz$/.test(value)) names.add(name);
+        if (typeof value === 'string' && /^file:.*\/host-inputs\/[a-f0-9]{64}\.tgz$/.test(value)) {
+          names.add(name);
+          if (!lstatIfPresent(value.slice(5))) snapshotsMissing = true;
+        }
       }
     }
   }
   const missing = [...names].filter(name => !inputs.some(input => input.name === name));
   if (!drop && missing.length) refuse('E_HOST_DEPENDENCY_REINSTALL',
-    `lock or checkout records host dependencies (${missing.join(', ')}); repeat --host-dependency for each or pass --drop-host-dependencies`);
+    `${snapshotsMissing ? 'pinned checkout; snapshots missing; ' : ''}lock or checkout records host dependencies (${missing.join(', ')}); repeat --host-dependency for each or pass --drop-host-dependencies`);
+  return names.size > 0;
 }
 function lstatIfPresent(path: string): ReturnType<typeof lstatSync> | undefined {
   try { return lstatSync(path); }
@@ -96,7 +104,7 @@ function lstatIfPresent(path: string): ReturnType<typeof lstatSync> | undefined 
 }
 function storage(root: string, create: boolean): void {
   try { provisionPrivateDirectory(root, create); }
-  catch (error) { refuse('E_HOST_DEPENDENCY_STORAGE', `${root}: ${(error as Error).message}; requires Linux /proc, real directory ancestors (no symlinks), and an owned 0700 host-inputs directory`); }
+  catch (error) { refuse('E_HOST_DEPENDENCY_STORAGE', `${root}: ${(error as Error).message}; requires Linux /proc, root/same-user-owned symlinks only, and an owned 0700 host-inputs directory`); }
 }
 function isTrustedDependency(pkg: { trustedDependencies?: unknown }, name: string): boolean {
   if (!Object.hasOwn(pkg, 'trustedDependencies')) return false;
@@ -109,8 +117,10 @@ export function parseHostDependencies(raw: unknown): HostDependencyInput[] {
   const names = new Set<string>();
   return (Array.isArray(raw) ? raw : [raw]).map(value => {
     const m = typeof value === 'string' && /^((?:@[a-z0-9._-]+\/)?[a-z0-9._-]+)=(.+)#sha256=([a-fA-F0-9]{64})$/.exec(value);
-    if (!m || !isAbsolute(m[2]!) || /[\0\r\n]/.test(m[2]!)) refuse('E_HOST_DEPENDENCY_OPTION');
-    if (names.has(m[1]!)) refuse('E_HOST_DEPENDENCY_DUPLICATE');
+    if (!m) refuse('E_HOST_DEPENDENCY_OPTION', `${JSON.stringify(value)}: expected <name>=<absolute path>#sha256=<64 hex>`);
+    if (!isAbsolute(m[2]!)) refuse('E_HOST_DEPENDENCY_OPTION', `${JSON.stringify(value)}: path is not absolute`);
+    if (/[\0\r\n]/.test(m[2]!)) refuse('E_HOST_DEPENDENCY_OPTION', `${JSON.stringify(value)}: path contains NUL or a newline`);
+    if (names.has(m[1]!)) refuse('E_HOST_DEPENDENCY_DUPLICATE', `${JSON.stringify(value)}: duplicate name ${m[1]}`);
     names.add(m[1]!);
     return { name: m[1]!, path: m[2]!, sha256: m[3]!.toLowerCase() };
   });
@@ -207,12 +217,17 @@ function snapshot(source: string, dest: string, onCreated?: () => void): Buffer 
   }
   finally { if (input !== undefined) closeSync(input); if (output !== undefined) closeSync(output); }
 }
-export function preflightHostDependencies(url: string, ref: string, inputs: HostDependencyInput[], installDir: string): { commit: string; checkout: string; records: LockedHostDependency[]; materialize: () => void; cleanup: () => void; discardNew: () => void } {
+export function preflightHostDependencies(url: string, ref: string, inputs: HostDependencyInput[], installDir: string, onStaged?: (cleanup: () => void) => void): { installDir: string; commit: string; checkout: string; records: LockedHostDependency[]; materialize: () => void; cleanup: () => void; discardNew: () => void } {
   assertCredentialFreeSourceUrl(url);
+  if (/^[0-9a-f]{7,39}$/i.test(ref)) refuse('E_HOST_DEPENDENCY_SOURCE',
+    `'${ref}' looks like an abbreviated commit ID; --host-dependency needs the full 40-hex ID (git rev-parse ${ref}); no output written`);
+  try { installDir = resolvePrivateDirectoryPath(installDir); }
+  catch (error) { refuse('E_HOST_DEPENDENCY_STORAGE', `${installDir}: ${(error as Error).message}`); }
   const inputRoot = join(installDir, 'host-inputs');
   storage(inputRoot, false); // read-only validation before preview or output mutation
   const root = mkdtempSync(join(tmpdir(), 'cook-host-dependency-')); // owned 0700; pre-mutation staging only
   const cleanup = () => rmSync(root, { recursive: true, force: true });
+  onStaged?.(cleanup);
   try {
     const artifacts = inputs.map((input, i) => {
       const path = join(root, `${i}.tgz`), bytes = snapshot(input.path, path);
@@ -223,7 +238,7 @@ export function preflightHostDependencies(url: string, ref: string, inputs: Host
       if (pkg.name !== input.name) refuse('E_HOST_DEPENDENCY_NAME', `${input.path}: expected name ${input.name}, observed ${JSON.stringify(pkg.name)}`);
       return { input, path, size: bytes.length, sha256, pkg };
     });
-    const git = (args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000, maxBuffer: MAX_JSON }).trim();
+    const git = (args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: MAX_JSON }).trim();
     let commit: string, host: Partial<Record<Section | 'overrides' | 'resolutions', Record<string, unknown>>> & { trustedDependencies?: unknown };
     const checkout = join(root, 'source');
     let operation = 'init';
@@ -232,7 +247,7 @@ export function preflightHostDependencies(url: string, ref: string, inputs: Host
       const base = ['-C', checkout];
       git([...base, 'remote', 'add', 'origin', url]);
       operation = 'fetch';
-      git([...base, 'fetch', '--depth=1', '--', 'origin', ref]);
+      git([...base, 'fetch', '--tags', '--', 'origin', ref]);
       commit = git([...base, 'rev-parse', 'FETCH_HEAD^{commit}']);
       operation = 'read package.json';
       host = JSON.parse(git([...base, 'show', commit + ':package.json']));
@@ -244,7 +259,7 @@ export function preflightHostDependencies(url: string, ref: string, inputs: Host
       const cause = /couldn't find remote ref/.test(stderr) ? 'ref not found'
         : /does not appear to be a git repository|not a git repository|repository .* not found/i.test(stderr) ? 'repository inaccessible'
         : e.code ?? (e.signal ? 'terminated ' + e.signal : e.status !== undefined ? 'exit ' + e.status : 'invalid host manifest');
-      return refuse('E_HOST_DEPENDENCY_SOURCE', `${url}@${ref}: ${operation}: ${cause}; inspect with git fetch --depth=1 -- <repository> <ref>`);
+      return refuse('E_HOST_DEPENDENCY_SOURCE', `${url}@${ref}: ${operation}: ${cause}; inspect with git fetch -- <repository> <ref>`);
     }
     const policy = resolutionSection(host);
     assertDisjointPolicy(host[policy] ?? {}, policy, inputs.map(input => input.name));
@@ -296,7 +311,7 @@ export function preflightHostDependencies(url: string, ref: string, inputs: Host
         refuse('E_HOST_DEPENDENCY_FILE', `${activePath}: ${(err as NodeJS.ErrnoException).code ?? (err as Error).message}`);
       }
     };
-    return { commit, checkout, records, materialize, cleanup, discardNew };
+    return { installDir, commit, checkout, records, materialize, cleanup, discardNew };
   } catch (err) { cleanup(); throw err; }
 }
 /** The checkout is the exact preflight-validated commit; apply only its planned delta. */
@@ -332,7 +347,13 @@ export function verifyHostDependencyResolutions(checkout: string, records: Locke
     if (!Object.hasOwn(packages, record.name)) reject(`${record.name}: pinned root resolution is missing`);
     for (const [key, entry] of Object.entries(packages)) {
       const identity = Array.isArray(entry) ? entry[0] : undefined;
-      if (key !== record.name && !key.endsWith('/' + record.name) && !(typeof identity === 'string' && identity.startsWith(record.name + '@'))) continue;
+      const segments = key.split('/');
+      let lastName = '';
+      for (let i = 0; i < segments.length; i++) {
+        lastName = segments[i]!;
+        if (lastName.startsWith('@') && i + 1 < segments.length) lastName += '/' + segments[++i];
+      }
+      if (key !== record.name && lastName !== record.name && !(typeof identity === 'string' && identity.startsWith(record.name + '@'))) continue;
       if (!Array.isArray(entry) || identity !== `${record.name}@${record.snapshot}` || entry.length !== 3 || entry[2] !== integrity) {
         reject(`${record.name}: resolution ${JSON.stringify(key)} is not pinned to ${record.snapshot} (version ${record.version}, sha256 ${record.sha256})`);
       }

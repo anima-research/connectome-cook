@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, lstatSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -7,7 +7,7 @@ import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import * as fs from 'node:fs';
-import { archivePackage, preflightHostDependencies, parseHostDependencies } from './host-dependency.js';
+import { archivePackage, preflightHostDependencies, parseHostDependencies, verifyHostDependencyResolutions } from './host-dependency.js';
 
 let dir: string, repo: string, out: string, recipe: string, archive: string, digest: string, shim: string;
 const realBun = process.execPath;
@@ -35,7 +35,7 @@ function host(range: unknown = '^1.0.0', section = 'dependencies') {
 }
 function option(name = 'fixture-local-input', path = archive, hash = digest) { return `${name}=${path}#sha256=${hash}`; }
 function install(extra: string[] = ['--host-dependency', option()]) {
-  const result = spawnSync(realBun, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, '--ch-ref', 'main', '--no-prompts', '--yes', ...extra], {
+  const result = spawnSync(realBun, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, ...(extra.includes('--ch-ref') ? [] : ['--ch-ref', 'main']), '--no-prompts', '--yes', ...extra], {
     encoding: 'utf8', env: { ...process.env, TMPDIR: join(dir, 'staging'), PATH: shim + ':' + process.env.PATH },
   });
   if (result.status === 0 && existsSync(join(out, 'connectome.lock'))) {
@@ -239,7 +239,7 @@ test('reused durable snapshots are rehashed before checkout mutation', () => {
 
 test('recipe writes cannot overlap durable host inputs', () => {
   writeFileSync(recipe, JSON.stringify({ name: 'Synthetic', agent: { systemPrompt: 'Test' }, containerTemplateFiles: [{ hostPath: 'collision', inContainer: '/host-inputs/collision', template: 'conflict' }] }));
-  refused('E_HOST_DEPENDENCY_SOURCE');
+  refused('E_HOST_DEPENDENCY_OVERLAP');
   expect(readdirSync(join(dir, 'staging'))).toEqual([]);
 });
 
@@ -375,7 +375,7 @@ for (const fields of [
 ]) test(`R1-1 refuses ambiguous or malformed resolution policy ${JSON.stringify(fields)}`, () => {
   const pkg = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8'));
   Object.assign(pkg, fields); writeFileSync(join(repo, 'package.json'), JSON.stringify(pkg)); git(['commit', '-am', 'Invalid policy']);
-  refused('E_HOST_DEPENDENCY_RANGE');
+  refused(Object.hasOwn(fields, 'overrides') && Object.hasOwn(fields, 'resolutions') ? 'E_HOST_DEPENDENCY_POLICY_FIELDS' : 'E_HOST_DEPENDENCY_RANGE');
 });
 test('R1-2 plain reinstall refuses and preserves pinned checkout and lock', () => {
   expect(install().status).toBe(0);
@@ -418,15 +418,31 @@ for (const dangling of [true, false]) test(`R1-4 preserves pre-existing ${dangli
   expect(lstatSync(snapshot).isSymbolicLink()).toBe(true);
   expect(readFileSync(archive)).toEqual(gzipSync(tar([{ path: 'package/package.json', data: JSON.stringify({ name: 'fixture-local-input', version: '1.2.3' }) }])));
 });
-test('R1-5 rejects a symlinked output ancestor before preview or half-made tree', () => {
+test('R2-6 resolves same-user output links and previews the canonical path', () => {
   const actual = join(dir, 'actual'); mkdirSync(actual);
   const link = join(dir, 'linked'); symlinkSync(actual, link);
   out = join(link, 'new-install');
   const result = install();
-  expect(result.status).not.toBe(0); expect(result.stderr).toContain('E_HOST_DEPENDENCY_STORAGE');
-  expect(result.stderr).toContain(out);
-  expect(result.stdout).not.toContain('Host install plan');
-  expect(existsSync(out)).toBe(false); expect(readdirSync(actual)).toEqual([]);
+  expect(result.status).toBe(0);
+  expect(result.stdout).toContain(`Host install plan → ${join(actual, 'new-install')}`);
+  const record = JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8')).hostDependencies[0];
+  expect(record.snapshot).toBe(join(actual, 'new-install/host-inputs', digest + '.tgz'));
+});
+for (const owner of [0, 1003]) test(`R2-6 link owner ${owner} follows root/same-user trust policy`, () => {
+  const actual = join(dir, 'actual'); mkdirSync(actual);
+  const link = join(dir, 'linked'); symlinkSync(actual, link);
+  const original = fs.lstatSync;
+  const spy = spyOn(fs, 'lstatSync').mockImplementation(((path: fs.PathLike) => {
+    const stat = original(path);
+    if (String(path) === link) stat.uid = owner;
+    return stat;
+  }) as typeof fs.lstatSync);
+  let checked: ReturnType<typeof preflightHostDependencies> | undefined;
+  try {
+    const run = () => { checked = preflightHostDependencies(repo, 'main', parseHostDependencies(option()), join(link, 'install')); };
+    if (owner === 0) expect(run).not.toThrow();
+    else { expect(run).toThrow('E_HOST_DEPENDENCY_STORAGE'); expect(existsSync(join(actual, 'install'))).toBe(false); }
+  } finally { spy.mockRestore(); checked?.cleanup(); }
 });
 test('R1-5 rejects an unsafe existing input directory before preview', () => {
   mkdirSync(join(out, 'host-inputs'), { recursive: true, mode: 0o755 });
@@ -526,4 +542,135 @@ test('R1-4 an exclusive-create race never claims or deletes another snapshot', (
     expect(() => checked.materialize()).toThrow('E_HOST_DEPENDENCY_FILE');
     expect(readFileSync(snapshot, 'utf8')).toBe('race winner');
   } finally { spy.mockRestore(); checked.cleanup(); checked.discardNew(); }
+});
+
+// Maintainer round 2: history, scope boundaries, retained pins and usage errors.
+test('R2-1 pinned checkout retains full history and reachable tags in one fetch', () => {
+  const ancestor = git(['rev-parse', 'HEAD']);
+  git(['tag', '-a', 'v1.0.0', '-m', 'Release']);
+  for (let i = 0; i < 3; i++) git(['commit', '--allow-empty', '-m', `History ${i}`]);
+  expect(install().status).toBe(0);
+  const appGit = (...args: string[]) => execFileSync('git', args, { cwd: join(out, 'app'), encoding: 'utf8' }).trim();
+  expect(appGit('rev-parse', '--is-shallow-repository')).toBe('false');
+  expect(appGit('describe', '--tags')).toMatch(/^v1\.0\.0-3-g/);
+  expect(appGit('merge-base', ancestor, 'HEAD')).toBe(ancestor);
+  expect(appGit('merge-base', '--is-ancestor', ancestor, 'HEAD')).toBe('');
+});
+test('R2-2 abbreviated host refs refuse before reading inputs or creating staging', () => {
+  const abbrev = git(['rev-parse', '--short=8', 'HEAD']);
+  rmSync(archive);
+  const r = install(['--host-dependency', option(), '--ch-ref', abbrev]);
+  expect(r.status).not.toBe(0);
+  expect(r.stderr).toContain(`'${abbrev}' looks like an abbreviated commit ID`);
+  expect(r.stderr).toContain(`needs the full 40-hex ID (git rev-parse ${abbrev}); no output written`);
+  expect(existsSync(out)).toBe(false); expect(readdirSync(join(dir, 'staging'))).toEqual([]);
+});
+for (const [name, key] of [['semver', '@types/semver'], ['ws', 'ws/@types/ws']]) test(`R2-3 verifier ignores scoped lookalike ${key} for ${name}`, () => {
+  pack(name);
+  writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'synthetic-host', dependencies: { [name!]: '^1' } }));
+  git(['commit', '-am', 'Unscoped pin']);
+  expect(install(['--host-dependency', option(name!)]).status).toBe(0);
+  const path = join(out, 'app/bun.lock'), lock = Bun.JSONC.parse(readFileSync(path, 'utf8')) as any;
+  lock.packages[key!] = [`@types/${name}@1.0.0`, '', {}, 'sha512-unrelated'];
+  writeFileSync(path, JSON.stringify(lock));
+  const records = JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8')).hostDependencies;
+  expect(() => verifyHostDependencyResolutions(join(out, 'app'), records)).not.toThrow();
+  for (const nested of [`node_modules/${name}`, `parent/${name}`, `@scope/parent/${name}`]) {
+    lock.packages[nested] = [`${name}@9.0.0`, '', {}, 'sha512-other'];
+    writeFileSync(path, JSON.stringify(lock));
+    expect(() => verifyHostDependencyResolutions(join(out, 'app'), records)).toThrow('E_HOST_DEPENDENCY_RESOLUTION');
+    delete lock.packages[nested];
+  }
+});
+for (const [value, reason] of [
+  ['bad', 'expected <name>=<absolute path>#sha256=<64 hex>'],
+  ['fixture-local-input=relative.tgz#sha256=' + '0'.repeat(64), 'path is not absolute'],
+  ['fixture-local-input=/tmp/x#sha256=123', 'expected <name>=<absolute path>#sha256=<64 hex>'],
+]) test(`R2-4 option refusal identifies value and reason: ${value}`, () => {
+  const r = install(['--host-dependency', value!]);
+  expect(r.status).not.toBe(0); expect(r.stderr).toContain(value!); expect(r.stderr).toContain(reason!);
+});
+test('R2-4 duplicate refusal names the duplicate', () => {
+  expect(install(['--host-dependency', option(), '--host-dependency', option()]).stderr).toContain('duplicate name fixture-local-input');
+});
+test('R2-5 missing snapshots and lost lock records cannot hide retained checkout pins', () => {
+  expect(install().status).toBe(0);
+  const lockPath = join(out, 'connectome.lock'), lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+  delete lock.hostDependencies; writeFileSync(lockPath, JSON.stringify(lock));
+  rmSync(join(out, 'host-inputs'), { recursive: true });
+  const before = readFileSync(lockPath, 'utf8');
+  const result = install([]);
+  expect(result.status).not.toBe(0); expect(result.stderr).toContain('E_HOST_DEPENDENCY_REINSTALL');
+  expect(result.stderr).toContain('pinned checkout; snapshots missing');
+  expect(readFileSync(lockPath, 'utf8')).toBe(before);
+});
+for (const command of ['build', 'run', 'check']) test(`R2-nit --host-dependency refuses outside install (${command})`, () => {
+  const r = spawnSync(realBun, [resolve('bin/cook'), command, recipe, '--host-dependency', option()], { encoding: 'utf8' });
+  expect(r.status).not.toBe(0); expect(r.stderr).toContain('--host-dependency is only supported by install');
+});
+test('R2-nit dropping absent pins keeps an unchanged host', () => {
+  writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'synthetic-host' })); git(['commit', '-am', 'Flagless host']);
+  expect(install([]).status).toBe(0);
+  writeFileSync(join(out, 'app', 'kept'), 'keep');
+  const r = install(['--drop-host-dependencies']);
+  expect(r.status).toBe(0); expect(r.stdout).toContain('unchanged'); expect(existsSync(join(out, 'app', 'kept'))).toBe(true);
+});
+test('R2-nit only host-inputs gets private directory creation mode', () => {
+  const mask = process.umask(0o022);
+  try {
+    out = join(dir, 'new-parent/install'); expect(install().status).toBe(0);
+    expect(statSync(dirname(out)).mode & 0o777).toBe(0o755);
+    expect(statSync(out).mode & 0o777).toBe(0o755);
+    expect(statSync(join(out, 'host-inputs')).mode & 0o777).toBe(0o700);
+  } finally { process.umask(mask); }
+});
+for (const phase of ['fetch', 'build']) for (const signal of ['SIGINT', 'SIGTERM'] as const) test(`R2-nit signal cleanup re-raises ${signal} during ${phase}`, async () => {
+  const marker = join(dir, 'waiting');
+  if (phase === 'build') writeFileSync(join(shim, 'bun'), `#!/bin/sh\ntouch '${marker}'\nexec sleep 30\n`);
+  else writeFileSync(join(shim, 'git'), `#!/bin/sh\ncase " $* " in *' fetch '*) touch '${marker}'; exec sleep 30;; esac\nexec /usr/bin/git "$@"\n`, { mode: 0o755 });
+  const child = spawn(realBun, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, '--no-prompts', '--yes', '--host-dependency', option()], {
+    detached: true, stdio: 'ignore', env: { ...process.env, TMPDIR: join(dir, 'staging'), PATH: shim + ':' + process.env.PATH },
+  });
+  const exited = new Promise<string | null>(resolve => child.on('exit', (_code, signal) => resolve(signal)));
+  try {
+    const deadline = Date.now() + 4000;
+    while (!existsSync(marker) && Date.now() < deadline) await Bun.sleep(20);
+    expect(existsSync(marker)).toBe(true);
+    expect(readdirSync(join(dir, 'staging')).length).toBeGreaterThan(0);
+    process.kill(-child.pid!, signal);
+    expect(await exited).toBe(signal);
+    expect(readdirSync(join(dir, 'staging'))).toEqual([]);
+    expect(existsSync(join(out, 'app'))).toBe(false);
+    expect(existsSync(join(out, 'host-inputs', digest + '.tgz'))).toBe(false);
+  } finally {
+    try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* already gone */ }
+    await exited;
+  }
+}, 10000);
+
+test('R2-1/R2-2 full non-tip SHA still installs the selected commit with history', () => {
+  git(['tag', '-a', 'v1.0.0', '-m', 'Release']);
+  git(['commit', '--allow-empty', '-m', 'Selected']);
+  const selected = git(['rev-parse', 'HEAD']);
+  git(['commit', '--allow-empty', '-m', 'Later tip']);
+  expect(install(['--host-dependency', option(), '--ch-ref', selected]).status).toBe(0);
+  const appGit = (...args: string[]) => execFileSync('git', args, { cwd: join(out, 'app'), encoding: 'utf8' }).trim();
+  expect(appGit('rev-parse', 'HEAD')).toBe(selected);
+  expect(appGit('rev-parse', '--is-shallow-repository')).toBe('false');
+  expect(appGit('describe', '--tags')).toMatch(/^v1\.0\.0-1-g/);
+});
+test('R2-6 refuses another-user link reached inside a trusted link target', () => {
+  const actual = join(dir, 'actual'); mkdirSync(actual);
+  const untrusted = join(dir, 'other-link'); symlinkSync(actual, untrusted);
+  const trusted = join(dir, 'trusted-link'); symlinkSync('other-link/../actual', trusted);
+  const original = fs.lstatSync;
+  const spy = spyOn(fs, 'lstatSync').mockImplementation(((path: fs.PathLike) => {
+    const stat = original(path);
+    if (String(path) === untrusted) stat.uid = 1003;
+    return stat;
+  }) as typeof fs.lstatSync);
+  try {
+    expect(() => preflightHostDependencies(repo, 'main', parseHostDependencies(option()), join(trusted, 'install'))).toThrow('E_HOST_DEPENDENCY_STORAGE');
+    expect(existsSync(join(actual, 'install'))).toBe(false);
+  } finally { spy.mockRestore(); }
 });

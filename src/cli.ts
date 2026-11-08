@@ -175,9 +175,11 @@ ${log.bold('Flags:')}
                          references render as empty (default: refuse)
   --env-file <path>      Read variable values from this file before prompting
   --ch-repo <url>        connectome-host repo (default: ${DEFAULT_CH_REPO_URL})
-  --drop-host-dependencies Explicitly remove recorded local dependency pins
-  --host-dependency <name>=<abs-path>#sha256=<hex> Repeatable local archive input
   --ch-ref <ref>         connectome-host ref (default: ${DEFAULT_CH_REF})
+  --host-dependency <name>=<abs-path>#sha256=<64 hex>
+                         Repeatable hash-pinned local archive input
+  --drop-host-dependencies
+                         Explicitly remove recorded local dependency pins
   --help, -h             Show this message
 `;
 
@@ -586,6 +588,10 @@ export async function main(argv: string[]): Promise<void> {
     process.exit(0);
   }
 
+  const commandArgs = argv.slice(1, argv.indexOf('--') === -1 ? undefined : argv.indexOf('--'));
+  if (first !== 'install' && commandArgs.some(arg => arg === '--host-dependency' || arg.startsWith('--host-dependency='))) {
+    throw new Error('--host-dependency is only supported by install');
+  }
   const handler = SUBCOMMANDS[first];
   if (!handler) {
     log.error(`unknown command: ${first}`);

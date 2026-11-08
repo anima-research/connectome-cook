@@ -10,7 +10,7 @@ cook install recipe.json --out /srv/example/install --no-prompts --yes \
 ```
 
 Repeat `--host-dependency` for distinct names (including scoped names). Inputs
-must be absolute local regular files, not URLs, symlinks or directories. The
+are accepted only by `install`, and must be absolute local regular files, not URLs, symlinks or directories. The
 name must exist in exactly one of the acquired host's original `dependencies`,
 `devDependencies` or `optionalDependencies`. Peer-only declarations are not
 direct install inputs. Existing `overrides`/`resolutions` entries naming a
@@ -34,10 +34,15 @@ its version must satisfy that direct range (including semver prerelease rules).
 
 ## Preflight and storage
 
-**This opt-in input feature requires Linux with /proc, no symlink in any
-ancestor of the output/input directory, and an effective-user-owned 0700
-host-inputs directory if it already exists.** Existing ancestors need not be
-private. Cook validates these restrictions read-only before confirmation or
+**This opt-in input feature requires Linux with /proc and an
+effective-user-owned 0700 host-inputs directory if it already exists.** Cook
+resolves existing output ancestors with realpath and prints the canonical install
+path in the preview. Root-owned and same-effective-user-owned symlinks are
+trusted (including layouts such as `/home` → `/var/home`); links owned by any
+other non-root user refuse, including links traversed by another link's target.
+Existing ancestors need not be private. Only `host-inputs` is created with
+private mode; missing install ancestors use ordinary umask defaults. Cook
+validates these restrictions read-only before confirmation or
 creation of a fresh output tree. Flagless fresh installs retain their existing
 platform behavior. Later I/O errors or concurrent changes can still fail
 materialization; cook does not roll back newly created empty directories.
@@ -59,8 +64,11 @@ requiring extended headers), or with a `package/` directory containing
 package.json: `tar --format=ustar -czf input.tgz package`.
 Plain GNU `tar czf` and `tar --format=pax` are not supported.
 
-Cook fetches the selected host once into temporary staging and reads its
-manifest from Git objects. The preview names each dependency, original range,
+Cook fetches the selected host once into temporary staging, with full history
+and tags (not a shallow fetch), and reads its manifest from Git objects. Like
+the flagless clone, this fetch has no fixed timeout; SIGINT/SIGTERM can cancel it.
+Abbreviated hex `--ch-ref` values refuse before staging; use a symbolic ref or
+the full commit ID (`git rev-parse <abbreviation>`). The preview names each dependency, original range,
 planned `file:` location, SHA-256 prefix and selected resolution-policy field.
 Only after confirmation does cook materialize verified snapshots under
 `<installDir>/host-inputs/<sha256>.tgz` (0700 directory, 0400 file). New files
@@ -69,7 +77,10 @@ snapshot is reused only after checking ownership, mode, size and hash.
 Symlinks (including dangling ones) refuse without being removed.
 Cook transfers the fetched repository into app/, checks out the exact commit
 and applies the planned edits before Bun runs, without a second host fetch.
-Staging is removed on completion or normal failure/cancellation.
+Staging is removed on completion, failure/cancellation, and SIGINT/SIGTERM.
+Signal cleanup also removes the partially rewritten host checkout and only this
+attempt's new snapshots, then re-raises the original signal. SIGKILL and machine
+failure cannot run cleanup.
 
 ## Install policy and lock
 
@@ -110,8 +121,11 @@ recorded input** with its hash, or it refuses with E_HOST_DEPENDENCY_REINSTALL,
 even with `--yes`. Omitting the flag never means silently removing a pin.
 To deliberately remove all pins and rebuild the unmodified host, pass
 `--drop-host-dependencies` instead (cannot combine with `--host-dependency`).
-Retained checkout edits are also checked when an older cook has dropped the
-lock field. Do not use older cooks for these installs: they do not enforce this
+Retained checkout edits are checked whenever app/package.json exists, even
+when an older cook has dropped the lock field and `host-inputs` is missing.
+A flagless reinstall refuses with "pinned checkout; snapshots missing" when
+those retained pins refer to lost snapshots. Dropping pins when neither the
+lock nor the checkout records any is a no-op (an unchanged host is kept). Do not use older cooks for these installs: they do not enforce this
 contract, and lost lock records plus a lost checkout cannot be reconstructed.
 
 Snapshots survive temp cleanup and support later Bun installs with an empty
@@ -126,8 +140,10 @@ Authenticate the artifact/hash through your own trusted process. This feature
 does not establish provenance, download engines, or authorize activation.
 
 Refusals use the E_HOST_DEPENDENCY_ prefix: OPTION, DUPLICATE, FILE, HASH,
-ARCHIVE, NAME, SOURCE, UNDECLARED, RANGE, VERSION, TRUSTED, STORAGE, REINSTALL or
-RESOLUTION.
+ARCHIVE, NAME, SOURCE, UNDECLARED, RANGE, VERSION, TRUSTED, STORAGE, REINSTALL,
+RESOLUTION, OVERLAP or POLICY_FIELDS. OVERLAP identifies a recipe write into
+host inputs; POLICY_FIELDS identifies both overrides and resolutions being
+present.
 Input errors identify paths/reasons; hash mismatches give expected/observed
 digests and version mismatches give version/range. Source errors identify
 repository/ref/operation and a safe cause, never arbitrary Git/helper output.
