@@ -11,6 +11,7 @@ export interface HostEngines { bun: HostEngine; node: HostEngine }
 
 /** Only the cook-owned bin directory precedes the operator's search path. */
 export function hostBuildPath(binDir: string, parentPath?: string): string {
+  if (binDir.includes(':')) throw new Error('E_HOST_ENGINE_PATH: selected-engine install path must not contain ":" (build PATH separator)');
   return [binDir, ...(parentPath?.split(':') ?? [])].filter(Boolean).join(':');
 }
 
@@ -48,19 +49,43 @@ export interface HostEnginePreflight {
   engines: HostEngines;
   commit: string;
   sourceDir: string;
+  sourceUrl: string;
   cleanup: () => void;
 }
 
 /** Fetch once, inspect without builds, and retain that exact object store for
- * local materialization. Caller owns cleanup on every successful return. */
-export function preflightHostEngines(url: string, ref: string, bunPath: string, nodePath: string): HostEnginePreflight {
+ * local materialization. Caller owns cleanup on every successful return.
+ * onScratch lets the CLI register signal cleanup even before fetching. */
+export function preflightHostEngines(url: string, ref: string, bunPath: string, nodePath: string, onScratch?: (cleanup: () => void) => void): HostEnginePreflight {
   assertCredentialFreeSourceUrl(url);
+  // Git treats a colon before the first slash as a remote (including scp
+  // host:path). Resolve only local spellings, as git clone does for origin.
+  if (!isAbsolute(url) && !/^[^/]+:/.test(url)) url = process.cwd() + '/' + url;
   const scratch = mkdtempSync(join(tmpdir(), 'cook-engines-'));
   const cleanup = () => rmSync(scratch, { recursive: true, force: true });
+  onScratch?.(cleanup);
+  const runGit = (args: string[]) => execFileSync('git', args, {
+    cwd: scratch, env: process.env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000,
+  }).trim();
+  const timedOut = (err: unknown) => {
+    const failure = err as { signal?: string; code?: string };
+    return !!failure.signal || failure.code === 'ETIMEDOUT';
+  };
   const git = (args: string[], code: string, step: string) => {
-    try {
-      return execFileSync('git', args, { cwd: scratch, env: process.env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000 }).trim();
-    } catch { throw new Error(`E_HOST_ENGINE_${code}: git ${step} failed; no installation changed`); }
+    try { return runGit(args); }
+    catch (err) {
+      if (timedOut(err)) code = 'TIMEOUT';
+      else if (code === 'FETCH' && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(ref)) {
+        // A failed fetch alone cannot distinguish a missing ref from transport
+        // failure. Only ls-remote's documented exit 2 means no matching ref.
+        try { runGit(['ls-remote', '--exit-code', '--', url, ref]); }
+        catch (probeError) {
+          if (timedOut(probeError)) code = 'TIMEOUT';
+          else if ((probeError as { status?: number }).status === 2) code = 'REF';
+        }
+      }
+      throw new Error(`E_HOST_ENGINE_${code}: git ${step} failed; no installation changed`);
+    }
   };
   try {
     git(['init', '--bare', '.'], 'INIT', 'init');
@@ -72,6 +97,6 @@ export function preflightHostEngines(url: string, ref: string, bunPath: string, 
     catch { throw new Error('E_HOST_ENGINE_PACKAGE: invalid package.json'); }
     const engines = { bun: checkEngine(bunPath, pkg?.engines?.bun, 'bun'), node: checkEngine(nodePath, pkg?.engines?.node, 'node') };
     git(['update-ref', 'refs/heads/cook-selected', commit], 'COMMIT', 'update-ref cook-selected');
-    return { engines, commit, sourceDir: scratch, cleanup };
+    return { engines, commit, sourceDir: scratch, sourceUrl: url, cleanup };
   } catch (err) { cleanup(); throw err; }
 }

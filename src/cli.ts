@@ -175,9 +175,9 @@ ${log.bold('Flags:')}
                          references render as empty (default: refuse)
   --env-file <path>      Read variable values from this file before prompting
   --ch-repo <url>        connectome-host repo (default: ${DEFAULT_CH_REPO_URL})
-  --bun-path <absolute>  Validate host engines (requires --node-path)
-  --node-path <absolute> Select Node for host stdio consumers
   --ch-ref <ref>         connectome-host ref (default: ${DEFAULT_CH_REF})
+  --bun-path <absolute>  Validate host engines (requires --node-path)
+  --node-path <absolute> Node for host builds and command: node servers
   --help, -h             Show this message
 `;
 
@@ -215,7 +215,9 @@ async function handleInstall(argv: string[]): Promise<number> {
   // to a SHA before executing; clones check out the exact commits.
   let chCommit: string | undefined;
   if (flags['pin-refs']) {
-    log.step('pinning refs (git ls-remote)');
+    log.step(flags['bun-path'] !== undefined || flags['node-path'] !== undefined
+      ? 'pinning component refs (git ls-remote); host bound by engine preflight'
+      : 'pinning refs (git ls-remote)');
     pinSources(planResult.plan.sources);
     // Engine preflight fetches and binds the host itself; avoid ls-remote too.
     if (flags['bun-path'] === undefined && flags['node-path'] === undefined) {

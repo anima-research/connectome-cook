@@ -289,7 +289,7 @@ function executeClone(action: CloneAction, values: Record<string, string>, build
   mkdirSync(resolve(action.target, '..'), { recursive: true });
 
   const sslArgs = action.sslBypass ? ['-c', 'http.sslVerify=false'] : [];
-  log.step(`cloning ${log.dim(action.url)}${action.ref !== 'main' ? `@${action.ref}` : ''} → ${log.dim(action.target)}`);
+  log.step(`${sourceDir ? 'materializing inspected host from local scratch for' : 'cloning'} ${log.dim(action.url)}${action.ref !== 'main' ? `@${action.ref}` : ''} → ${log.dim(action.target)}`);
   if (sourceDir) {
     const localGit = (args: string[], step: string) => {
       try { execFileSync('git', args, { stdio: ['ignore', 'pipe', 'pipe'] }); }
@@ -341,6 +341,13 @@ function executeClone(action: CloneAction, values: Record<string, string>, build
       });
     }
   }
+  if (sourceDir) {
+    try {
+      execFileSync('git', ['branch', '-D', 'cook-selected'], { cwd: action.target, stdio: 'pipe' });
+      execFileSync('git', ['update-ref', '-d', 'refs/remotes/origin/cook-selected'], { cwd: action.target, stdio: 'pipe' });
+    } catch { throw new Error('E_HOST_ENGINE_CLONE: removing synthetic refs failed'); }
+  }
+
   let commit: string | undefined;
   try {
     commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: action.target })
@@ -482,15 +489,32 @@ export async function runHostBackend(
   for (const source of plan.sources) {
     assertCredentialFreeSourceUrl(source.url, `${sourceLocation(source)}.url`);
   }
-  let checked: HostEnginePreflight | undefined;
   if (options.bunPath !== undefined || options.nodePath !== undefined) {
     if (!options.bunPath || !options.nodePath) throw new Error('E_HOST_ENGINE_PATH: both --bun-path and --node-path are required');
-    const { preflightHostEngines } = await import('../host-engines.js');
-    checked = preflightHostEngines(options.chRepoUrl, options.chCommit ?? options.chRef, options.bunPath, options.nodePath);
-    options = { ...options, chCommit: checked.commit };
+    if (resolve(options.installDir).includes(':')) throw new Error('E_HOST_ENGINE_PATH: selected-engine install path must not contain ":" (build PATH separator)');
+    const { preflightHostEngines } = await import('../host-engines.js').catch(() => {
+      throw new Error('E_HOST_ENGINE_DEPENDENCY: cannot load engine preflight dependencies; run bun install');
+    });
+    let removeScratch = () => {};
+    const signals = ['SIGINT', 'SIGTERM'] as const;
+    const cleanup = () => {
+      removeScratch();
+      signals.forEach((signal, i) => process.off(signal, handlers[i]!));
+    };
+    const handlers = signals.map(signal => () => { cleanup(); process.kill(process.pid, signal); });
+    signals.forEach((signal, i) => process.on(signal, handlers[i]!));
+    try {
+      const checked = preflightHostEngines(options.chRepoUrl, options.chCommit ?? options.chRef, options.bunPath, options.nodePath, cleanup => { removeScratch = cleanup; });
+      options = { ...options, chRepoUrl: checked.sourceUrl, chCommit: checked.commit };
+      return await materializeHost(plan, options, checked);
+    } finally {
+      // Sync git/build subprocesses defer JS signal delivery. Drain pending
+      // signals before unregistering handlers (and before CLI process.exit).
+      await new Promise<void>(resolve => setImmediate(resolve));
+      cleanup();
+    }
   }
-  try { return await materializeHost(plan, options, checked); }
-  finally { checked?.cleanup(); }
+  return materializeHost(plan, options);
 }
 
 /** Materialization starts only after engine inspection has succeeded. */
