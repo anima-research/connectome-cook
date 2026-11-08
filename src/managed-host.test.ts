@@ -446,6 +446,26 @@ test('split workspace refuses reserved-root mounts before any build', () => {
   }
 });
 
+for (const mount of ['/', '/./', '//', '../../../../../../../../', 'reserved-parent/']) {
+  test(`split workspace root-aware refusal before any build: ${mount}`, () => {
+    const c = { ...splitLayout(), state: join(dir, 'reserved-parent/state') };
+    const file = layoutFile(); writeFileSync(file, JSON.stringify(c));
+    const path = mount === 'reserved-parent/' ? join(dir, mount) + '/' : mount;
+    const original = JSON.parse(readFileSync(recipe, 'utf8'));
+    writeFileSync(recipe, JSON.stringify({ ...original, modules: { workspace: {
+      mounts: [{ name: 'unsafe', path, mode: 'read-write' }],
+    } } }));
+    const marker = join(dir, 'build-ran');
+    writeFileSync(bun, `#!/bin/sh\nif [ "$1" = --version ]; then echo 1.4.4; else touch '${marker}'; fi\n`);
+    const result = install(['--layout', file, '--bun-path', bun, '--node-path', node]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('E_HOST_LAYOUT: workspace mount exposes a reserved root');
+    expect(result.stdout).not.toContain('Host install plan');
+    expect(existsSync(marker)).toBe(false);
+    for (const root of [c.runtime, c.config, c.state, c.workspace, c.credentials]) expect(existsSync(root)).toBe(false);
+  });
+}
+
 test('split failed first build resumes only the same layout', () => {
   const file = layoutFile(), args = ['--layout', file, '--bun-path', bun, '--node-path', node];
   writeFileSync(bun, '#!/bin/sh\nif [ "$1" = --version ]; then echo 1.4.4; else exit 42; fi\n');

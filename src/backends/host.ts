@@ -60,6 +60,7 @@ import {
 } from '../lockfile.js';
 import { applyConnectorState, applyWorkspaceMounts, provisionLayout, type HostLayout, validateLayoutConsumers } from '../host-layout.js';
 import { writePrivateLayoutFile } from '../private-directory.js';
+import { isPathWithin } from '../path-containment.js';
 import { renderUserUnit, validateUserUnit } from '../host-unit.js';
 import { assertHostEnginePath } from '../host-engine-path.js';
 import type { HostEngines, HostEnginePreflight } from '../host-engines.js';
@@ -864,7 +865,7 @@ async function materializeHost(
         continue;
       }
       const target = resolve(join(installDir, 'app'), cf.path);
-      if (target !== resolve(installDir, 'app') && !target.startsWith(resolve(installDir, 'app') + '/')) {
+      if (!isPathWithin(resolve(installDir, 'app'), target)) {
         log.warn(`${cf.path}: resolves outside the install dir — skipped; hand-place it before launching`);
         continue;
       }
@@ -888,7 +889,7 @@ async function materializeHost(
     const envsubstFiles: LauncherEnvsubst[] = [];
     const writeWithin = (target: string, content: string, mode: number) => {
       const resolved = resolve(target);
-      if (resolved !== resolve(installDir) && !resolved.startsWith(resolve(installDir) + '/')) {
+      if (!isPathWithin(installDir, resolved)) {
         throw new Error(`rendered file "${target}" resolves outside the install dir — refusing to write`);
       }
       mkdirSync(resolve(resolved, '..'), { recursive: true });

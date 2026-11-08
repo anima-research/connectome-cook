@@ -1,6 +1,7 @@
 /** Explicit, opt-in standalone legacy layout. No data discovery or migration. */
 import { dirname, join, resolve, isAbsolute } from 'node:path';
 import { privatePathParts, provisionPrivateDirectory } from './private-directory.js';
+import { isPathWithin } from './path-containment.js';
 import type { Recipe } from './vendor/recipe.js';
 
 export interface HostLayout {
@@ -25,7 +26,7 @@ export function hostLayout(value: unknown, installDir: string): HostLayout {
     if (typeof path !== 'string' || !path.startsWith('/') || /[\0-\x1f\x7f]/.test(path)) fail(role, `expected an absolute control-free path: ${JSON.stringify(path)}`);
     try { privatePathParts(path.slice(1)); }
     catch { fail(role, `${path}: noncanonical path (empty, dot or traversal component)`); }
-    const overlap = paths.find(p => p.path === path || p.path.startsWith(path + '/') || path.startsWith(p.path + '/'));
+    const overlap = paths.find(p => isPathWithin(path, p.path) || isPathWithin(p.path, path));
     if (overlap) fail(role, `${path}: overlaps ${overlap.role} ${overlap.path}`);
     paths.push({ role, path });
   }
@@ -34,7 +35,7 @@ export function hostLayout(value: unknown, installDir: string): HostLayout {
   for (const [consumer, env] of Object.entries(c.connectorState)) {
     if (!/^[A-Za-z0-9_-]+$/.test(consumer) || !env || typeof env !== 'object' || Array.isArray(env) || !Object.keys(env).length) fail(`connectorState.${consumer}`, 'expected a named consumer and nonempty env mapping');
     const files = Object.values(env);
-    if (files.some((file, i) => typeof file === 'string' && files.some((other, j) => i !== j && typeof other === 'string' && other.startsWith(file + '/')))) fail(`connectorState.${consumer}`, 'a file cannot also be a parent directory');
+    if (files.some(file => typeof file === 'string' && files.some(other => typeof other === 'string' && other !== file && isPathWithin(file, other)))) fail(`connectorState.${consumer}`, 'a file cannot also be a parent directory');
     for (const [name, path] of Object.entries(env)) {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || typeof path !== 'string') fail(`connectorState.${consumer}.${name}`, 'expected an env name and relative file path');
       try { privatePathParts(path); }
@@ -99,7 +100,7 @@ export function applyWorkspaceMounts(configuration: Recipe, layout: HostLayout):
   const lowered = mounts.map(mount => {
     const path = isAbsolute(mount.path) ? resolve(mount.path) : resolve(layout.workspace, mount.path);
     // Also reject ancestors exposing a reserved root (e.g. '..' or '/').
-    if (reserved.some(root => path === root || path.startsWith(root + '/') || root.startsWith(path + '/'))) {
+    if (reserved.some(root => isPathWithin(root, path) || isPathWithin(path, root))) {
       throw new Error('E_HOST_LAYOUT: workspace mount exposes a reserved root: ' + mount.path);
     }
     return { ...mount, path };
