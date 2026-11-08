@@ -2,7 +2,7 @@
 
 Status: proposal, for discussion in its pull request.
 
-Following review R1 on #3 and #5, we're closing both PRs. They implemented a held/seed/verify lifecycle and a deployment manifest ahead of any agreed design. The PRs with users today are rebuilt on main and don't depend on them: #6, #7, #8, #10 and #11. #9 (which absorbs #4) is on hold until question 3 below is settled.
+Following review R1 on #3 and #5, we're closing both PRs. They implemented a held/seed/verify lifecycle and a deployment manifest ahead of any agreed design. The PRs with users today are rebuilt on main and don't depend on them: #6, #7, #8, #10 and #11. #9 (which absorbed #4) is closed: secrets stay with the deployment layer (see Decided, below).
 
 ## Proposal
 - cook keeps doing one thing: deterministically materialise one pinned runtime into its own directory. It is fail-closed, keeps credentials out of argv, and leaves existing installs untouched unless asked.
@@ -33,5 +33,7 @@ A v1 lock is still read. The first reconcile after the upgrade rewrites it as v2
 ## Questions
 1. Is the split acceptable: cook materialises and records, and the lifecycle lives outside it?
 2. Any fields to add or drop in lock v2?
-3. Should cook provision credential files and bind them to consumers (#9), or should that stay with the deployment layer (for example systemd `LoadCredential`), with cook only refusing credentials in argv and URLs?
-4. Two small refactors from #3 also stand on their own: inspectPlan/validatePlanWalks in plan.ts, and parent-recipe reuse in walkRecipe. Do you want them as a separate PR?
+
+## Decided
+- Credential files (formerly question 3): they stay with the deployment layer (for example systemd `LoadCredential` or an env file rendered from a secret store). cook only refuses credentials in argv and URLs. #9 and #4 are closed.
+- The two standalone refactors from #3 (formerly question 4): `inspectPlan`/`validatePlanWalks` in `plan.ts` and parent-recipe reuse in `walkRecipe` are in #13.
