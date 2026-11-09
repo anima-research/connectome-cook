@@ -20,7 +20,8 @@ export function materialize(cli: string, scenario: Case) {
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 const args = process.argv.slice(2);
-if (args[0] === 'clone') {
+if (args[0] === '--version') { console.log('git version 2.53.0');
+} else if (args[0] === 'clone') {
   mkdirSync(join(args[2], '.git'), { recursive: true });
   writeFileSync(join(args[2], '.git/config'), '[remote "origin"]\\nurl = ' + args[1]);
 } else if (args[0] === 'remote') {

@@ -1,12 +1,13 @@
 /** Async subprocesses for the opt-in pinned install. Keep cook's session and
  * controlling terminal; cancellation signals only the direct child. */
+import { gitEnvironment, processAllowlistEnv } from './process-env.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 
 export class PinnedCommands {
   private active = new Map<ChildProcess, Promise<void>>();
   private cancelled = false;
 
-  run(file: string, args: string[], cwd: string, inherit = false, env: NodeJS.ProcessEnv = process.env): Promise<string> {
+  run(file: string, args: string[], cwd: string, inherit = false, env: NodeJS.ProcessEnv = file === 'git' ? gitEnvironment() : processAllowlistEnv()): Promise<string> {
     if (this.cancelled) return Promise.reject(new Error('pinned install cancelled'));
     const child = spawn(file, args, {
       cwd, stdio: inherit ? ['ignore', 'inherit', 'inherit'] : ['ignore', 'pipe', 'pipe'],
@@ -40,7 +41,7 @@ export class PinnedCommands {
         this.active.delete(child);
         if (status === 0 && !overflow) resolve(Buffer.concat(stdout).toString('utf8').trim());
         else reject(Object.assign(new Error(`command failed: ${file}`), {
-          status, signal, stderr: Buffer.concat(stderr).toString('utf8'),
+          status, signal, stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8'),
           ...(overflow ? { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' } : {}),
         }));
       });

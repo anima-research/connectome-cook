@@ -1,3 +1,5 @@
+import { execFileSync } from 'node:child_process';
+import { repositoryIndependentGitEnv } from './git-env.js';
 import type { InstallPlan } from './plan.js';
 
 /** Recipe value names excluded from source-acquisition environments only. */
@@ -41,7 +43,18 @@ export function processAllowlistEnv(): NodeJS.ProcessEnv {
 
 /** Git additionally receives external authentication hooks and configuration channels. */
 export function gitEnvironment(base = processAllowlistEnv(), excluded: Iterable<string> = []): NodeJS.ProcessEnv {
-  const env = { ...base };
+  const blocked = new Set(excluded);
+  const selected = new Set((process.env.COOK_PASS_ENV ?? '').split(/[,\s]+/).filter(Boolean));
+  for (const name of ['GH_TOKEN', 'GITHUB_TOKEN']) {
+    if (blocked.has(name) && process.env[name] !== undefined) {
+      if (!selected.has(name)) {
+        throw new Error(`Recipe secret ${name} collides with Git's helper environment; explicitly select ${name} with COOK_PASS_ENV to forward the parent value, or rename the recipe secret.`);
+      }
+      blocked.delete(name);
+    }
+  }
+  let env = { ...base };
+  for (const key of blocked) delete env[key];
   // Explicit build opt-ins must not redirect Git repositories or bypass its
   // separate authentication/configuration policy. Re-add Git's channels below.
   for (const key of Object.keys(env)) {
@@ -50,6 +63,9 @@ export function gitEnvironment(base = processAllowlistEnv(), excluded: Iterable<
       'XDG_CONFIG_HOME', 'SSH_ASKPASS', 'COOK_PASS_ENV',
     ].includes(key)) delete env[key];
   }
+  // Strip repository-local controls BEFORE restoring indexed operator config
+  // and BEFORE sourceGitEnvironment injects a credential.
+  env = repositoryIndependentGitEnv(env);
   for (const key of [
     'SSH_AUTH_SOCK', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_SSH_VARIANT',
     'GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_TERMINAL_PROMPT',
@@ -68,7 +84,7 @@ export function gitEnvironment(base = processAllowlistEnv(), excluded: Iterable<
     const match = /^GIT_CONFIG_(?:KEY|VALUE)_(\d+)$/.exec(key);
     if (match && Number(match[1]) < count) env[key] = process.env[key];
   }
-  for (const key of excluded) delete env[key];
+  for (const key of blocked) delete env[key];
   return env;
 }
 
@@ -92,11 +108,43 @@ export function sourceGitEnvironment(
   }
   const rawCount = env.GIT_CONFIG_COUNT ?? '0';
   const count = Number(rawCount);
-  if (!/^\d+$/.test(rawCount) || !Number.isSafeInteger(count) || count >= Number.MAX_SAFE_INTEGER) {
+  if (!/^\d+$/.test(rawCount) || !Number.isSafeInteger(count) || count > Number.MAX_SAFE_INTEGER - 2) {
     throw new Error(`${location}: authSecret requires a valid GIT_CONFIG_COUNT.`);
   }
-  env.GIT_CONFIG_COUNT = String(count + 1);
+  assertAuthGitVersion(env, location);
+  env.GIT_CONFIG_COUNT = String(count + 2);
   env[`GIT_CONFIG_KEY_${count}`] = `http.${origin}/.extraHeader`;
   env[`GIT_CONFIG_VALUE_${count}`] = `Authorization: Basic ${Buffer.from(`oauth2:${token}`).toString('base64')}`;
+  env[`GIT_CONFIG_KEY_${count + 1}`] = 'http.followRedirects';
+  env[`GIT_CONFIG_VALUE_${count + 1}`] = 'false';
   return env;
 }
+
+/** GIT_CONFIG_COUNT is available starting with Git 2.31. Do not try auth on older Git. */
+function assertAuthGitVersion(env: NodeJS.ProcessEnv, location: string): void {
+  let version: string;
+  try {
+    version = execFileSync('git', ['--version'], { env, encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {
+    throw new Error(`${location}: authSecret requires Git >= 2.31; git --version failed.`);
+  }
+  const match = /^git version (\d+)\.(\d+)(?:\.|\s|$)/.exec(version);
+  if (!match || Number(match[1]) < 2 || (Number(match[1]) === 2 && Number(match[2]) < 31)) {
+    throw new Error(`${location}: authSecret requires Git >= 2.31 (GIT_CONFIG_COUNT support).`);
+  }
+}
+
+/** Keep useful diagnostics without relaying known private credentials or an
+ * exec error's message (which may include the environment/command). */
+export function gitFailureOutput(error: unknown, token?: string): string {
+  const { stdout, stderr } = error as { stdout?: unknown; stderr?: unknown };
+  let output = [stdout, stderr].filter(value => value !== undefined && value !== null).map(String).join('\n').trim();
+  if (token) {
+    const forms = [token, Buffer.from(token).toString('base64'), Buffer.from(`oauth2:${token}`).toString('base64')]
+      .sort((a, b) => b.length - a.length);
+    for (const form of forms) output = output.replaceAll(form, '[REDACTED]');
+  }
+  return output;
+}
+
+export const AUTH_REDIRECT_HINT = 'authSecret disables HTTP redirects; put the final URL in the recipe.';

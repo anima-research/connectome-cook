@@ -162,7 +162,11 @@ entries; the path-valued `GIT_SSL_CAINFO`/`CAPATH`/`CERT`/`KEY` and correspondin
 `DBUS_SESSION_BUS_ADDRESS`/`XDG_RUNTIME_DIR` for desktop keyrings. Helper settings
 `GCM_*` and `GH_TOKEN`/`GITHUB_TOKEN` go to Git by default, preserving existing Git
 Credential Manager and GitHub CLI setups. Builds receive these only if explicitly
-selected. Ambient repository-redirection variables such as
+selected. If a recipe secret named `GH_TOKEN` or `GITHUB_TOKEN` would remove a
+parent helper credential, cook refuses with the variable name: explicitly select
+it with `COOK_PASS_ENV` to forward the parent value, or rename the recipe secret.
+A source's own `authSecret` is still sent only through its header channel.
+Ambient repository-redirection variables such as
 `GIT_DIR`/`GIT_WORK_TREE`/`GIT_CONFIG_PARAMETERS` are not forwarded to cook's Git
 subprocesses, even if selected for builds.
 
@@ -188,7 +192,8 @@ and does not make generated Docker commands safe for arbitrary URLs or refs.
 Surrounding whitespace and ASCII control characters are also rejected. Unknown
 token formats may not be recognized: never put credentials in a source URL.
 
-Host HTTP(S) sources support `authSecret`: cook resolves the named token from
+Host HTTP(S) sources support `authSecret` with **Git >= 2.31** (preflighted before
+private acquisition; older Git lacks `GIT_CONFIG_COUNT`): cook resolves the named token from
 `--env-file`, the parent environment, or the prompt, and sends Git an
 origin-scoped `http.<source origin>/.extraHeader` (`Authorization: Basic` with
 `oauth2:<token>`). This is appended to the operator's existing indexed
@@ -199,8 +204,24 @@ Runtime `.env`, recipes and locks retain main's semantics without classifying
 names by their Git use: `.env` includes resolved `authSecret` values, and resolved
 requirement values remain in the lock even if the name is also an `authSecret`.
 Runtime persistence does not forward those values to build subprocesses.
+For `authSecret` sources, cook appends `http.followRedirects=false` after forwarded
+indexed configuration. Redirects are refused, including cross-origin redirects:
+**put the final repository URL in the recipe**, rather than a redirecting URL.
+Git matches HTTP configuration against the original URL, not every subsequent
+request; relying on curl's redirect header stripping is insufficient.
+
+The origin scope uses URL normalization, while Git's URL matching can differ.
+For example, `127.1` versus `127.0.0.1`, or expanded versus compressed IPv6
+literals, may not match. This **fails closed** (no injected header); use the
+canonical final URL in the recipe. Git failures for private actions retain
+useful diagnostics with the token, its base64, and the base64 of `oauth2:<token>`
+redacted. Public host clones retain Git's stderr as before. This is not general
+redaction of arbitrary credentials emitted by external helpers.
+
 Missing tokens and unsupported transports fail with the declaring source
-location; SSH and other
+location only when the action will acquire a checkout; unchanged host checkouts
+need no token on a normal rerun. Explicit `--pin-refs` lookups still need remote
+authentication. SSH and other
 transports can use externally configured Git authentication instead.
 An unrecognized credential embedded by the user in a source URL would still be
 written to `.git/config` and the lock, so never put credentials in source URLs.

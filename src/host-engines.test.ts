@@ -448,3 +448,36 @@ test('R3-7 failed component build change marks the lock and retry rebuilds the p
   expect(existsSync(join(out, 'app', 'stale'))).toBe(false);
   expect(readFileSync(join(out, 'repo', 'built'), 'utf8').trim()).toBe('new');
 });
+
+test('R1-3: engine preflight and every materialization Git call use the environment model', () => {
+  const tools = join(dir, 'tools'); mkdirSync(tools);
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+  const record = join(dir, 'git-environments');
+  writeFileSync(join(tools, 'git'), `#!${process.execPath}
+import { appendFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+appendFileSync(${JSON.stringify(record)}, JSON.stringify({ args: process.argv.slice(2), env: process.env }) + '\\n');
+const child = spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), { env: process.env, stdio: 'inherit' });
+process.exit(child.status ?? 1);
+`, { mode: 0o755 });
+  script(bun, 'if [ "$1" = --version ]; then echo 1.4.4; else /usr/bin/env > build-env; fi');
+  const result = install(true, { ...process.env, PATH: tools + ':' + process.env.PATH,
+    COOK_TEST_UNSELECTED: 'synthetic-runtime-secret', COOK_TEST_SELECTED: 'operator-tool-setting', COOK_PASS_ENV: 'COOK_TEST_SELECTED GIT_DIR',
+    GIT_DIR: '/unrelated/repository', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'cook.marker', GIT_CONFIG_VALUE_0: 'forwarded',
+  });
+  expect(result.status).toBe(0);
+  const calls = readFileSync(record, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  for (const call of calls) {
+    expect(call.env.COOK_TEST_UNSELECTED).toBeUndefined();
+    expect(call.env.COOK_TEST_SELECTED).toBe('operator-tool-setting');
+    expect(call.env.GIT_DIR).toBeUndefined();
+    expect(call.env.GIT_CONFIG_COUNT).toBe('1');
+    expect(call.env.GIT_CONFIG_VALUE_0).toBe('forwarded');
+  }
+  expect(calls.some(call => call.args.includes('fetch'))).toBe(true);
+  expect(calls.some(call => call.args.includes('clone'))).toBe(true);
+  expect(calls.some(call => call.args.includes('update-ref'))).toBe(true);
+  const build = readFileSync(join(out, 'app/build-env'), 'utf8');
+  expect(build).not.toContain('COOK_TEST_UNSELECTED');
+  expect(build).toContain('COOK_TEST_SELECTED=operator-tool-setting');
+});

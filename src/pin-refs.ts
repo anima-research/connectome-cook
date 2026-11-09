@@ -11,7 +11,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { sourceGitEnvironment } from './process-env.js';
+import { sourceGitEnvironment, gitFailureOutput, AUTH_REDIRECT_HINT } from './process-env.js';
 import { assertCredentialFreeSourceUrl, sourceLocation } from './source-url.js';
 import { log } from './log.js';
 import type { McpSource } from './types.js';
@@ -50,7 +50,7 @@ export function resolveRemoteRef(
       });
     } catch (err) {
       // Helper output and the execFileSync message may contain credentials.
-      // Report only spawn metadata, never stderr/stdout or the original error.
+      // Keep main's public-pin diagnostic policy; redact known private tokens.
       const { code, signal, status } = err as { code?: string; signal?: string; status?: number };
       const outcome = code === 'ENOENT' ? 'git executable not found (ENOENT)'
         : code === 'ETIMEDOUT' || signal ? 'git ls-remote timed out or was terminated'
@@ -60,7 +60,8 @@ export function resolveRemoteRef(
       // copied literally. The URL has already passed credential validation.
       const command = ['git', ...args].map(arg => /^[a-z0-9_./:@=+-]+$/i.test(arg)
         ? arg : "'" + arg.replaceAll("'", "'\\''") + "'").join(' ');
-      throw new Error(`--pin-refs: ${location}: could not resolve ${url}@${ref}: remote unreachable or refused (${outcome}); no output written. run \`${command}\` to see Git's diagnostics.`);
+      const output = authSecret ? gitFailureOutput(err, (values ?? process.env)[authSecret]) : '';
+      throw new Error(`--pin-refs: ${location}: could not resolve ${url}@${ref}: remote unreachable or refused (${outcome}); no output written. run \`${command}\` to see Git's diagnostics.${output ? '\n' + output : ''}${authSecret ? '\n' + AUTH_REDIRECT_HINT : ''}`);
     }
     const sha = output.split('\n')[0]?.split('\t')[0]?.trim();
     if (sha && looksLikeSha(sha)) return sha;

@@ -862,3 +862,34 @@ test('a failed rebuild of a pinned host marks the lock incomplete', () => {
   expect(run.status).not.toBe(0);
   expect(run.stdout + run.stderr).toContain('last install failed');
 });
+
+test('R1-3: dependency preflight Git and pinned builds share the curated environments', () => {
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+  const record = join(dir, 'git-environments');
+  writeFileSync(join(shim, 'git'), `#!${process.execPath}
+import { appendFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+appendFileSync(${JSON.stringify(record)}, JSON.stringify({ args: process.argv.slice(2), env: process.env }) + '\\n');
+const child = spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), { env: process.env, stdio: 'inherit' });
+process.exit(child.status ?? 1);
+`, { mode: 0o755 });
+  writeFileSync(join(shim, 'bun'), `#!/bin/sh\n/usr/bin/env > build-env\nexec env BUN_INSTALL_CACHE_DIR='${join(dir, 'cache')}' '${realBun}' "$@" --offline\n`, { mode: 0o755 });
+  const result = install(undefined, { COOK_TEST_UNSELECTED: 'synthetic-runtime-secret',
+    COOK_TEST_SELECTED: 'operator-tool-setting', COOK_PASS_ENV: 'COOK_TEST_SELECTED GIT_DIR',
+    GIT_DIR: '/unrelated/repository', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'cook.marker', GIT_CONFIG_VALUE_0: 'forwarded' });
+  expect(result.status).toBe(0);
+  const calls = readFileSync(record, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  for (const call of calls) {
+    expect(call.env.COOK_TEST_UNSELECTED).toBeUndefined();
+    expect(call.env.COOK_TEST_SELECTED).toBe('operator-tool-setting');
+    expect(call.env.GIT_DIR).toBeUndefined();
+    expect(call.env.GIT_CONFIG_COUNT).toBe('1');
+    expect(call.env.GIT_CONFIG_VALUE_0).toBe('forwarded');
+  }
+  expect(calls.some(call => call.args.includes('fetch'))).toBe(true);
+  expect(calls.some(call => call.args.includes('checkout'))).toBe(true);
+  const build = readFileSync(join(out, 'app/build-env'), 'utf8');
+  expect(build).not.toContain('COOK_TEST_UNSELECTED');
+  expect(build).toContain('COOK_TEST_SELECTED=operator-tool-setting');
+  expect(build).not.toContain('GIT_CONFIG_COUNT');
+});

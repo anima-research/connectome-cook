@@ -23,7 +23,15 @@ const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(join(dir, 'git-argv'))}, JSON.stringify(args) + '\\n');
 appendFileSync(${JSON.stringify(join(dir, 'git-env'))}, JSON.stringify({ args, env: process.env }) + '\\n');
 const behavior = JSON.parse(readFileSync(${JSON.stringify(join(dir, 'git-behavior.json'))}, 'utf-8'));
-if (behavior.fail && args[0] === behavior.fail && process.env.GIT_CONFIG_COUNT === '1') { console.log(process.env.GIT_CONFIG_VALUE_0); console.error(process.env.GIT_CONFIG_VALUE_0); process.exit(128); }
+if (args[0] === '--version') { console.log('git version ' + (behavior.version ?? '2.53.0')); process.exit(0); }
+if (behavior.fail && args[0] === behavior.fail && (process.env.GIT_CONFIG_COUNT === '2' || behavior.publicFail)) {
+  console.log(process.env.GIT_CONFIG_VALUE_0 ?? 'public stdout diagnostic');
+  console.error('fatal: useful Git diagnostic');
+  console.error(${JSON.stringify(SECRET)});
+  console.error(${JSON.stringify(Buffer.from(SECRET).toString('base64'))});
+  console.error(process.env.GIT_CONFIG_VALUE_0 ?? 'public stderr diagnostic');
+  process.exit(128);
+}
 const sslBypass = args[0] === '-c' && args[1] === 'http.sslVerify=false';
 if (sslBypass) args.splice(0, 2);
 if (args[0] === 'ls-remote') {
@@ -52,7 +60,7 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 function run(command: string, source: Record<string, unknown> | undefined, flags: string[] = [], extension = false) {
   writeFileSync(join(dir, 'git-behavior.json'), JSON.stringify({
-    fail: env.FAKE_FAIL_GIT, missing: env.FAKE_MISSING_URL, empty: env.FAKE_EMPTY_URL, requireSsl: env.FAKE_REQUIRE_SSL,
+    fail: env.FAKE_FAIL_GIT, version: env.FAKE_GIT_VERSION, publicFail: env.FAKE_PUBLIC_FAIL, missing: env.FAKE_MISSING_URL, empty: env.FAKE_EMPTY_URL, requireSsl: env.FAKE_REQUIRE_SSL,
   }));
   const recipe = join(dir, 'recipe.json');
   writeFileSync(recipe, JSON.stringify({
@@ -126,15 +134,17 @@ for (const pin of [false, true]) {
     const header = `Authorization: Basic ${Buffer.from(`oauth2:${SECRET}`).toString('base64')}`;
     const calls = gitEnvironments();
     for (const command of ['clone', 'fetch', 'checkout', 'rev-parse', ...(pin ? ['ls-remote'] : [])]) {
-      expect(calls.some(call => call.args[0] === command && call.env.GIT_CONFIG_COUNT === '2')).toBe(true);
+      expect(calls.some(call => call.args[0] === command && call.env.GIT_CONFIG_COUNT === '3')).toBe(true);
     }
     for (const call of calls) {
       expect(call.env.GIT_CONFIG_KEY_0).toBe('credential.helper');
       expect(call.env.GIT_CONFIG_VALUE_0).toBe('/synthetic/helper');
       expect(call.env.GIT_TOKEN).toBeUndefined();
-      if (call.env.GIT_CONFIG_COUNT === '2') {
+      if (call.env.GIT_CONFIG_COUNT === '3') {
         expect(call.env.GIT_CONFIG_KEY_1).toBe('http.https://example.invalid/.extraHeader');
         expect(call.env.GIT_CONFIG_VALUE_1).toBe(header);
+        expect(call.env.GIT_CONFIG_KEY_2).toBe('http.followRedirects');
+        expect(call.env.GIT_CONFIG_VALUE_2).toBe('false');
       } else {
         expect(call.env.GIT_CONFIG_VALUE_1).toBeUndefined();
       }
@@ -152,7 +162,7 @@ for (const pin of [false, true]) {
 test('R1-1: private symbolic Docker pins use the same environment-only channel', () => {
   const result = run('build', { url: 'https://example.invalid/private.git', authSecret: 'GIT_TOKEN' }, ['--pin-refs']);
   expect(result.status).toBe(0);
-  expect(gitEnvironments().find(call => call.args[1]?.includes('private.git'))?.env.GIT_CONFIG_COUNT).toBe('1');
+  expect(gitEnvironments().find(call => call.args[1]?.includes('private.git'))?.env.GIT_CONFIG_COUNT).toBe('2');
   expect(gitCalls() + result.stdout + result.stderr + readFileSync(join(dir, 'out/connectome.lock'), 'utf-8')).not.toContain(SECRET);
 });
 
@@ -662,6 +672,9 @@ for (const failure of ['clone', 'fetch', 'checkout', 'ls-remote']) {
     const output = result.stdout + result.stderr;
     expect(output).not.toContain(SECRET);
     expect(output).not.toContain(Buffer.from(`oauth2:${SECRET}`).toString('base64'));
+    expect(output).not.toContain(Buffer.from(SECRET).toString('base64'));
+    expect(output).toContain('fatal: useful Git diagnostic');
+    expect(output).toContain('[REDACTED]');
     expect(output).toContain(failure === 'ls-remote' ? 'mcpServers.fixture.source' : 'git');
   });
 }
@@ -895,4 +908,53 @@ test('R5: selecting Git controls affects builds, not acquisition repository rout
   for (const call of gitEnvironments()) {
     for (const key of Object.keys(selected)) expect(call.env[key]).toBeUndefined();
   }
+});
+
+test('R1-2: public Git stderr remains visible', () => {
+  env.FAKE_FAIL_GIT = 'clone'; env.FAKE_PUBLIC_FAIL = '1';
+  const result = run('install', { url: 'https://example.invalid/public.git' });
+  expect(result.status).not.toBe(0);
+  expect(result.stdout + result.stderr).toContain('fatal: useful Git diagnostic');
+  expect(result.stdout + result.stderr).toContain('public stderr diagnostic');
+  expect(result.stdout + result.stderr).not.toContain('withheld');
+});
+
+test('R1-4: unchanged private checkout needs no token or Git requests', () => {
+  const source = { url: 'https://example.invalid/private.git', authSecret: 'GIT_TOKEN' };
+  expect(run('install', source).status).toBe(0);
+  const calls = gitCalls();
+  delete env.GIT_TOKEN;
+  const result = run('install', source);
+  expect(result.status).toBe(0);
+  expect(result.stdout).toContain('unchanged');
+  expect(gitCalls()).toBe(calls);
+});
+
+for (const name of ['GH_TOKEN', 'GITHUB_TOKEN']) {
+  test(`R1-5: recipe secret ${name} helper collision is explicit`, () => {
+    env[name] = SECRET;
+    const result = run('install', { url: 'https://example.invalid/private.git', authSecret: name });
+    expect(result.status).not.toBe(0);
+    expect(result.stdout + result.stderr).toContain(name);
+    expect(result.stdout + result.stderr).toContain('COOK_PASS_ENV');
+    expect(result.stdout + result.stderr).toContain('rename');
+    expect(result.stdout + result.stderr).not.toContain(SECRET);
+    expect(gitCalls()).not.toContain('clone');
+  });
+}
+
+for (const version of ['2.30.9', '1.99.0', 'not-a-version']) test(`R1-6: authSecret refuses Git ${version} before cloning`, () => {
+  env.FAKE_GIT_VERSION = version;
+  const result = run('install', { url: 'https://example.invalid/private.git', authSecret: 'GIT_TOKEN' });
+  expect(result.status).not.toBe(0);
+  expect(result.stdout + result.stderr).toContain('Git >= 2.31');
+  expect(gitCalls()).not.toContain('clone');
+  expect(existsSync(join(dir, 'out'))).toBe(false);
+});
+
+test('R1-8: build failures explain the environment migration', () => {
+  const result = run('install', { url: 'https://example.invalid/public.git', install: { run: 'exit 7', runtime: 'custom' } });
+  expect(result.status).not.toBe(0);
+  expect(result.stdout + result.stderr).toContain('build failed');
+  expect(result.stdout + result.stderr).toContain('COOK_PASS_ENV');
 });

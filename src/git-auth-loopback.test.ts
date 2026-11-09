@@ -80,9 +80,105 @@ test('R1-1: real Git sends the private header on loopback pin/clone/fetch, keeps
     }
     expect(readFileSync(join(out, '.env'), 'utf-8')).toContain(`PRIVATE_TOKEN='${token}'`);
     expect(readFileSync(join(out, 'private/.git/config'), 'utf-8')).toContain(`${origin}/private.git`);
+    const requestCount = requests.length;
+    const rerun = spawn(process.execPath, [resolve(import.meta.dir, '../bin/cook'), 'install', recipe,
+      '--out', out, '--yes', '--no-prompts', '--ch-repo', `${origin}/public.git`], {
+      env: { PATH: `${bin}:${process.env.PATH}`, HOME: home, GIT_CONFIG_NOSYSTEM: '1' }, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let rerunOutput = '';
+    rerun.stdout.on('data', chunk => { rerunOutput += chunk; });
+    rerun.stderr.on('data', chunk => { rerunOutput += chunk; });
+    expect(await new Promise<number | null>((resolve, reject) => { rerun.on('error', reject); rerun.on('close', resolve); })).toBe(0);
+    expect(rerunOutput).toContain('unchanged');
+    expect(requests.length).toBe(requestCount);
     console.log(`loopback Git: ${requests.length} requests; private pin/clone/fetch authenticated; public requests clean`);
   } finally {
     server.stop(true);
     rmSync(dir, { recursive: true, force: true });
   }
 }, 15_000);
+
+// A smart-HTTP destination is essential: Git can strip Authorization on the
+// redirected GET, then leak it on subsequent upload-pack POSTs.
+test('R1-1: cross-origin redirect fails closed; inspect EVERY destination request', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cook-redirect-'));
+  const token = 'synthetic-redirect-token';
+  const requestsA: Array<{ method: string; auth: string | null }> = [];
+  const requestsB: Array<{ method: string; path: string; auth: string | null }> = [];
+  const home = join(dir, 'home'); mkdirSync(home);
+  const env = { PATH: process.env.PATH, HOME: home, GIT_CONFIG_NOSYSTEM: '1' };
+  const git = (args: string[]) => execFileSync('git', args, { env, stdio: 'pipe' });
+  const repo = join(dir, 'repo.git');
+  const source = join(dir, 'source');
+  git(['init', '-b', 'main', source]);
+  writeFileSync(join(source, 'index.js'), 'fixture');
+  git(['-C', source, 'add', '.']);
+  git(['-C', source, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'fixture']);
+  git(['clone', '--bare', source, repo]);
+  const destination = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    const url = new URL(request.url);
+    requestsB.push({ method: request.method, path: url.pathname, auth: request.headers.get('authorization') });
+    const backend = spawn('git', ['http-backend'], {
+      env: { ...env, GIT_PROJECT_ROOT: dir, GIT_HTTP_EXPORT_ALL: '1', PATH_INFO: url.pathname,
+        REQUEST_METHOD: request.method, QUERY_STRING: url.search.slice(1),
+        CONTENT_TYPE: request.headers.get('content-type') ?? '' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const chunks: Buffer[] = [];
+    backend.stdout.on('data', chunk => chunks.push(chunk));
+    backend.stdin.end(Buffer.from(await request.arrayBuffer()));
+    await new Promise<void>((resolve, reject) => { backend.on('error', reject); backend.on('close', () => resolve()); });
+    const output = Buffer.concat(chunks);
+    const split = output.indexOf('\r\n\r\n');
+    const headers = new Headers(); let status = 200;
+    for (const line of output.subarray(0, split).toString().split('\r\n')) {
+      const colon = line.indexOf(':');
+      if (colon < 0) continue;
+      const key = line.slice(0, colon), value = line.slice(colon + 1).trim();
+      if (key.toLowerCase() === 'status') status = Number(value.split(' ')[0]);
+      else headers.append(key, value);
+    }
+    return new Response(output.subarray(split + 4), { status, headers });
+  } });
+  const origin = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+    requestsA.push({ method: request.method, auth: request.headers.get('authorization') });
+    const url = new URL(request.url);
+    return Response.redirect(`http://127.0.0.1:${destination.port}${url.pathname}${url.search}`, 302);
+  } });
+  try {
+    const bin = join(dir, 'bin'); mkdirSync(bin);
+    writeFileSync(join(bin, 'bun'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    // Prove B really serves smart HTTP, including upload-pack POSTs.
+    const control = spawn('git', ['clone', `http://127.0.0.1:${destination.port}/repo.git`, join(dir, 'control')], { env, stdio: 'ignore' });
+    expect(await new Promise<number | null>((resolve, reject) => { control.on('error', reject); control.on('close', resolve); })).toBe(0);
+    expect(requestsB.some(r => r.method === 'POST')).toBe(true);
+    requestsB.length = 0;
+    const recipe = join(dir, 'recipe.json');
+    writeFileSync(recipe, JSON.stringify({ name: 'Redirect fixture', agent: { systemPrompt: 'test' },
+      mcpServers: { fixture: { command: 'node', source: {
+        url: `http://127.0.0.1:${origin.port}/repo.git`, authSecret: 'PRIVATE_TOKEN',
+      } } } }));
+    const child = spawn(process.execPath, [resolve(import.meta.dir, '../bin/cook'), 'install', recipe,
+      '--out', join(dir, 'out'), '--yes', '--no-prompts', '--ch-repo', repo], {
+      env: { ...env, PATH: `${bin}:${env.PATH}`, PRIVATE_TOKEN: token,
+        GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.followRedirects', GIT_CONFIG_VALUE_0: 'true' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = '';
+    child.stdout.on('data', chunk => { output += chunk; });
+    child.stderr.on('data', chunk => { output += chunk; });
+    const status = await new Promise<number | null>((resolve, reject) => { child.on('error', reject); child.on('close', resolve); });
+    expect(requestsA.length).toBeGreaterThan(0);
+    expect(requestsA.every(r => r.auth === `Basic ${Buffer.from(`oauth2:${token}`).toString('base64')}`)).toBe(true);
+    // Check all methods, not just curl's initially redirected GET.
+    expect(requestsB.filter(r => r.auth !== null)).toEqual([]);
+    expect(requestsB).toEqual([]);
+    expect(status).not.toBe(0);
+    expect(output).toContain('final URL in the recipe');
+    expect(output).not.toContain(token);
+    expect(output).not.toContain(Buffer.from(`oauth2:${token}`).toString('base64'));
+  } finally {
+    origin.stop(true); destination.stop(true);
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 15000);
