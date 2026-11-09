@@ -322,7 +322,6 @@ export async function runDockerBackend(
         name: r.name,
         envName: r.envName,
         origin: r.origin,
-        ...(r.value !== undefined ? { value: r.value } : {}),
       })),
       launch: { kind: 'compose', dir: outDir },
     };

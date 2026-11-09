@@ -93,7 +93,20 @@ For code that must link against things already on the machine:
 
 Cook probes the candidates, suggests the first hit, lets you confirm or
 override, and exposes the answer as `$SPRING_HOME` — usable in recipe
-`${VAR}` references and install steps, and recorded in the lock.
+`${VAR}` references and install steps. Answers are not recorded in the lock.
+
+### Lock contents and recovery
+
+`connectome.lock` (v1) records the backend, recipe path, creation time,
+component sources/refs and available commits, materialized paths, requirement
+names/env names/origins, and launch hints (plus selected host engines and pinned
+host dependencies when used). Requirement answers stay in the backend's `.env`,
+not the lock; successful writes also strip answers from older locks. Writes use
+a synced temporary file and atomic rename. `cook install` refuses an unreadable
+or unknown-version lock before removing targets; `cook run` also refuses it.
+Inspect the lock, then either move it aside to force a fresh install (which may
+remove existing targets, including the agent workspace under `app/`), or use the
+cook that wrote it.
 
 ### Source credentials
 

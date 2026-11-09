@@ -619,7 +619,9 @@ async function materializeHost(
   try {
     existingLock = readLockfile(installDir);
   } catch (err) {
-    log.warn(`existing ${LOCKFILE_NAME} unreadable (${err instanceof Error ? err.message : String(err)}) — treating as fresh install`);
+    log.error(`refusing install: cannot read ${join(installDir, LOCKFILE_NAME)} (${err instanceof Error ? err.message : String(err)}). `
+      + 'Inspect the lock, then either move it aside to force a fresh install (which may remove existing targets), or use the cook that wrote it.');
+    return { exitCode: 2, outDir: installDir };
   }
 
   const hasRecordedPins = assertHostDependencyReinstall(installDir, existingLock?.hostDependencies, dependencyInputs, options.dropHostDependencies);
@@ -1004,7 +1006,6 @@ async function materializeHost(
         name: r.name,
         envName: r.envName,
         origin: r.origin,
-        ...(r.value !== undefined ? { value: r.value } : {}),
       })),
       launch: { kind: 'script', script: join(installDir, 'run.sh'), ...(userUnitHint !== undefined ? { userUnit: userUnitHint } : {}) },
     };
