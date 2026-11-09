@@ -11,7 +11,7 @@
  * requirement names and origins), not answers or credentials.
  */
 
-import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, fchmodSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
@@ -73,16 +73,36 @@ export function writeLockfile(dir: string, lock: Lockfile): void {
     requirements: lock.requirements.map(({ value: _value, ...metadata }) => metadata),
   };
   const path = join(dir, LOCKFILE_NAME);
+  let mode: number | undefined;
+  try {
+    mode = statSync(path).mode & 0o7777;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
   const temporary = join(dir, `.${LOCKFILE_NAME}.${randomUUID()}.tmp`);
-  const fd = openSync(temporary, 'wx', 0o600);
+  // New locks use the normal file-creation mode (subject to umask). Existing
+  // locks retain their exact mode, even when the current umask is stricter.
+  const fd = openSync(temporary, 'wx', mode === undefined ? 0o666 : 0o600);
   try {
     try {
       writeFileSync(fd, JSON.stringify(sanitized, null, 2) + '\n');
+      if (mode !== undefined) fchmodSync(fd, mode);
       fsyncSync(fd);
     } finally {
       closeSync(fd);
     }
     renameSync(temporary, path);
+    // Persist the directory entry too, where directory syncing is supported.
+    try {
+      const directoryFd = openSync(dir, 'r');
+      try {
+        fsyncSync(directoryFd);
+      } finally {
+        closeSync(directoryFd);
+      }
+    } catch (err) {
+      if (!['EINVAL', 'EISDIR', 'EPERM'].includes((err as NodeJS.ErrnoException).code ?? '')) throw err;
+    }
   } finally {
     rmSync(temporary, { force: true });
   }

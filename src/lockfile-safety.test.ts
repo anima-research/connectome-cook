@@ -114,22 +114,55 @@ function oldLock(): Lockfile {
     version: 1, backend: 'host', recipePath: recipe, createdAt: '2026-01-01T00:00:00.000Z',
     connectomeHost: { url: 'https://example.invalid/host.git', ref: 'main' },
     components: [], localExtensions: [],
-    requirements: [{ name: 'sdk', envName: 'SDK_ROOT', origin: 'env-file', value: ANSWER }],
+    requirements: [
+      { name: 'sdk', envName: 'SDK_ROOT', origin: 'env-file', value: ANSWER },
+      { name: 'token', envName: 'GIT_TOKEN', origin: 'env-file', value: TOKEN },
+    ],
     launch: { kind: 'script', script: join(dir, 'run.sh') },
   };
 }
 
-test('writer strips legacy values without mutating input; other v1 bytes are unchanged', () => {
-  const lock = oldLock();
-  writeLockfile(dir, lock);
-  const sanitized = { ...lock, requirements: [{ name: 'sdk', envName: 'SDK_ROOT', origin: 'env-file' }] };
-  expect(fs.readFileSync(join(dir, LOCKFILE_NAME), 'utf8')).toBe(JSON.stringify(sanitized, null, 2) + '\n');
-  expect(lock.requirements[0]!.value).toBe(ANSWER);
-  // Exercise the existing-lock rewrite, including the incomplete marker path.
-  fs.writeFileSync(join(dir, LOCKFILE_NAME), JSON.stringify(lock));
-  writeLockfile(dir, { ...readLockfile(dir)!, incomplete: true });
-  expect(readLockfile(dir)).toEqual({ ...sanitized, incomplete: true });
-});
+for (const backend of ['host', 'docker'] as const) {
+  test(`${backend}: writer strips all legacy values without mutating input; other v1 bytes are unchanged`, () => {
+    const lock: Lockfile = {
+      ...oldLock(), backend,
+      launch: backend === 'host'
+        ? { kind: 'script', script: join(dir, 'run.sh') }
+        : { kind: 'compose', dir },
+    };
+    writeLockfile(dir, lock);
+    const sanitized = { ...lock, requirements: [
+      { name: 'sdk', envName: 'SDK_ROOT', origin: 'env-file' },
+      { name: 'token', envName: 'GIT_TOKEN', origin: 'env-file' },
+    ] };
+    expect(fs.readFileSync(join(dir, LOCKFILE_NAME), 'utf8')).toBe(JSON.stringify(sanitized, null, 2) + '\n');
+    expect(lock.requirements[0]!.value).toBe(ANSWER);
+    expect(lock.requirements[1]!.value).toBe(TOKEN);
+    // Exercise the existing-lock rewrite, including the incomplete marker path.
+    fs.writeFileSync(join(dir, LOCKFILE_NAME), JSON.stringify(lock));
+    writeLockfile(dir, { ...readLockfile(dir)!, incomplete: true });
+    expect(readLockfile(dir)).toEqual({ ...sanitized, incomplete: true });
+  });
+}
+
+for (const existingMode of [undefined, 0o664, 0o600]) {
+  test(`atomic lock ${existingMode === undefined ? 'creation respects umask' : `replacement preserves mode ${existingMode.toString(8)}`}`, () => {
+    const path = join(dir, LOCKFILE_NAME);
+    if (existingMode !== undefined) {
+      fs.writeFileSync(path, 'old lock');
+      fs.chmodSync(path, existingMode);
+    }
+    const mask = existingMode === undefined ? 0o027 : 0o077;
+    const previousMask = process.umask(mask);
+    try {
+      writeLockfile(dir, oldLock());
+    } finally {
+      process.umask(previousMask);
+    }
+    expect(fs.statSync(path).mode & 0o7777).toBe(existingMode ?? (0o666 & ~mask));
+    expect(readLockfile(dir)?.version).toBe(1);
+  });
+}
 
 for (const failure of ['mid-write', 'fsync', 'rename'] as const) {
   test(`atomic lock ${failure} failure preserves the old bytes and cleans the temporary file`, () => {
@@ -155,13 +188,20 @@ for (const failure of ['mid-write', 'fsync', 'rename'] as const) {
   });
 }
 
-test('atomic lock syncs the complete same-directory temporary file before rename', () => {
+test('atomic lock syncs the complete temporary file before rename and the directory after', () => {
   const path = join(dir, LOCKFILE_NAME);
   fs.writeFileSync(path, 'old lock');
   const events: string[] = [];
   const originalSync = fs.fsyncSync;
   const originalRename = fs.renameSync;
   const sync = spyOn(fs, 'fsyncSync').mockImplementation(fd => {
+    if (fs.fstatSync(fd).isDirectory()) {
+      expect(events).toEqual(['sync', 'rename']);
+      expect(readLockfile(dir)?.version).toBe(1);
+      events.push('directory sync');
+      originalSync(fd);
+      return;
+    }
     expect(fs.readFileSync(path, 'utf8')).toBe('old lock');
     const temporary = fs.readdirSync(dir).find(name => name.endsWith('.tmp'))!;
     expect(JSON.parse(fs.readFileSync(join(dir, temporary), 'utf8')).version).toBe(1);
@@ -177,8 +217,39 @@ test('atomic lock syncs the complete same-directory temporary file before rename
   });
   try { writeLockfile(dir, oldLock()); }
   finally { sync.mockRestore(); rename.mockRestore(); }
-  expect(events).toEqual(['sync', 'rename']);
+  expect(events).toEqual(['sync', 'rename', 'directory sync']);
 });
+
+for (const operation of ['open', 'sync'] as const) {
+  for (const code of ['EINVAL', 'EISDIR', 'EPERM', 'EIO']) {
+    test(`directory ${operation} ${code}: only unsupported-platform errors are ignored`, () => {
+      const originalOpen = fs.openSync;
+      const originalSync = fs.fsyncSync;
+      let directoryFd: number | undefined;
+      const error = Object.assign(new Error('directory failure'), { code });
+      const open = spyOn(fs, 'openSync').mockImplementation((path, flags, mode) => {
+        if (path === dir && operation === 'open') throw error;
+        const fd = originalOpen(path, flags, mode);
+        if (path === dir) directoryFd = fd;
+        return fd;
+      });
+      const sync = spyOn(fs, 'fsyncSync').mockImplementation(fd => {
+        if (fd === directoryFd) throw error;
+        originalSync(fd);
+      });
+      try {
+        if (code === 'EIO') expect(() => writeLockfile(dir, oldLock())).toThrow('directory failure');
+        else writeLockfile(dir, oldLock());
+      } finally {
+        open.mockRestore();
+        sync.mockRestore();
+      }
+      if (directoryFd !== undefined) expect(() => fs.fstatSync(directoryFd!)).toThrow();
+      expect(readLockfile(dir)?.version).toBe(1);
+      expect(fs.readdirSync(dir).filter(name => name.endsWith('.tmp'))).toEqual([]);
+    });
+  }
+}
 
 // Captured from upstream 7152366 with the same offline fixture. Only the
 // fixture root, createdAt and legacy requirement values are normalized.
