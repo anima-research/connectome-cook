@@ -100,7 +100,7 @@ test('R1-1: real Git sends the private header on loopback pin/clone/fetch, keeps
 
 // A smart-HTTP destination is essential: Git can strip Authorization on the
 // redirected GET, then leak it on subsequent upload-pack POSTs.
-test('R1-1: cross-origin redirect fails closed; inspect EVERY destination request', async () => {
+test.each(['prefix', 'exact'] as const)('R1-1: cross-origin redirect fails closed with operator %s URL config; inspect EVERY destination request', async (scope) => {
   const dir = mkdtempSync(join(tmpdir(), 'cook-redirect-'));
   const token = 'synthetic-redirect-token';
   const requestsA: Array<{ method: string; auth: string | null }> = [];
@@ -153,10 +153,17 @@ test('R1-1: cross-origin redirect fails closed; inspect EVERY destination reques
     expect(await new Promise<number | null>((resolve, reject) => { control.on('error', reject); control.on('close', resolve); })).toBe(0);
     expect(requestsB.some(r => r.method === 'POST')).toBe(true);
     requestsB.length = 0;
+    const sourceUrl = `http://127.0.0.1:${origin.port}/repo.git`;
+    const operatorUrl = scope === 'exact' ? sourceUrl : `http://127.0.0.1:${origin.port}/`;
+    // URL-specific file config outranks an unkeyed command-scope setting.
+    // At equal URL specificity our injected command-scope setting must win.
+    writeFileSync(join(home, '.gitconfig'), `[http "${operatorUrl}"]\n\tfollowRedirects = true\n`);
+    expect(execFileSync('git', ['config', '--get-urlmatch', 'http.followRedirects', sourceUrl],
+      { env, encoding: 'utf8' }).trim()).toBe('true');
     const recipe = join(dir, 'recipe.json');
     writeFileSync(recipe, JSON.stringify({ name: 'Redirect fixture', agent: { systemPrompt: 'test' },
       mcpServers: { fixture: { command: 'node', source: {
-        url: `http://127.0.0.1:${origin.port}/repo.git`, authSecret: 'PRIVATE_TOKEN',
+        url: sourceUrl, authSecret: 'PRIVATE_TOKEN',
       } } } }));
     const child = spawn(process.execPath, [resolve(import.meta.dir, '../bin/cook'), 'install', recipe,
       '--out', join(dir, 'out'), '--yes', '--no-prompts', '--ch-repo', repo], {

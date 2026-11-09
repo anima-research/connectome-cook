@@ -143,7 +143,7 @@ for (const pin of [false, true]) {
       if (call.env.GIT_CONFIG_COUNT === '3') {
         expect(call.env.GIT_CONFIG_KEY_1).toBe('http.https://example.invalid/.extraHeader');
         expect(call.env.GIT_CONFIG_VALUE_1).toBe(header);
-        expect(call.env.GIT_CONFIG_KEY_2).toBe('http.followRedirects');
+        expect(call.env.GIT_CONFIG_KEY_2).toBe('http.https://example.invalid/private.git.followRedirects');
         expect(call.env.GIT_CONFIG_VALUE_2).toBe('false');
       } else {
         expect(call.env.GIT_CONFIG_VALUE_1).toBeUndefined();

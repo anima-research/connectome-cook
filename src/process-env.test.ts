@@ -16,14 +16,16 @@ function withEnvironment(values: NodeJS.ProcessEnv, body: () => void) {
 
 test('R1-3: real Git retains injected COUNT/KEY/VALUE after repository stripping', () => {
   withEnvironment({ GIT_DIR: '/not/a/repository', COOK_PASS_ENV: 'GIT_DIR',
-    GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.followRedirects', GIT_CONFIG_VALUE_0: 'true' }, () => {
+    GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.https://example.invalid/repo.git.followRedirects', GIT_CONFIG_VALUE_0: 'true' }, () => {
     const token = 'synthetic-config-survival-token';
     const env = sourceGitEnvironment('https://example.invalid/repo.git', 'PRIVATE_TOKEN', { PRIVATE_TOKEN: token });
     expect(env.GIT_DIR).toBeUndefined();
     expect(env.GIT_CONFIG_COUNT).toBe('3');
     const config = (key: string) => execFileSync('git', ['config', '--get', key], { env, encoding: 'utf8' }).trim();
     expect(config('http.https://example.invalid/.extraHeader')).toBe(`Authorization: Basic ${Buffer.from(`oauth2:${token}`).toString('base64')}`);
-    expect(config('http.followRedirects')).toBe('false');
+    expect(config('http.https://example.invalid/repo.git.followRedirects')).toBe('false');
+    expect(execFileSync('git', ['config', '--get-urlmatch', 'http.followRedirects', 'https://example.invalid/repo.git'],
+      { env, encoding: 'utf8' }).trim()).toBe('false');
   });
 });
 

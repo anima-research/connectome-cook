@@ -115,7 +115,10 @@ export function sourceGitEnvironment(
   env.GIT_CONFIG_COUNT = String(count + 2);
   env[`GIT_CONFIG_KEY_${count}`] = `http.${origin}/.extraHeader`;
   env[`GIT_CONFIG_VALUE_${count}`] = `Authorization: Basic ${Buffer.from(`oauth2:${token}`).toString('base64')}`;
-  env[`GIT_CONFIG_KEY_${count + 1}`] = 'http.followRedirects';
+  // Git chooses URL specificity before config scope: an unkeyed setting
+  // loses to operator http.<url> config, even when injected here. Match the
+  // exact source URL, then command scope/order wins ties against user config.
+  env[`GIT_CONFIG_KEY_${count + 1}`] = `http.${url}.followRedirects`;
   env[`GIT_CONFIG_VALUE_${count + 1}`] = 'false';
   return env;
 }
