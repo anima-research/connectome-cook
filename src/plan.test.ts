@@ -2,7 +2,7 @@ import { afterAll, afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { inspectPlan, PlanInspectionError, resolvePlan, validatePlanWalks } from './plan.js';
+import { inspectPlan, PlanInspectionError, validatePlanWalks } from './plan.js';
 import type { WalkResult } from './types.js';
 
 const walk = (path: string): WalkResult => ({ path, recipe: {
@@ -104,25 +104,4 @@ describe('quiet plan inspection', () => {
     }
     expect(stdout).not.toHaveBeenCalled(); expect(stderr).not.toHaveBeenCalled();
   });
-});
-
-
-test('resolvePlan passes the preloaded root through and still announces walking once', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'cook-plan-preloaded-'));
-  const out = spyOn(process.stdout, 'write').mockReturnValue(true);
-  const err = spyOn(process.stderr, 'write').mockReturnValue(true);
-  try {
-    const path = join(dir, 'nonexistent.json');
-    const recipe = { name: 'preloaded', agent: { provider: 'openai-codex', systemPrompt: 'test' } };
-    const result = await resolvePlan(path, { strict: true, noPrompts: true }, recipe);
-    expect(result.ok).toBe(true);
-    if (result.ok) expect(result.plan.parentWalk.recipe).toBe(recipe);
-    expect(out.mock.calls.map(c => c[0])).toEqual([
-      `-> walking recipe ${path}\n`, 'OK loaded 1 recipe\n',
-      '-> detecting MCP sources (strict)\n', 'OK detected 0 sources, 0 env vars\n',
-    ]);
-  } finally {
-    out.mockRestore(); err.mockRestore();
-    rmSync(dir, { recursive: true, force: true });
-  }
 });

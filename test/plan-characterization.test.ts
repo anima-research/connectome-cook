@@ -6,7 +6,7 @@ import { resolve } from 'node:path';
 // Snapshots were recorded on main 916cad09, before extracting inspection.
 const root = resolve(import.meta.dir, '..');
 const fixtures = ['triumvirate', 'triumvirate-mid'].flatMap(dir =>
-  readdirSync(`${root}/examples/${dir}/recipes`).filter(f => f.endsWith('.json'))
+  readdirSync(`${root}/examples/${dir}/recipes`).filter(f => f.endsWith('.json')).sort()
     .map(f => `examples/${dir}/recipes/${f}`),
 );
 const scratch = '.cache/plan-characterization';

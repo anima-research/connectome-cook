@@ -18,7 +18,6 @@
  */
 
 import { resolve } from 'node:path';
-import type { Recipe } from './vendor/recipe.js';
 import { log } from './log.js';
 import type {
   EnvVar,
@@ -99,18 +98,15 @@ export type PlanResult =
  * Resolve a recipe into an InstallPlan. Interactive unless opts.noPrompts.
  * Returns a failure exit code (with the error already logged) instead of
  * throwing — the CLI maps it straight to process exit.
- * A supplied parentRecipe must have been read from recipePath. The walking
- * progress line is still emitted here (main has no announcing pre-read).
  */
 export async function resolvePlan(
   recipePath: string,
   opts: PlanOptions,
-  parentRecipe?: Recipe,
 ): Promise<PlanResult> {
   let walks: WalkResult[];
   try {
     log.step(`walking recipe ${log.dim(recipePath)}`);
-    walks = await walkRecipe(recipePath, parentRecipe);
+    walks = await walkRecipe(recipePath);
     log.success(`loaded ${walks.length} recipe${walks.length === 1 ? '' : 's'}`);
   } catch (err) {
     log.error(`failed to load recipe: ${err instanceof Error ? err.message : String(err)}`);
