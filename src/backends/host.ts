@@ -305,12 +305,12 @@ async function executeClone(
   const sourceDir = preparedCheckout ? undefined : context.sourceDir;
   const env = sourceGitEnvironment(action.url, action.authSecret, values, action.key, buildEnv, context.excluded);
   const git = async (args: string[], cwd?: string): Promise<string> => {
-    // Fetch runs inside the new checkout: include its local Git configuration.
-    if (action.authSecret && args[0] === 'fetch') {
+    // Both network commands run in the target: include its local Git config.
+    if (action.authSecret && (args[0] === 'fetch' || args[0] === 'ls-remote')) {
       assertUnrewrittenSourceUrl(action.url, env, action.key, values[action.authSecret], cwd, 'origin');
       // No submodule network operations may inherit this source's credential,
       // even when operator config enables recursive fetches.
-      args = ['fetch', '--no-recurse-submodules', ...args.slice(1)];
+      if (args[0] === 'fetch') args = ['fetch', '--no-recurse-submodules', ...args.slice(1)];
       if (action.sslBypass) args = ['-c', 'http.sslVerify=false', ...args];
     }
     try {
@@ -345,7 +345,19 @@ async function executeClone(
       // Initialize the real target and origin before ANY authenticated network.
       await git(['init', action.target]);
       await git(['remote', 'add', 'origin', action.url], action.target);
-      await git(['fetch', 'origin'], action.target);
+      const head = await git(['ls-remote', '--symref', 'origin', 'HEAD'], action.target);
+      // remote add's refspec fetches all branches, including remote HEAD.
+      // Explicit --tags also brings in tags unreachable from any branch, as
+      // clone does, so subsequent branch/tag/SHA checkouts see the same objects.
+      await git(['fetch', '--tags', 'origin'], action.target);
+      const branch = /^ref: refs\/heads\/(.+)\tHEAD$/m.exec(head)?.[1];
+      if (branch) {
+        await git(['symbolic-ref', 'refs/remotes/origin/HEAD', `refs/remotes/origin/${branch}`], action.target);
+        await git(['checkout', '-b', branch, '--track', `refs/remotes/origin/${branch}`], action.target);
+      } else {
+        const sha = /^([0-9a-f]{40}|[0-9a-f]{64})\tHEAD$/mi.exec(head)?.[1];
+        if (sha) await git(['checkout', '--detach', sha], action.target);
+      }
     } else {
       // Public sources retain the existing clone path (including URL aliases).
       await git([...sslArgs, 'clone', action.url, action.target]);
@@ -364,7 +376,7 @@ async function executeClone(
       } else {
         await git(['checkout', action.commit], action.target);
       }
-    } else if (action.ref && (action.ref !== 'main' || action.authSecret)) {
+    } else if (action.ref && action.ref !== 'main') {
       if (action.ref.startsWith('refs/')) {
         await git(['fetch', 'origin', `${action.ref}:cook-install-checkout`], action.target);
         await git(['checkout', 'cook-install-checkout'], action.target);

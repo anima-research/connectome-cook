@@ -24,6 +24,31 @@ function gitCalls(path: string): GitCall[] {
   return readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line));
 }
 
+async function gitHttpResponse(request: Request, dir: string, env: NodeJS.ProcessEnv): Promise<Response> {
+  const url = new URL(request.url);
+  const backend = spawn('git', ['http-backend'], {
+    env: { ...env, GIT_PROJECT_ROOT: dir, GIT_HTTP_EXPORT_ALL: '1', PATH_INFO: url.pathname,
+      REQUEST_METHOD: request.method, QUERY_STRING: url.search.slice(1),
+      CONTENT_TYPE: request.headers.get('content-type') ?? '' },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const chunks: Buffer[] = [];
+  backend.stdout.on('data', chunk => chunks.push(chunk));
+  backend.stdin.end(Buffer.from(await request.arrayBuffer()));
+  await new Promise<void>((resolve, reject) => { backend.on('error', reject); backend.on('close', () => resolve()); });
+  const output = Buffer.concat(chunks);
+  const split = output.indexOf('\r\n\r\n');
+  const headers = new Headers(); let status = 200;
+  for (const line of output.subarray(0, split).toString().split('\r\n')) {
+    const colon = line.indexOf(':');
+    if (colon < 0) continue;
+    const key = line.slice(0, colon), value = line.slice(colon + 1).trim();
+    if (key.toLowerCase() === 'status') status = Number(value.split(' ')[0]);
+    else headers.append(key, value);
+  }
+  return new Response(output.subarray(split + 4), { status, headers });
+}
+
 test.each(['none', 'identity', 'pushInsteadOf'] as const)('R1-1: real Git authenticates pin/init/fetch with %s fetch rewrite; public aliases still work', async (rewrite) => {
   const dir = mkdtempSync(join(tmpdir(), 'cook-git-http-'));
   const token = 'synthetic-loopback-token';
@@ -159,29 +184,8 @@ test.each(['prefix', 'exact', 'include', 'insteadOf', 'insteadOf-prefix', 'inste
   git(['-C', source, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'fixture']);
   git(['clone', '--bare', source, repo]);
   const destination = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
-    const url = new URL(request.url);
-    requestsB.push({ method: request.method, path: url.pathname, auth: request.headers.get('authorization') });
-    const backend = spawn('git', ['http-backend'], {
-      env: { ...env, GIT_PROJECT_ROOT: dir, GIT_HTTP_EXPORT_ALL: '1', PATH_INFO: url.pathname,
-        REQUEST_METHOD: request.method, QUERY_STRING: url.search.slice(1),
-        CONTENT_TYPE: request.headers.get('content-type') ?? '' },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const chunks: Buffer[] = [];
-    backend.stdout.on('data', chunk => chunks.push(chunk));
-    backend.stdin.end(Buffer.from(await request.arrayBuffer()));
-    await new Promise<void>((resolve, reject) => { backend.on('error', reject); backend.on('close', () => resolve()); });
-    const output = Buffer.concat(chunks);
-    const split = output.indexOf('\r\n\r\n');
-    const headers = new Headers(); let status = 200;
-    for (const line of output.subarray(0, split).toString().split('\r\n')) {
-      const colon = line.indexOf(':');
-      if (colon < 0) continue;
-      const key = line.slice(0, colon), value = line.slice(colon + 1).trim();
-      if (key.toLowerCase() === 'status') status = Number(value.split(' ')[0]);
-      else headers.append(key, value);
-    }
-    return new Response(output.subarray(split + 4), { status, headers });
+    requestsB.push({ method: request.method, path: new URL(request.url).pathname, auth: request.headers.get('authorization') });
+    return gitHttpResponse(request, dir, env);
   } });
   const origin = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
     const url = new URL(request.url);
@@ -296,3 +300,101 @@ test.each(['prefix', 'exact', 'include', 'insteadOf', 'insteadOf-prefix', 'inste
     rmSync(dir, { recursive: true, force: true });
   }
 }, 15000);
+
+test.each(['default-master', 'default-main', 'branch', 'tag', 'lightweight-tag', 'sha'] as const)(
+  'authenticated checkout matches a real clone: %s', async (scenario) => {
+    const dir = mkdtempSync(join(tmpdir(), 'cook-clone-equivalence-'));
+    const home = join(dir, 'home'); mkdirSync(home);
+    const env = {
+      PATH: process.env.PATH, HOME: home, GIT_CONFIG_NOSYSTEM: '1',
+      GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@example.invalid',
+      GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 'test@example.invalid',
+    };
+    const git = (args: string[]) => execFileSync('git', args, { env, encoding: 'utf8', stdio: 'pipe' }).trim();
+    const branch = scenario === 'default-main' ? 'main' : 'master';
+    const source = join(dir, 'source');
+    git(['init', '-b', branch, source]);
+    writeFileSync(join(source, 'index.js'), 'first');
+    git(['-C', source, 'add', '.']);
+    git(['-C', source, 'commit', '-m', 'first']);
+    const sha = git(['-C', source, 'rev-parse', 'HEAD']);
+    writeFileSync(join(source, 'index.js'), 'default tip');
+    git(['-C', source, 'commit', '-am', 'default tip']);
+    git(['-C', source, 'checkout', '-b', 'feature']);
+    writeFileSync(join(source, 'index.js'), 'feature');
+    git(['-C', source, 'commit', '-am', 'feature']);
+    git(['-C', source, 'checkout', '--orphan', 'tag-only']);
+    writeFileSync(join(source, 'index.js'), 'unreachable from every branch');
+    git(['-C', source, 'commit', '-am', 'tag-only']);
+    git(['-C', source, 'tag', '-a', 'release', '-m', 'unreachable annotated tag']);
+    git(['-C', source, 'tag', 'lightweight']);
+    git(['-C', source, 'checkout', branch]);
+    git(['-C', source, 'branch', '-D', 'tag-only']);
+    git(['clone', '--bare', source, join(dir, 'private.git')]);
+    expect(git(['-C', source, 'branch', '--contains', 'release'])).toBe('');
+    const token = 'synthetic-clone-equivalence-token';
+    const header = `Basic ${Buffer.from(`oauth2:${token}`).toString('base64')}`;
+    const requests: Array<string | null> = [];
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+      requests.push(request.headers.get('authorization'));
+      if (request.headers.get('authorization') !== header) return new Response('', { status: 401 });
+      return gitHttpResponse(request, dir, env);
+    } });
+    const run = async (command: string, args: string[], childEnv: NodeJS.ProcessEnv) => {
+      const child = spawn(command, args, { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+      let output = '';
+      child.stdout.on('data', chunk => { output += chunk; });
+      child.stderr.on('data', chunk => { output += chunk; });
+      const status = await new Promise<number | null>((resolve, reject) => { child.on('error', reject); child.on('close', resolve); });
+      expect(output).not.toContain(token);
+      expect(output).not.toContain(header);
+      expect({ status, output: status === 0 ? '' : output }).toEqual({ status: 0, output: '' });
+    };
+    try {
+      const url = `http://127.0.0.1:${server.port}/private.git`;
+      const control = join(dir, 'control');
+      await run('git', ['clone', url, control], { ...env,
+        GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `http.${url}.extraHeader`, GIT_CONFIG_VALUE_0: `Authorization: ${header}` });
+      const ref = scenario === 'branch' ? 'feature' : scenario === 'tag' ? 'release'
+        : scenario === 'lightweight-tag' ? 'lightweight' : scenario === 'sha' ? sha : undefined;
+      // The public path clones first, then checks out a requested non-main ref.
+      if (ref) git(['-C', control, 'checkout', ref]);
+      const recipe = join(dir, 'recipe.json');
+      writeFileSync(recipe, JSON.stringify({ name: 'Clone equivalence', agent: { systemPrompt: 'test' },
+        mcpServers: { fixture: { command: 'node', source: { url, ...(ref ? { ref } : {}), authSecret: 'PRIVATE_TOKEN' } } } }));
+      const bin = join(dir, 'bin'); mkdirSync(bin);
+      writeFileSync(join(bin, 'bun'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      const callsFile = traceGit(bin, dir);
+      const out = join(dir, 'out');
+      await run(process.execPath, [resolve(import.meta.dir, '../bin/cook'), 'install', recipe,
+        '--out', out, '--yes', '--no-prompts', '--ch-repo', source], {
+        ...env, PATH: `${bin}:${env.PATH}`, PRIVATE_TOKEN: token,
+      });
+      const target = join(out, 'private');
+      const snapshot = (repo: string) => ({
+        commit: git(['-C', repo, 'rev-parse', 'HEAD']),
+        head: readFileSync(join(repo, '.git/HEAD'), 'utf8'),
+        remoteHead: git(['-C', repo, 'symbolic-ref', 'refs/remotes/origin/HEAD']),
+        refs: git(['-C', repo, 'show-ref']),
+        config: git(['-C', repo, 'config', '--get-regexp', '^(remote\\.origin\\.|branch\\.)']).split('\n').sort(),
+        contents: readFileSync(join(repo, 'index.js'), 'utf8'),
+      });
+      expect(snapshot(target)).toEqual(snapshot(control));
+      const calls = gitCalls(callsFile);
+      const network = calls.map((call, index) => ({ ...call, index })).filter(call => call.cwd === target
+        && (call.args[0] === 'fetch' || (call.args[0] === 'ls-remote' && call.args[1] !== '--get-url')));
+      expect(network.map(call => call.args[0])).toEqual(['ls-remote', 'fetch']);
+      expect(network[0]!.args).toEqual(['ls-remote', '--symref', 'origin', 'HEAD']);
+      expect(network[1]!.args).toContain('--tags');
+      for (const call of network) {
+        expect(calls[call.index - 2]).toEqual({ cwd: target, args: ['remote', 'get-url', 'origin'] });
+        expect(calls[call.index - 1]).toEqual({ cwd: target, args: ['ls-remote', '--get-url', 'origin'] });
+      }
+      expect(requests.length).toBeGreaterThan(0);
+      expect(requests.every(auth => auth === header)).toBe(true);
+    } finally {
+      server.stop(true);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15000,
+);

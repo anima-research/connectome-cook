@@ -151,12 +151,6 @@ export function assertUnrewrittenSourceUrl(
     const display = gitFailureOutput({ stdout: safeUrl }, token);
     throw new Error(`${location}: E_AUTH_SOURCE_URL_REWRITTEN: the source URL is rewritten by Git configuration to ${display}. Credentials are only sent to the exact URL in the recipe; put the real URL in the recipe or remove the rewrite.`);
   }
-  // Defense in depth: deny redirects for the effective URL as well as all
-  // sourceGitEnvironment's original keys. Equality is mandatory above, so its
-  // exact-URL key already covers this URL; explicitly retain the effective key.
-  const last = Number(env.GIT_CONFIG_COUNT) - 1;
-  env[`GIT_CONFIG_KEY_${last}`] = `http.${effective}.followRedirects`;
-  env[`GIT_CONFIG_VALUE_${last}`] = 'false';
 }
 
 /** GIT_CONFIG_COUNT is available starting with Git 2.31. Do not try auth on older Git. */

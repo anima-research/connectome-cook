@@ -42,7 +42,8 @@ if (args[0] === 'ls-remote') {
   if (behavior.requireSsl && args[1] === behavior.requireSsl && !sslBypass) process.exit(1);
   if (args[1] === behavior.missing) { console.error('old diagnostic 1\\nold diagnostic 2\\nfatal: TLS handshake failed\\ncheck the custom CA\\nremote unavailable'); process.exit(1); }
   if (args[1] === behavior.empty) process.exit(0);
-  console.log('${SHA}\\t' + args[2]);
+  if (args[1] === '--symref') console.log('ref: refs/heads/main\\tHEAD\\n${SHA}\\tHEAD');
+  else console.log('${SHA}\\t' + args[2]);
 } else if (args[0] === 'clone') {
   mkdirSync(join(args[2], '.git'), { recursive: true });
   writeFileSync(join(args[2], '.git/config'), '[remote "origin"]\\nurl = ' + args[1]);
