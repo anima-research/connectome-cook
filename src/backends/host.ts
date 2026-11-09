@@ -33,7 +33,7 @@
  */
 
 import { execFileSync, execSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
 import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
@@ -58,9 +58,18 @@ import {
   type Lockfile,
   type LockedComponent,
 } from '../lockfile.js';
+import { renderUserUnit, validateUserUnit } from '../host-unit.js';
+import { assertHostEnginePath } from '../host-engine-path.js';
+import type { HostEngines, HostEnginePreflight } from '../host-engines.js';
 import type { BuildResult } from './docker.js';
 
 export interface HostBackendOptions {
+  /** Export a static user unit under the installation; never install/start it. */
+  userUnit?: string;
+  /** Both absolute paths opt into fail-closed host engine validation. */
+  bunPath?: string;
+  /** Absolute Node path, required together with bunPath. */
+  nodePath?: string;
   /** Install root. Default: ~/.connectome/installs/<slug>. */
   installDir: string;
   /** Non-interactive mode (no prompts at all). */
@@ -198,6 +207,13 @@ export function planHostActions(plan: InstallPlan, options: HostBackendOptions):
   return { clones, copies, skipped, localExtensionPaths };
 }
 
+/** Bind the host install command by role, independently of planner ordering. */
+export function bindHostEngine(actions: HostActions, bunPath: string): void {
+  const host = actions.clones.find(action => action.role === 'connectome-host');
+  if (!host) throw new Error('E_HOST_ENGINE_PLAN: connectome-host clone is missing');
+  host.buildCommand = shellQuote(bunPath) + ' install';
+}
+
 /** Render the confirm-gate preview. Pure (string). */
 export function renderActionPreview(actions: HostActions, options: HostBackendOptions): string {
   const lines: string[] = [];
@@ -272,15 +288,24 @@ function cloneUrlFor(action: CloneAction, values: Record<string, string>): strin
 
 /** Execute one clone+build action. Throws on failure; the caller removes
  *  the target on failure so no half-built checkout survives. */
-function executeClone(action: CloneAction, values: Record<string, string>): { commit?: string } {
+function executeClone(action: CloneAction, values: Record<string, string>, buildEnv: NodeJS.ProcessEnv, sourceDir?: string): { commit?: string } {
   rmSync(action.target, { recursive: true, force: true });
   mkdirSync(resolve(action.target, '..'), { recursive: true });
 
   const sslArgs = action.sslBypass ? ['-c', 'http.sslVerify=false'] : [];
-  log.step(`cloning ${log.dim(action.url)}${action.ref !== 'main' ? `@${action.ref}` : ''} → ${log.dim(action.target)}`);
-  execFileSync('git', [...sslArgs, 'clone', cloneUrlFor(action, values), action.target], {
-    stdio: ['ignore', 'inherit', 'inherit'],
-  });
+  log.step(`${sourceDir ? 'materializing inspected host from local scratch for' : 'cloning'} ${log.dim(action.url)}${action.ref !== 'main' ? `@${action.ref}` : ''} → ${log.dim(action.target)}`);
+  if (sourceDir) {
+    const localGit = (args: string[], step: string) => {
+      try { execFileSync('git', args, { stdio: ['ignore', 'pipe', 'pipe'] }); }
+      catch { throw new Error(`E_HOST_ENGINE_CLONE: git ${step} failed`); }
+    };
+    localGit(['clone', '--no-hardlinks', '--branch', 'cook-selected', '--', sourceDir, action.target], 'clone inspected source');
+    localGit(['-C', action.target, 'remote', 'set-url', 'origin', action.url], 'set-url origin');
+  } else {
+    execFileSync('git', [...sslArgs, 'clone', cloneUrlFor(action, values), action.target], {
+      stdio: ['ignore', 'inherit', 'inherit'],
+    });
+  }
   if (action.authSecret) {
     // Scrub the token from .git/config — the credentialed URL must not
     // persist on disk (backups, shared machines, later `git fetch`).
@@ -293,14 +318,19 @@ function executeClone(action: CloneAction, values: Record<string, string>): { co
     // time, regardless of where the branch tip has moved since. A refspec
     // pin (refs/merge-requests/*, refs/pull/*) isn't fetched by the plain
     // clone — fetch the ref first so the SHA exists in the object store.
-    if (action.ref.startsWith('refs/')) {
+    if (!sourceDir && action.ref.startsWith('refs/')) {
       execFileSync('git', ['fetch', 'origin', action.ref], {
         cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
       });
     }
-    execFileSync('git', ['checkout', action.commit], {
-      cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
-    });
+    try {
+      execFileSync('git', ['checkout', action.commit], {
+        cwd: action.target, stdio: sourceDir ? ['ignore', 'pipe', 'pipe'] : ['ignore', 'inherit', 'inherit'],
+      });
+    } catch (err) {
+      if (sourceDir) throw new Error('E_HOST_ENGINE_CHECKOUT: git checkout inspected commit failed');
+      throw err;
+    }
   } else if (action.ref && action.ref !== 'main') {
     if (action.ref.startsWith('refs/')) {
       execFileSync('git', ['fetch', 'origin', `${action.ref}:cook-install-checkout`], {
@@ -315,6 +345,13 @@ function executeClone(action: CloneAction, values: Record<string, string>): { co
       });
     }
   }
+  if (sourceDir) {
+    try {
+      execFileSync('git', ['branch', '-D', 'cook-selected'], { cwd: action.target, stdio: 'pipe' });
+      execFileSync('git', ['update-ref', '-d', 'refs/remotes/origin/cook-selected'], { cwd: action.target, stdio: 'pipe' });
+    } catch { throw new Error('E_HOST_ENGINE_CLONE: removing synthetic refs failed'); }
+  }
+
   let commit: string | undefined;
   try {
     commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: action.target })
@@ -328,7 +365,7 @@ function executeClone(action: CloneAction, values: Record<string, string>): { co
     execSync(action.buildCommand, {
       cwd: action.target,
       stdio: ['ignore', 'inherit', 'inherit'],
-      env: process.env,
+      env: buildEnv,
     });
   }
   return { ...(commit !== undefined ? { commit } : {}) };
@@ -395,7 +432,7 @@ export interface LauncherEnvsubst {
 
 export function renderLauncher(
   parentRecipeBasename: string,
-  opts: { hasSidecars: boolean; envsubstFiles: LauncherEnvsubst[] },
+  opts: { hasSidecars: boolean; envsubstFiles: LauncherEnvsubst[]; engines?: HostEngines },
 ): string {
   const lines = [
     '#!/usr/bin/env bash',
@@ -406,6 +443,11 @@ export function renderLauncher(
     '  set -a; . ./.env; set +a',
     'fi',
   ];
+  if (opts.engines) {
+    // Match selected-engine builds without importing unrelated engine siblings.
+    // PWD is the install root here; .env has already been sourced.
+    lines.push('export PATH="$PWD/.cook-engines/bin${PATH:+:$PATH}"');
+  }
   if (opts.hasSidecars) {
     lines.push(
       '',
@@ -440,7 +482,7 @@ export function renderLauncher(
     'export DATA_DIR="${DATA_DIR:-$PWD/data}"',
     'mkdir -p "$DATA_DIR"',
     'cd app',
-    `exec bun src/index.ts "../recipes/${parentRecipeBasename}" "$@"`,
+    `exec ${opts.engines ? shellQuote(opts.engines.bun.path) : "bun"} src/index.ts "../recipes/${parentRecipeBasename}" "$@"`,
     '',
   );
   return lines.join('\n');
@@ -451,12 +493,54 @@ export async function runHostBackend(
   plan: InstallPlan,
   options: HostBackendOptions,
 ): Promise<BuildResult> {
-  const installDir = options.installDir;
   // Preflight every source before previewing URLs or making any changes.
   assertCredentialFreeSourceUrl(options.chRepoUrl, '--ch-repo');
   for (const source of plan.sources) {
     assertCredentialFreeSourceUrl(source.url, `${sourceLocation(source)}.url`);
   }
+  if (options.userUnit !== undefined) {
+    if (!options.bunPath || !options.nodePath) throw new Error('E_HOST_UNIT: --user-unit requires both --bun-path and --node-path');
+    validateUserUnit(options.userUnit);
+    renderUserUnit(options.installDir, options.userUnit);
+  }
+  if (options.bunPath !== undefined || options.nodePath !== undefined) {
+    if (!options.bunPath || !options.nodePath) throw new Error('E_HOST_ENGINE_PATH: both --bun-path and --node-path are required');
+    assertHostEnginePath(resolve(options.installDir));
+    const { preflightHostEngines } = await import('../host-engines.js').catch(() => {
+      throw new Error('E_HOST_ENGINE_DEPENDENCY: cannot load engine preflight dependencies; run bun install');
+    });
+    let removeScratch = () => {};
+    const signals = ['SIGINT', 'SIGTERM'] as const;
+    const cleanup = () => {
+      removeScratch();
+      signals.forEach((signal, i) => process.off(signal, handlers[i]!));
+    };
+    const handlers = signals.map(signal => () => { cleanup(); process.kill(process.pid, signal); });
+    signals.forEach((signal, i) => process.on(signal, handlers[i]!));
+    try {
+      const checked = preflightHostEngines(options.chRepoUrl, options.chCommit ?? options.chRef, options.bunPath, options.nodePath, cleanup => { removeScratch = cleanup; });
+      options = { ...options, chRepoUrl: checked.sourceUrl, chCommit: checked.commit };
+      return await materializeHost(plan, options, checked);
+    } finally {
+      // Sync git/build subprocesses defer JS signal delivery. Drain pending
+      // signals before unregistering handlers (and before CLI process.exit).
+      await new Promise<void>(resolve => setImmediate(resolve));
+      cleanup();
+    }
+  }
+  return materializeHost(plan, options);
+}
+
+/** Materialization starts only after engine inspection has succeeded. */
+async function materializeHost(
+  plan: InstallPlan,
+  options: HostBackendOptions,
+  checked?: HostEnginePreflight,
+): Promise<BuildResult> {
+  const installDir = options.installDir;
+  const engines = checked?.engines;
+  const userUnit = options.userUnit !== undefined ? renderUserUnit(installDir, options.userUnit) : undefined;
+  const buildEnv = { ...process.env };
   const parent = plan.parentWalk.recipe;
   const hasSidecars = (parent.services ?? []).length > 0;
 
@@ -474,12 +558,32 @@ export async function runHostBackend(
   }
 
   const actions = planHostActions(plan, options);
+  if (engines) bindHostEngine(actions, engines.bun.path);
   let existingLock: Lockfile | null = null;
   try {
     existingLock = readLockfile(installDir);
   } catch (err) {
     log.warn(`existing ${LOCKFILE_NAME} unreadable (${err instanceof Error ? err.message : String(err)}) — treating as fresh install`);
   }
+
+  // Preserve the operator hint separately from clone reuse invalidation.
+  const previousUserUnit = existingLock?.launch.kind === 'script' ? existingLock.launch.userUnit : undefined;
+  if (previousUserUnit && (options.userUnit === undefined || !engines)) {
+    log.warn('previously exported user unit may still be installed and launches this run.sh; '
+      + (engines
+        ? 'no --user-unit supplied: export is not refreshed; review installed copies'
+        : 'selected engines are being removed: installed copies may fail or use unvalidated PATH engines; review or disable them'));
+  }
+  const userUnitHint = userUnit !== undefined ? join(installDir, options.userUnit!)
+    : engines ? previousUserUnit : undefined;
+
+  const engineBindingChanged = JSON.stringify(existingLock?.engines) !== JSON.stringify(engines);
+  // Retire the disk lock before any destructive work if ANY clone cannot be
+  // reused. Otherwise an interrupted ref/build/engine change could leave an
+  // old lock authorizing a newly built checkout on the next run.
+  const invalidateLock = !existingLock || engineBindingChanged
+    || actions.clones.some(action => !isSatisfiedByLock(action, existingLock));
+  if (engineBindingChanged) existingLock = null;
 
   // ---- Confirm gate: commands run on the operator's machine. ----
   process.stdout.write(renderActionPreview(actions, options) + '\n\n');
@@ -501,8 +605,21 @@ export async function runHostBackend(
     }
   }
 
+  if (invalidateLock) rmSync(join(installDir, LOCKFILE_NAME), { force: true });
+
   mkdirSync(installDir, { recursive: true });
   mkdirSync(join(installDir, 'recipes'), { recursive: true });
+  const engineRoot = join(installDir, '.cook-engines');
+  // Also remove links left by a failed selected-engine install with no lock.
+  rmSync(engineRoot, { recursive: true, force: true });
+  if (engines) {
+    const binDir = join(engineRoot, 'bin');
+    mkdirSync(binDir, { recursive: true, mode: 0o700 });
+    symlinkSync(engines.bun.path, join(binDir, 'bun'));
+    symlinkSync(engines.node.path, join(binDir, 'node'));
+    const { hostBuildPath } = await import('../host-engines.js');
+    buildEnv.PATH = hostBuildPath(binDir, buildEnv.PATH);
+  }
 
   // ---- Clone + build components (idempotent against the lock). ----
   const lockedComponents: LockedComponent[] = [];
@@ -516,7 +633,7 @@ export async function runHostBackend(
         : existingLock!.components.find((c) => c.key === action.key)?.commit;
     } else {
       try {
-        commit = executeClone(action, plan.values).commit;
+        commit = executeClone(action, plan.values, buildEnv, action.role === 'connectome-host' ? checked?.sourceDir : undefined).commit;
       } catch (err) {
         log.error(
           `install of ${action.key} failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -604,6 +721,10 @@ export async function runHostBackend(
   try {
     for (const walk of plan.walks) {
       const configuration = lowerToConfiguration(walk.recipe, overlays.get(walk.path), walk.path);
+      if (engines) for (const server of Object.values(configuration.mcpServers ?? {})) {
+        if (server.command === 'node') server.command = engines.node.path;
+        if (server.command === 'bun') server.command = engines.bun.path;
+      }
       writeFileSync(
         join(installDir, 'recipes', recipeFilename(walk.path)),
         JSON.stringify(configuration, null, 2) + '\n',
@@ -706,13 +827,21 @@ export async function runHostBackend(
     }
     writeFileSync(
       join(installDir, 'run.sh'),
-      renderLauncher(parentRecipeBasename, { hasSidecars, envsubstFiles }),
+      renderLauncher(parentRecipeBasename, { hasSidecars, envsubstFiles, engines }),
       { mode: 0o755 },
     );
+
+    if (userUnit !== undefined) {
+      const unitPath = join(installDir, options.userUnit!);
+      writeFileSync(unitPath, userUnit, { mode: 0o600 });
+      // writeFileSync's mode applies only to new files, not reconciled exports.
+      chmodSync(unitPath, 0o600);
+    }
 
     const lock: Lockfile = {
       version: 1,
       backend: 'host',
+      ...(engines ? { engines } : {}),
       recipePath: plan.recipePath,
       createdAt: new Date().toISOString(),
       connectomeHost: {
@@ -733,7 +862,7 @@ export async function runHostBackend(
         origin: r.origin,
         ...(r.value !== undefined ? { value: r.value } : {}),
       })),
-      launch: { kind: 'script', script: join(installDir, 'run.sh') },
+      launch: { kind: 'script', script: join(installDir, 'run.sh'), ...(userUnitHint !== undefined ? { userUnit: userUnitHint } : {}) },
     };
     writeLockfile(installDir, lock);
   } catch (err) {
