@@ -41,6 +41,8 @@ export interface LockedRequirement {
 
 export interface Lockfile {
   version: 1;
+  /** Hash-pinned local inputs and explicit pre-install package.json edits. */
+  hostDependencies?: import('./host-dependency.js').LockedHostDependency[];
   /** A confirmed reinstall started but has not completed successfully. */
   incomplete?: true;
   /** Operator-selected engines, validated against the acquired host. */
