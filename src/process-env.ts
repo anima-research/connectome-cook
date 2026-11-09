@@ -115,17 +115,37 @@ export function sourceGitEnvironment(
   env.GIT_CONFIG_COUNT = String(count + 4);
   env[`GIT_CONFIG_KEY_${count}`] = `http.${origin}/.extraHeader`;
   env[`GIT_CONFIG_VALUE_${count}`] = `Authorization: Basic ${Buffer.from(`oauth2:${token}`).toString('base64')}`;
-  // Git matches HTTP config against the insteadOf-rewritten URL. Keep an
-  // unkeyed fallback, and cover the credential's entire origin for same-origin
-  // path rewrites. The exact key still beats more-specific operator path config
-  // for the recipe URL: URL specificity wins before command scope/order.
+  // Keep all three redirect blocks as defense in depth. The exact key beats
+  // more-specific operator path config: URL specificity wins before scope/order.
   for (const [index, key] of [
     'http.followRedirects', `http.${origin}/.followRedirects`, `http.${url}.followRedirects`,
   ].entries()) {
     env[`GIT_CONFIG_KEY_${count + 1 + index}`] = key;
     env[`GIT_CONFIG_VALUE_${count + 1 + index}`] = 'false';
   }
+  assertUnrewrittenSourceUrl(url, env, location, token);
   return env;
+}
+
+/** Resolve fetch rewrites offline using the acquisition environment/config.
+ * pushInsteadOf affects pushes only and is intentionally irrelevant here. */
+export function assertUnrewrittenSourceUrl(
+  url: string, env: NodeJS.ProcessEnv, location: string, token?: string, cwd?: string,
+): void {
+  let effective: string;
+  try {
+    effective = execFileSync('git', ['ls-remote', '--get-url', url], {
+      env, cwd, encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'],
+    }).replace(/\r?\n$/, '');
+  } catch {
+    // Do not echo Git diagnostics: configuration can contain other credentials.
+    throw new Error(`${location}: E_AUTH_SOURCE_URL_CHECK: could not resolve the source URL offline; no authenticated Git request made.`);
+  }
+  if (effective !== url) {
+    const safeUrl = effective.replace(/(\/\/)[^/?#]*@/g, '$1').replace(/^[^/]*@(?=[^/]+:)/, '');
+    const display = gitFailureOutput({ stdout: safeUrl }, token);
+    throw new Error(`${location}: E_AUTH_SOURCE_URL_REWRITTEN: the source URL is rewritten by Git configuration to ${display}. Credentials are only sent to the exact URL in the recipe; put the real URL in the recipe or remove the rewrite.`);
+  }
 }
 
 /** GIT_CONFIG_COUNT is available starting with Git 2.31. Do not try auth on older Git. */

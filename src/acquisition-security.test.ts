@@ -24,6 +24,10 @@ appendFileSync(${JSON.stringify(join(dir, 'git-argv'))}, JSON.stringify(args) + 
 appendFileSync(${JSON.stringify(join(dir, 'git-env'))}, JSON.stringify({ args, env: process.env }) + '\\n');
 const behavior = JSON.parse(readFileSync(${JSON.stringify(join(dir, 'git-behavior.json'))}, 'utf-8'));
 if (args[0] === '--version') { console.log('git version ' + (behavior.version ?? '2.53.0')); process.exit(0); }
+if (args[0] === 'ls-remote' && args[1] === '--get-url') {
+  if (behavior.getUrlFail) { console.error(${JSON.stringify(SECRET)}); process.exit(128); }
+  console.log(args[2]); process.exit(0);
+}
 if (behavior.fail && args[0] === behavior.fail && (process.env.GIT_CONFIG_COUNT === '4' || behavior.publicFail)) {
   console.log(process.env.GIT_CONFIG_VALUE_0 ?? 'public stdout diagnostic');
   console.error('fatal: useful Git diagnostic');
@@ -60,7 +64,7 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 function run(command: string, source: Record<string, unknown> | undefined, flags: string[] = [], extension = false) {
   writeFileSync(join(dir, 'git-behavior.json'), JSON.stringify({
-    fail: env.FAKE_FAIL_GIT, version: env.FAKE_GIT_VERSION, publicFail: env.FAKE_PUBLIC_FAIL, missing: env.FAKE_MISSING_URL, empty: env.FAKE_EMPTY_URL, requireSsl: env.FAKE_REQUIRE_SSL,
+    getUrlFail: env.FAKE_FAIL_GET_URL, fail: env.FAKE_FAIL_GIT, version: env.FAKE_GIT_VERSION, publicFail: env.FAKE_PUBLIC_FAIL, missing: env.FAKE_MISSING_URL, empty: env.FAKE_EMPTY_URL, requireSsl: env.FAKE_REQUIRE_SSL,
   }));
   const recipe = join(dir, 'recipe.json');
   writeFileSync(recipe, JSON.stringify({
@@ -966,4 +970,14 @@ test('R1-8: merged install help retains the explicit environment migration hint'
   expect(result.status).toBe(0);
   expect(result.stdout).toContain('COOK_PASS_ENV selects extra parent environment names');
   expect(gitCalls()).toBe('');
+});
+
+test('private acquisition refuses offline URL-resolution failures without relaying credentials', () => {
+  env.FAKE_FAIL_GET_URL = '1';
+  const result = run('install', { url: 'https://example.invalid/private.git', authSecret: 'GIT_TOKEN' });
+  expect(result.status).not.toBe(0);
+  expect(result.stdout + result.stderr).toContain('E_AUTH_SOURCE_URL_CHECK');
+  expect(result.stdout + result.stderr).not.toContain(SECRET);
+  expect(gitCalls()).toContain('["ls-remote","--get-url","https://example.invalid/private.git"]');
+  expect(gitCalls()).not.toContain('clone');
 });

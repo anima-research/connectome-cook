@@ -38,7 +38,7 @@ import { execFileSync, execSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
-import { knownSecretEnvironmentNames, sourceGitEnvironment, processAllowlistEnv, gitEnvironment, gitFailureOutput, AUTH_REDIRECT_HINT } from '../process-env.js';
+import { assertUnrewrittenSourceUrl, knownSecretEnvironmentNames, sourceGitEnvironment, processAllowlistEnv, gitEnvironment, gitFailureOutput, AUTH_REDIRECT_HINT } from '../process-env.js';
 import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
 import { log } from '../log.js';
 import type { GeneratorInput, McpSource } from '../types.js';
@@ -305,6 +305,10 @@ async function executeClone(
   const sourceDir = preparedCheckout ? undefined : context.sourceDir;
   const env = sourceGitEnvironment(action.url, action.authSecret, values, action.key, buildEnv, context.excluded);
   const git = async (args: string[], cwd?: string): Promise<string> => {
+    // Fetch runs inside the new checkout: include its local Git configuration.
+    if (action.authSecret && args[0] === 'fetch') {
+      assertUnrewrittenSourceUrl(action.url, env, action.key, values[action.authSecret], cwd);
+    }
     try {
       return commands ? await commands.run('git', args, cwd ?? process.cwd(), !action.authSecret, env)
         : execFileSync('git', args, { env, cwd, encoding: 'utf8', stdio: action.authSecret ? ['ignore', 'pipe', 'pipe'] : ['ignore', 'inherit', 'inherit'] }) ?? '';

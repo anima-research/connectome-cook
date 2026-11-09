@@ -11,7 +11,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { sourceGitEnvironment, gitFailureOutput, AUTH_REDIRECT_HINT } from './process-env.js';
+import { assertUnrewrittenSourceUrl, sourceGitEnvironment, gitFailureOutput, AUTH_REDIRECT_HINT } from './process-env.js';
 import { assertCredentialFreeSourceUrl, sourceLocation } from './source-url.js';
 import { log } from './log.js';
 import type { McpSource } from './types.js';
@@ -39,6 +39,7 @@ export function resolveRemoteRef(
   if (looksLikeSha(ref)) return ref.toLowerCase();
   const env = sourceGitEnvironment(url, authSecret, values, location, undefined, excluded);
   for (const candidate of candidateRefNames(ref)) {
+    if (authSecret) assertUnrewrittenSourceUrl(url, env, location, (values ?? process.env)[authSecret]);
     const args = [...(sslBypass ? ['-c', 'http.sslVerify=false'] : []), 'ls-remote', url, candidate];
     let output: string;
     try {

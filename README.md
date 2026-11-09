@@ -204,11 +204,22 @@ Runtime `.env`, recipes and locks retain main's semantics without classifying
 names by their Git use: `.env` includes resolved `authSecret` values, and resolved
 requirement values remain in the lock even if the name is also an `authSecret`.
 Runtime persistence does not forward those values to build subprocesses.
-For `authSecret` sources, cook appends `http.followRedirects=false` after forwarded
-indexed configuration. Redirects are refused, including cross-origin redirects:
-**put the final repository URL in the recipe**, rather than a redirecting URL.
-Git matches HTTP configuration against the original URL, not every subsequent
-request; relying on curl's redirect header stripping is insufficient.
+Before authenticated network Git calls, cook resolves the effective fetch URL
+**offline** with `git ls-remote --get-url` using the curated Git environment and
+configuration. Any change from the exact recipe URL (including same-origin path
+rewrites via `url.*.insteadOf`) is refused with `E_AUTH_SOURCE_URL_REWRITTEN`;
+the error shows the rewritten URL without userinfo. Credentials are only sent to
+the exact URL in the recipe: **put the real URL in the recipe or remove the
+rewrite**. A rewrite that Git reports as the identical URL is allowed.
+`pushInsteadOf` affects pushes, not fetches, so it does not trigger this refusal.
+Public sources without `authSecret` retain Git's normal rewrite behavior.
+
+Cook also appends unkeyed, origin-scoped and exact-URL
+`http.*.followRedirects=false` settings after forwarded indexed configuration.
+Redirects are refused, including cross-origin redirects: **put the final
+repository URL in the recipe**, rather than a redirecting URL. Git matches HTTP
+configuration against its effective initial URL, not every subsequent request;
+relying on curl's redirect header stripping is insufficient.
 
 The origin scope uses URL normalization, while Git's URL matching can differ.
 For example, `127.1` versus `127.0.0.1`, or expanded versus compressed IPv6
