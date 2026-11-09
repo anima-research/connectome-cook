@@ -45,15 +45,14 @@ export function hostLayout(value: unknown, installDir: string): HostLayout {
   // Check all existing roots before creating any. Retain both role and cause.
   const identities = new Set<string>();
   for (const { role, path } of paths) {
-    try {
-      const stat = provisionPrivateDirectory(path, false);
-      if (stat) {
-        const identity = `${stat.dev}:${stat.ino}`;
-        if (identities.has(identity)) fail(role, 'root aliases another root (device/inode)');
-        identities.add(identity);
-      }
+    let stat;
+    try { stat = provisionPrivateDirectory(path, false); }
+    catch (err) { fail(role, `${path}: ${err instanceof Error ? err.message : String(err)}`); }
+    if (stat) {
+      const identity = `${stat.dev}:${stat.ino}`;
+      if (identities.has(identity)) fail(role, `${path}: root aliases another root (device/inode)`);
+      identities.add(identity);
     }
-    catch (err) { fail(role, `${path}: ${err instanceof Error ? err.message : String(err)} (requires effective-user ownership, mode 0700 and no symlink/non-directory ancestors)`); }
   }
   return c;
 }
@@ -61,7 +60,7 @@ export function hostLayout(value: unknown, installDir: string): HostLayout {
 export function validateLayoutConsumers(layout: HostLayout, recipes: Recipe[]): void {
   for (const consumer of Object.keys(layout.connectorState)) {
     const matches = recipes.map(r => r.mcpServers?.[consumer]).filter(s => s !== undefined);
-    if (!matches.length || matches.some(s => !s.command || s.url)) throw new Error('E_HOST_LAYOUT: state consumer must be declared stdio');
+    if (!matches.length || matches.some(s => !s.command || s.url)) throw new Error(`E_HOST_LAYOUT: state consumer ${consumer} must be declared stdio`);
   }
 }
 export function provisionLayout(layout: HostLayout): void {
@@ -92,12 +91,18 @@ export function applyConnectorState(configuration: Recipe, layout: HostLayout): 
 export function applyWorkspaceMounts(configuration: Recipe, layout: HostLayout): void {
   const workspace = configuration.modules?.workspace;
   if (workspace === false) return;
+  if (workspace === null || (typeof workspace === 'object' && !Array.isArray(workspace.mounts))) {
+    throw new Error('E_HOST_LAYOUT: modules.workspace requires a mounts array');
+  }
   const mounts = typeof workspace === 'object' ? workspace.mounts : [
     { name: 'input', path: './input', mode: 'read-only' as const },
     { name: 'products', path: './output', mode: 'read-write' as const },
   ];
   const reserved = [layout.state, layout.config, layout.runtime, layout.credentials];
   const lowered = mounts.map(mount => {
+    if (/\$\{[^}]*\}/.test(mount.path)) {
+      throw new Error(`E_HOST_LAYOUT: workspace mount ${mount.name}: variable path is unsupported: ${mount.path}`);
+    }
     const path = isAbsolute(mount.path) ? resolve(mount.path) : resolve(layout.workspace, mount.path);
     // Also reject ancestors exposing a reserved root (e.g. '..' or '/').
     if (reserved.some(root => isPathWithin(root, path) || isPathWithin(path, root))) {
@@ -108,4 +113,16 @@ export function applyWorkspaceMounts(configuration: Recipe, layout: HostLayout):
   configuration.modules = { ...configuration.modules, workspace: {
     ...(typeof workspace === 'object' ? workspace : {}), mounts: lowered,
   } };
+}
+
+/** Reject CWD-dependent executable paths after overlays have been applied. */
+export function validateLayoutStdio(configuration: Recipe): void {
+  for (const [name, server] of Object.entries(configuration.mcpServers ?? {})) {
+    if (!server.command || server.url) continue;
+    for (const value of [server.command, ...(server.args ?? [])]) {
+      if (value.startsWith('./') || value.startsWith('../')) {
+        throw new Error(`E_HOST_LAYOUT: stdio server ${name}: CWD-relative executable/arg ${JSON.stringify(value)}`);
+      }
+    }
+  }
 }

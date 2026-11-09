@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { layoutTestDirectory } from './test-layout-directory.js';
 import { join, resolve } from 'node:path';
 import { checkEngine, preflightHostEngines } from './host-engines.js';
 
 let dir: string, repo: string, bun: string, node: string, recipe: string, out: string;
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), 'cook-managed-'));
+  dir = layoutTestDirectory('cook-managed-');
   repo = join(dir, 'source'); mkdirSync(repo);
   const git = (args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'pipe' });
   git(['init', '-b', 'main']); git(['config', 'user.name', 'Fixture']); git(['config', 'user.email', 'fixture@example.org']);
@@ -384,10 +384,10 @@ test('layout R1 reconcile: unreadable/missing lock, old-cook overwrite and marke
   writeFileSync(launcherPath, '# old cook default launcher\n');
   expect(install([]).stderr).toContain('E_HOST_LAYOUT');
   expect(install(args).stderr).toContain('E_HOST_LAYOUT');
-  // Original PR8 launchers without a marker still identify split installs.
+  // Without a marker, split adoption still refuses any existing launcher.
   writeFileSync(launcherPath, launcher); rmSync(lockPath);
   rmSync(join(out, '.cook-layout.json'), { force: true });
-  expect(install([]).stderr).toContain('E_HOST_LAYOUT');
+  expect(install(args).stderr).toContain('E_HOST_LAYOUT');
 });
 
 test('layout R1 unit: bare state path matrix and terminal-backslash refusal', () => {
@@ -524,4 +524,184 @@ test('layout parse, IO, overlap and state-unit errors precede recipe resolution'
   }
   rmSync(file);
   expect(install(['--layout', file, '--bun-path', bun, '--node-path', node]).stderr).toContain('E_HOST_LAYOUT: --layout ' + file + ':');
+});
+
+for (const target of ['.cook-engines', 'example.service']) {
+  test(`R3-8 refuses reserved code target ${target} before build`, () => {
+    const original = JSON.parse(readFileSync(recipe, 'utf8'));
+    original.mcpServers.local.source = { url: repo, install: { run: 'true', runtime: 'custom' }, inContainer: { path: '/' + target } };
+    writeFileSync(recipe, JSON.stringify(original));
+    const result = install(['--layout', layoutFile(), '--bun-path', bun, '--node-path', node, '--user-unit', 'example.service']);
+    expect(result.stderr).toContain('E_HOST_LAYOUT');
+    expect(result.stdout).not.toContain('Host install plan');
+    expect(existsSync(out)).toBe(false);
+  });
+}
+
+for (const scenario of [
+  { name: 'reviewer repro', copy: false, relativeHint: false, child: false, reexport: false, changeEngine: false },
+  { name: 'relative retained hint and descendant', copy: false, relativeHint: true, child: true, reexport: false, changeEngine: false },
+  { name: 'different requested unit', copy: false, relativeHint: false, child: false, reexport: true, changeEngine: false },
+  { name: 'sibling copy', copy: true, relativeHint: false, child: false, reexport: false, changeEngine: false },
+  { name: 'sibling copy with relative hint and re-export', copy: true, relativeHint: true, child: false, reexport: true, changeEngine: false },
+  { name: 'engine binding change', copy: false, relativeHint: false, child: false, reexport: false, changeEngine: true },
+]) {
+  test(`R3-8 retained unit refuses code collision before writes: ${scenario.name}`, () => {
+    const args = ['--layout', layoutFile(), '--bun-path', bun, '--node-path', node];
+    expect(install([...args, '--user-unit', 'example.service']).status).toBe(0);
+    const lockPath = join(out, 'connectome.lock');
+    if (scenario.relativeHint) {
+      const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+      lock.launch.userUnit = 'example.service';
+      writeFileSync(lockPath, JSON.stringify(lock));
+    }
+    const paths = [lockPath, join(out, '.cook-layout.json'), join(out, 'run.sh'), join(out, 'example.service')];
+    const before = paths.map(path => readFileSync(path, 'utf8'));
+    const original = JSON.parse(readFileSync(recipe, 'utf8'));
+    if (scenario.copy) {
+      // Unresolved servers use sibling-copy and target /<server name>.
+      original.mcpServers['example.service'] = { command: 'node', args: ['fixture.js'] };
+      mkdirSync(join(dir, 'example.service'));
+      writeFileSync(join(dir, 'example.service/fixture.js'), '// sibling fixture');
+    } else {
+      original.mcpServers.local.source = {
+        url: repo, install: { run: 'true', runtime: 'custom' },
+        inContainer: { path: '/example.service' + (scenario.child ? '/checkout' : '') },
+      };
+    }
+    writeFileSync(recipe, JSON.stringify(original));
+    if (scenario.changeEngine) {
+      const otherNode = join(dir, 'other-node');
+      writeFileSync(otherNode, readFileSync(node), { mode: 0o755 });
+      args[args.length - 1] = otherNode;
+    }
+    const result = install([...args, ...(scenario.reexport ? ['--user-unit', 'new.service'] : [])]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('E_HOST_LAYOUT');
+    expect(result.stdout).not.toContain('Host install plan');
+    expect(paths.map(path => readFileSync(path, 'utf8'))).toEqual(before);
+    expect(statSync(join(out, 'example.service')).isFile()).toBe(true);
+    expect(existsSync(join(out, 'new.service'))).toBe(false);
+  });
+}
+
+// A lexical /app/back/<control> looks harmless, but the tracked link goes
+// back to the runtime root. Exercise both destructive source action kinds.
+for (const copy of [false, true]) for (const control of [
+  'example.service', '.cook-engines/bin', '.cook-layout.json', 'connectome.lock',
+]) {
+  test(`R3-8 real-path ${copy ? 'copy' : 'clone'} refuses existing alias to ${control} before writes`, () => {
+    symlinkSync('..', join(repo, 'back'));
+    execFileSync('git', ['add', 'back'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'Tracked ancestor alias'], { cwd: repo, stdio: 'pipe' });
+    const args = ['--layout', layoutFile(), '--bun-path', bun, '--node-path', node];
+    expect(install([...args, '--user-unit', 'example.service']).status).toBe(0);
+    const paths = ['connectome.lock', '.cook-layout.json', 'run.sh', 'example.service'].map(p => join(out, p));
+    const before = paths.map(p => readFileSync(p, 'utf8'));
+    const links = ['bun', 'node'].map(p => join(out, '.cook-engines/bin', p));
+    const linkTargets = links.map(p => readlinkSync(p));
+    const original = JSON.parse(readFileSync(recipe, 'utf8'));
+    const target = 'app/back/' + control;
+    if (copy) {
+      original.mcpServers[target] = { command: 'node', args: ['fixture.js'] };
+      mkdirSync(join(dir, target), { recursive: true });
+      writeFileSync(join(dir, target, 'fixture.js'), '// sibling fixture');
+    } else {
+      original.mcpServers.local.source = { url: repo, inContainer: { path: '/' + target } };
+    }
+    writeFileSync(recipe, JSON.stringify(original));
+    // Deliberately omit --user-unit: the retained export is still reserved.
+    const result = install(args);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('E_HOST_LAYOUT');
+    expect(result.stderr).toContain(join(out, target));
+    expect(result.stdout).not.toContain('Host install plan');
+    expect(paths.map(p => readFileSync(p, 'utf8'))).toEqual(before);
+    expect(links.map(p => readlinkSync(p))).toEqual(linkTargets);
+  });
+}
+
+for (const copy of [false, true]) {
+  test(`R3-8 real-path ${copy ? 'copy' : 'clone'} rechecks alias created by earlier host clone`, () => {
+    symlinkSync('..', join(repo, 'back'));
+    execFileSync('git', ['add', 'back'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'Tracked ancestor alias'], { cwd: repo, stdio: 'pipe' });
+    const original = JSON.parse(readFileSync(recipe, 'utf8'));
+    const target = 'app/back/example.service';
+    if (copy) {
+      original.mcpServers[target] = { command: 'node', args: ['fixture.js'] };
+      mkdirSync(join(dir, target), { recursive: true });
+      writeFileSync(join(dir, target, 'fixture.js'), '// sibling fixture');
+    } else original.mcpServers.local.source = { url: repo, inContainer: { path: '/' + target } };
+    writeFileSync(recipe, JSON.stringify(original));
+    const result = install(['--layout', layoutFile(), '--bun-path', bun, '--node-path', node, '--user-unit', 'example.service']);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('E_HOST_LAYOUT');
+    expect(result.stderr).toContain(join(out, target));
+    // Preflight could not see this link; it must be checked after host clone.
+    expect(lstatSync(join(out, 'app/back')).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(out, 'example.service'))).toBe(false);
+    expect(lstatSync(join(out, '.cook-engines/bin/bun')).isSymbolicLink()).toBe(true);
+  });
+}
+
+for (const path of ['${AGENT_NOTES}/x', '${ESCAPE}']) {
+  test(`R3-1 CLI refuses variable mount ${path} before builds`, () => {
+    const original = JSON.parse(readFileSync(recipe, 'utf8'));
+    original.modules = { workspace: { mounts: [{ name: 'notes', path }] } };
+    writeFileSync(recipe, JSON.stringify(original));
+    const result = install(['--layout', layoutFile(), '--bun-path', bun, '--node-path', node]);
+    expect(result.stderr).toContain('E_HOST_LAYOUT');
+    expect(result.stderr).toContain('notes');
+    expect(result.stdout).not.toContain('Host install plan');
+    expect(existsSync(out)).toBe(false);
+  });
+}
+
+for (const server of [
+  { command: './bin/tool' }, { command: '../tools/server' },
+  { command: 'node', args: ['--enable-x', './tools/x.js'] },
+]) {
+  test(`R3-2 CLI refuses remaining relative stdio ${JSON.stringify(server)}`, () => {
+    writeFileSync(recipe, JSON.stringify({ name: 'Test', agent: { systemPrompt: 'Test' }, mcpServers: { local: server } }));
+    const result = install(['--layout', layoutFile(), '--bun-path', bun, '--node-path', node]);
+    expect(result.stderr).toContain('E_HOST_LAYOUT');
+    expect(result.stderr).toContain('local');
+    expect(result.stderr).toContain(server.command.startsWith('.') ? server.command : server.args!.at(-1)!);
+    expect(result.stdout).not.toContain('Host install plan');
+    expect(existsSync(out)).toBe(false);
+  });
+}
+
+test('R3-3 build and run reject layout before resolving or launching a target', () => {
+  for (const command of ['build', 'run']) for (const extra of [['--layout'], ['--layout='], ['--layout', '/missing/layout.json']]) {
+    const result = spawnSync(process.execPath, [resolve('bin/cook'), command, recipe, ...extra], { encoding: 'utf8' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('E_HOST_LAYOUT');
+  }
+  // A materialized directory must not bypass the run parser's refusal.
+  expect(install(['--bun-path', bun, '--node-path', node]).status).toBe(0);
+  const run = spawnSync(process.execPath, [resolve('bin/cook'), 'run', out, '--layout', '/missing'], { encoding: 'utf8' });
+  expect(run.status).toBe(1);
+  expect(run.stderr).toContain('E_HOST_LAYOUT');
+  const help = spawnSync(process.execPath, [resolve('bin/cook'), 'build', '--help'], { encoding: 'utf8' });
+  expect(help.stdout).not.toContain('--layout');
+});
+
+test('R3-9 preview labels defaults conditionally for disabled and explicit workspaces', () => {
+  for (const workspace of [false, { mounts: [{ name: 'custom', path: './custom' }] }]) {
+    const original = JSON.parse(readFileSync(recipe, 'utf8'));
+    writeFileSync(recipe, JSON.stringify({ ...original, modules: { workspace } }));
+    const result = install(['--layout', layoutFile(), '--bun-path', bun, '--node-path', node]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain('Implicit mounts:');
+    expect(result.stdout).toContain('Default mounts (only when workspace is unset/true)');
+  }
+});
+
+test('R3-9 refuses unreleased raw-layout marker format', () => {
+  const args = ['--layout', layoutFile(), '--bun-path', bun, '--node-path', node];
+  expect(install(args).status).toBe(0);
+  writeFileSync(join(out, '.cook-layout.json'), JSON.stringify(splitLayout()));
+  expect(install(args).stderr).toContain('E_HOST_LAYOUT: unreadable runtime layout marker');
 });

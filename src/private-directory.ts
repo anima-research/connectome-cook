@@ -1,6 +1,7 @@
 /** Private directory provisioning for the effective user, never chmod/chown.
  * Linux descriptor-relative traversal rejects symlinks even in ancestors.
- * Non-root-owned writable ancestors must be sticky; the root must be 0700.
+ * Writable ancestors must be sticky and owned by root or the effective user.
+ * Foreign non-root ancestors always refuse; the root must be 0700.
  * Same-uid processes are trusted. */
 import { dirname } from 'node:path';
 import { closeSync, constants as F, fchmodSync, fstatSync, fsyncSync, mkdirSync, openSync, writeFileSync, renameSync, unlinkSync, type Stats } from 'node:fs';
@@ -23,7 +24,8 @@ export function provisionPrivateDirectory(root: string, create = true): Stats | 
     closeSync(probe);
     for (const part of parts) {
       const ancestor = fstatSync(fd);
-      if (ancestor.uid !== 0 && (ancestor.mode & 0o022) && !(ancestor.mode & 0o1000)) throw new PrivateDirectoryError('E_PRIVATE_ANCESTOR');
+      const trustedOwner = ancestor.uid === 0 || ancestor.uid === process.geteuid!();
+      if (!trustedOwner || ((ancestor.mode & 0o022) && !(ancestor.mode & 0o1000))) throw new PrivateDirectoryError('E_PRIVATE_ANCESTOR');
       const path = '/proc/self/fd/' + fd + '/' + part;
       let next: number;
       try { next = openSync(path, F.O_RDONLY | F.O_DIRECTORY | F.O_NOFOLLOW); }

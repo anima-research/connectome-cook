@@ -1,13 +1,19 @@
 import { afterEach, beforeEach, expect, test, spyOn } from 'bun:test';
 import * as fs from 'node:fs';
-import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
+import { layoutTestDirectory } from './test-layout-directory.js';
+import { applyWorkspaceMounts, validateLayoutStdio } from './host-layout.js';
+import { generateOverlays } from './generators/overlay.js';
+import { lowerToConfiguration } from './configuration.js';
+import { detectSources } from './source-detector.js';
+import type { Recipe } from './vendor/recipe.js';
 import { hostLayout, provisionLayout, validateLayoutConsumers, type HostLayout } from './host-layout.js';
 import { provisionPrivateDirectory, writePrivateLayoutFile } from './private-directory.js';
 
 let dir: string;
-beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'cook-layout-')); });
+beforeEach(() => { dir = layoutTestDirectory('cook-layout-'); });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 function layout(): HostLayout {
   return { schema: 'connectome.host-layout/v1', config: join(dir, 'config'), runtime: join(dir, 'runtime'), state: join(dir, 'state'), workspace: join(dir, 'workspace'), credentials: join(dir, 'credentials'), connectorState: { local: { SETTINGS: 'settings/config.json' } } };
@@ -69,11 +75,11 @@ test('connector file and parent mappings refuse in either order', () => {
   }
 });
 
-test('non-root non-sticky writable ancestors refuse; sticky ancestors remain supported', () => {
+test('non-sticky writable ancestors refuse; shell-created sticky ancestors remain supported', () => {
   const parent = join(dir, 'shared'); mkdirSync(parent, { mode: 0o777 }); chmodSync(parent, 0o777);
   expect(() => provisionPrivateDirectory(join(parent, 'private'))).toThrow('E_PRIVATE_ANCESTOR');
   expect(existsSync(join(parent, 'private'))).toBe(false);
-  chmodSync(parent, 0o1777);
+  execFileSync('chmod', ['1777', parent]);
   expect(() => provisionPrivateDirectory(join(parent, 'private'))).not.toThrow();
 });
 
@@ -83,7 +89,11 @@ test('layout root distinctness includes opened device/inode identities', () => {
   const config = fs.statSync(c.config);
   const mocked = spyOn(fs, 'fstatSync').mockImplementation(((fd: number) =>
     fs.readlinkSync('/proc/self/fd/' + fd) === c.state ? config : original(fd)) as typeof fs.fstatSync);
-  try { expect(() => hostLayout(c, c.runtime)).toThrow('device/inode'); }
+  try {
+    let message = '';
+    try { hostLayout(c, c.runtime); } catch (err) { message = (err as Error).message; }
+    expect(message).toBe(`E_HOST_LAYOUT: state: ${c.state}: root aliases another root (device/inode)`);
+  }
   finally { mocked.mockRestore(); }
 });
 
@@ -104,4 +114,67 @@ test('private control replacement is atomic and keeps the original on a failed f
   expect(fs.readdirSync(dir)).toEqual(['.cook-layout.json']);
   fs.linkSync(file, join(dir, 'alias'));
   expect(() => writePrivateLayoutFile(file, 'bad', 0o600)).toThrow('E_PRIVATE_FILE');
+});
+
+for (const path of ['${AGENT_NOTES}/x', '${ESCAPE}']) {
+  test(`R3-1 refuses variable mount ${path} naming the mount`, () => {
+    const recipe: Recipe = { name: 'Test', agent: { systemPrompt: 'Test' }, modules: { workspace: { mounts: [{ name: 'notes', path }] } } };
+    expect(() => applyWorkspaceMounts(recipe, layout())).toThrow(/E_HOST_LAYOUT:.*notes/);
+  });
+}
+
+for (const [command, args, install] of [
+  ['python3', ['../pipy/server.py'], 'pip-editable'],
+  ['./bin/tool', [], undefined],
+  ['../tools/server', [], undefined],
+  ['node', ['--enable-x', './tools/x.js'], undefined],
+  ['node', ['./tools/x.js'], 'npm'],
+] as const) {
+  test(`R3-2 validates lowered stdio ${command} ${args.join(' ')}`, () => {
+    const recipe: Recipe = { name: 'Test', agent: { systemPrompt: 'Test' }, mcpServers: { tool: { command, args: [...args],
+      ...(install ? { source: { url: 'https://example.invalid/pipy.git', install } } : {}),
+    } } };
+    const walks = [{ path: '/fixture/recipe.json', recipe }];
+    const sources = detectSources(walks, { strict: false }).map(s => ({ ...s, inContainerPath: layout().runtime + s.inContainerPath }));
+    const overlays = generateOverlays({ walks, sources, envVars: [], options: { outDir: layout().runtime, strict: false, noPrompts: true, pinRefs: false } });
+    const configuration = lowerToConfiguration(recipe, overlays.get(walks[0]!.path), walks[0]!.path);
+    if (install === 'npm') {
+      expect(configuration.mcpServers!.tool!.args![0]).toStartWith('/');
+      expect(() => validateLayoutStdio(configuration)).not.toThrow();
+    } else {
+      const value = command.startsWith('.') ? command : args.at(-1)!;
+      expect(() => validateLayoutStdio(configuration)).toThrow('E_HOST_LAYOUT');
+      expect(() => validateLayoutStdio(configuration)).toThrow('tool');
+      expect(() => validateLayoutStdio(configuration)).toThrow(value);
+    }
+  });
+}
+
+for (const [owner, mode, allowed] of [
+  [0, 0o777, false], [0, 0o1777, true],
+  [process.geteuid!(), 0o1777, true], [process.geteuid!() + 1, 0o1777, false],
+  [process.geteuid!() + 1, 0o755, false],
+] as const) {
+  test(`R3-4 ancestor uid=${owner} mode=${mode.toString(8)}`, () => {
+    const parent = join(dir, 'ancestor'); mkdirSync(parent);
+    const original = fs.fstatSync;
+    const mocked = spyOn(fs, 'fstatSync').mockImplementation(((fd: number) => {
+      const stat = original(fd);
+      return fs.readlinkSync('/proc/self/fd/' + fd) === parent
+        ? Object.assign(stat, { uid: owner, mode: (stat.mode & ~0o7777) | mode }) : stat;
+    }) as typeof fs.fstatSync);
+    try {
+      const provision = () => provisionPrivateDirectory(join(parent, 'private'));
+      if (allowed) expect(provision).not.toThrow();
+      else { expect(provision).toThrow('E_PRIVATE_ANCESTOR'); expect(existsSync(join(parent, 'private'))).toBe(false); }
+    } finally { mocked.mockRestore(); }
+  });
+}
+
+test('R3-9 malformed workspace errors and missing consumers are named', () => {
+  for (const workspace of [null, {}]) {
+    const configuration = { name: 'Test', agent: { systemPrompt: 'Test' }, modules: { workspace } } as unknown as Recipe;
+    expect(() => applyWorkspaceMounts(configuration, layout())).toThrow('E_HOST_LAYOUT: modules.workspace');
+  }
+  expect(() => validateLayoutConsumers(layout(), [])).toThrow('state consumer local');
 });

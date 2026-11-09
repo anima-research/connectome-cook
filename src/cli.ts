@@ -63,7 +63,6 @@ ${log.bold('Flags:')}
   --image-name <name>    Override the generated image name
   --no-prompts           Non-interactive; warn-and-continue on missing values
   --env-file <path>      Read variable values from this file before prompting
-  --layout <local-json>  Opt-in split roots and explicit connector-state mappings
   --pin-refs             Resolve branch refs to commit SHAs (reproducible build)
   --allow-incomplete-templates
                          Write templated config files even when \${VAR}
@@ -98,9 +97,14 @@ async function runBuildPipeline(argv: string[]): Promise<BuildResult> {
     // mri auto-handles `--no-<flag>` as `flag: false`; we read it as
     // `flags.prompts === false` below.
     boolean: ['help', 'strict', 'pin-refs', 'allow-incomplete-templates'],
-    string: ['out', 'env-file', 'image-name'],
+    string: ['out', 'env-file', 'image-name', 'layout'],
     alias: { h: 'help' },
   });
+
+  if (Object.hasOwn(flags, 'layout')) {
+    log.error('E_HOST_LAYOUT: --layout is only supported by cook install, not build/run');
+    return { exitCode: 1, outDir: '' };
+  }
 
   if (flags.help) {
     process.stdout.write(BUILD_USAGE);
@@ -396,9 +400,14 @@ async function handleRun(argv: string[]): Promise<number> {
   // found regardless of flag order.
   const runFlags = mri(buildArgs, {
     boolean: ['rebuild', 'help', 'strict', 'pin-refs', 'allow-incomplete-templates'],
-    string: ['out', 'env-file', 'image-name'],
+    string: ['out', 'env-file', 'image-name', 'layout'],
     alias: { h: 'help' },
   });
+  if (Object.hasOwn(runFlags, 'layout')) {
+    log.error('E_HOST_LAYOUT: --layout is only supported by cook install, not build/run');
+    return 1;
+  }
+
   const [target] = runFlags._ as string[];
 
   // Build-affecting flags mean the operator wants a fresh materialization —

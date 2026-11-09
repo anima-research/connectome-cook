@@ -33,8 +33,8 @@
  */
 
 import { execFileSync, execSync } from 'node:child_process';
-import { chmodSync, cpSync, existsSync, lstatSync, readFileSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, relative, resolve } from 'node:path';
+import { chmodSync, cpSync, existsSync, lstatSync, readFileSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import promptsLib from 'prompts';
 import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
 import { log } from '../log.js';
@@ -58,7 +58,7 @@ import {
   type Lockfile,
   type LockedComponent,
 } from '../lockfile.js';
-import { applyConnectorState, applyWorkspaceMounts, provisionLayout, type HostLayout, validateLayoutConsumers } from '../host-layout.js';
+import { applyConnectorState, applyWorkspaceMounts, provisionLayout, type HostLayout, validateLayoutStdio, validateLayoutConsumers } from '../host-layout.js';
 import { writePrivateLayoutFile } from '../private-directory.js';
 import { isPathWithin } from '../path-containment.js';
 import { renderUserUnit, validateUserUnit } from '../host-unit.js';
@@ -251,7 +251,7 @@ export function renderActionPreview(actions: HostActions, options: HostBackendOp
     lines.push(`Runtime controls: ${['run.sh', LOCKFILE_NAME, 'bunfig.toml', '.cook-layout.json', ...(options.userUnit ? [options.userUnit] : [])].map(name => join(c.runtime, name)).join(', ')}`);
     lines.push(`Host CWD / DATA_DIR: ${c.state}`);
     lines.push(`Agent workspace (relative/default mounts rebased; WORKSPACE_DIR exported): ${c.workspace}`);
-    lines.push(`Implicit mounts: input=${join(c.workspace, 'input')} (read-only), products=${join(c.workspace, 'output')} (read-write); "." maps to ${c.workspace}`);
+    lines.push(`Default mounts (only when workspace is unset/true): input=${join(c.workspace, 'input')} (read-only), products=${join(c.workspace, 'output')} (read-write); "." maps to ${c.workspace}`);
     lines.push(`Reserved credentials (no consumer yet): ${c.credentials}`);
   } else lines.push(`Also writes: recipes/, .env, run.sh, ${LOCKFILE_NAME} under the install dir.`);
   return lines.join('\n');
@@ -530,28 +530,17 @@ function assertRecordedLayout(installDir: string, requested?: HostLayout): void 
   if (marker) {
     try {
       const value = JSON.parse(readFileSync(markerPath, 'utf8'));
-      // Accept the original raw-layout marker as a completed install.
-      if (value?.phase === 'installing' || value?.phase === 'installed') {
-        recorded = value.layout;
-        installing = value.phase === 'installing';
-      } else recorded = value;
+      if (value?.phase !== 'installing' && value?.phase !== 'installed') throw new Error('invalid marker phase');
+      recorded = value.layout;
+      installing = value.phase === 'installing';
     }
     catch { throw new Error('E_HOST_LAYOUT: unreadable runtime layout marker; restore from backup, do not reconcile'); }
     if (!recorded || canonical(recorded) !== canonical(requested)) throw new Error('E_HOST_LAYOUT: runtime marker requires the same --layout; use fresh roots for changes');
   }
-  // Recognize original PR8 installs as well, before markers were introduced.
-  let signature = false;
-  const launcherPresent = pathPresent(join(installDir, 'run.sh'));
-  if (launcherPresent) {
-    try {
-      const launcher = readFileSync(join(installDir, 'run.sh'), 'utf8');
-      signature = launcher.includes('export WORKSPACE_DIR=') && launcher.includes('export DATA_DIR=');
-    } catch { throw new Error('E_HOST_LAYOUT: unreadable runtime launcher; cannot determine recorded layout'); }
-  }
-  if (requested && !marker && !signature && ['run.sh', 'recipes', 'data'].some(name => pathPresent(join(installDir, name)))) {
+  if (requested && !marker && ['run.sh', 'recipes', 'data'].some(name => pathPresent(join(installDir, name)))) {
     throw new Error('E_HOST_LAYOUT: no in-place adoption of default launcher, recipes/ or data/; use fresh roots');
   }
-  if (marker || signature) {
+  if (marker) {
     // Only our durable installing phase authorizes retry after lock retirement.
     // A completed marker must never bless a missing/corrupted/downgraded lock.
     if (installing && !pathPresent(join(installDir, LOCKFILE_NAME))) return;
@@ -621,6 +610,77 @@ export async function runHostBackend(
   return materializeHost(plan, options);
 }
 
+/** Shared deterministic overlays for early split-layout checks and final lowering. */
+function hostOverlays(plan: InstallPlan, options: HostBackendOptions): Map<string, Partial<Recipe>> {
+  const installDir = options.installDir;
+  // ---- Lower configurations with host-rebased overlays. ----
+  // The overlay machinery reasons in `inContainerPath` terms; rebasing each
+  // source's path onto the install dir makes it emit host-absolute paths.
+  // Sibling-copy sources are included — their checkouts use the same target,
+  // so args must be rewritten to the install-dir paths just like in docker.
+  const rebasedSources = plan.sources
+    .filter((s) => s.install.kind !== 'npm-global')
+    .map((s) => ({ ...s, inContainerPath: hostPathFor(installDir, s.inContainerPath) }));
+  const rebasedLocalExts = plan.localExtensions.map((ext) => ({
+    ...ext,
+    // In-place: "container path" IS the operator's directory.
+    inContainerPath: ext.hostDir,
+  }));
+  const overlayInput: GeneratorInput = {
+    walks: plan.walks,
+    sources: rebasedSources,
+    localExtensions: rebasedLocalExts,
+    envVars: plan.envVars,
+    options: {
+      outDir: installDir,
+      noPrompts: options.noPrompts,
+      strict: plan.options.strict,
+      pinRefs: false,
+    },
+  };
+  return generateOverlays(overlayInput);
+}
+
+/** Keep the lexical reservation even when a target does not exist yet. */
+function runtimeControlCollision(installDir: string, target: string, unitPaths: string[]): boolean {
+  const rel = relative(installDir, target);
+  return unitPaths.some(path => isPathWithin(path, target) || isPathWithin(target, path))
+    || /^(?:run\.sh|bunfig\.toml|connectome\.lock|\.cook-layout\.json|\.cook-engines)(?:\/|$)/.test(rel);
+}
+
+/** R3-8: do not follow checkout-provided aliases into runtime controls (or
+ * outside runtime). Re-run at the action boundary: an earlier clone/copy/build
+ * can introduce ancestors that did not exist during preflight. This is not a
+ * sandbox for build commands, nor protection against concurrent path swaps. */
+function assertRuntimeCodeTarget(installDir: string, target: string, unitPaths: string[]): void {
+  const root = resolve(installDir);
+  const rel = relative(root, target);
+  const refuse = (reason: string): never => {
+    throw new Error(`E_HOST_LAYOUT: code target ${target}: ${reason}`);
+  };
+  if (!rel || rel.startsWith('..') || !isPathWithin(root, target) || runtimeControlCollision(root, target, unitPaths)) {
+    refuse('escapes runtime root or collides with runtime controls');
+  }
+  let current = root;
+  for (const component of ['', ...rel.split(sep)]) {
+    current = join(current, component);
+    try {
+      // lstat before realpath also catches dangling symlinks. Check the leaf
+      // too: it may be reused by reconcile or removed by the action.
+      if (lstatSync(current).isSymbolicLink()) refuse(`symlink component ${current}`);
+      const real = realpathSync(current);
+      if (!isPathWithin(root, real)
+        || (current !== root && runtimeControlCollision(root, real, unitPaths))) {
+        refuse(`component ${current} resolves outside runtime or into runtime controls`);
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') break;
+      if (err instanceof Error && err.message.startsWith('E_HOST_LAYOUT:')) throw err;
+      refuse(`cannot inspect component ${current}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+
 /** Materialization starts only after engine inspection has succeeded. */
 async function materializeHost(
   plan: InstallPlan,
@@ -654,12 +714,18 @@ async function materializeHost(
     return { exitCode: 2, outDir: installDir };
   }
 
-  const actions = planHostActions(plan, options);
-  if (layout) for (const target of [...actions.clones.map(a => a.target), ...actions.copies.map(a => a.target)]) {
-    const rel = relative(installDir, target);
-    if (!rel || rel.startsWith('..') || /^(?:run\.sh|bunfig\.toml|connectome\.lock|\.cook-layout\.json|\.cook)(?:\/|$)/.test(rel)) throw new Error('E_HOST_LAYOUT: code target escapes runtime root');
+  const splitOverlays = layout ? hostOverlays(plan, options) : undefined;
+  // Checked after overlays: source-backed first args may safely become absolute.
+  const splitConfigurations = layout ? new Map(plan.walks.map(walk => [
+    walk.path, lowerToConfiguration(walk.recipe, splitOverlays!.get(walk.path), walk.path),
+  ])) : undefined;
+  if (layout) for (const configuration of splitConfigurations!.values()) {
+    validateLayoutStdio(configuration);
+    applyConnectorState(configuration, layout);
+    applyWorkspaceMounts(configuration, layout);
   }
-  if (engines) bindHostEngine(actions, engines.bun.path);
+
+  const actions = planHostActions(plan, options);
   let existingLock: Lockfile | null = null;
   try {
     existingLock = readLockfile(installDir);
@@ -673,6 +739,19 @@ async function materializeHost(
   if (existingLock && !sameLayout) throw new Error('E_HOST_LAYOUT: layout changes require a fresh stopped installation');
   // Preserve the operator hint separately from clone reuse invalidation.
   const previousUserUnit = existingLock?.launch.kind === 'script' ? existingLock.launch.userUnit : undefined;
+  // Reserve both exports before lock invalidation or any clone/copy. An omitted
+  // --user-unit (or a renamed export) does not remove the previously named file.
+  const unitPaths = [
+    ...(options.userUnit !== undefined ? [resolve(installDir, options.userUnit)] : []),
+    ...(previousUserUnit !== undefined ? [resolve(installDir, previousUserUnit)] : []),
+  ];
+  const assertCodeTarget = (target: string) => {
+    if (layout) assertRuntimeCodeTarget(installDir, target, unitPaths);
+  };
+  for (const target of [...actions.clones.map(a => a.target), ...actions.copies.map(a => a.target)]) {
+    assertCodeTarget(target);
+  }
+  if (engines) bindHostEngine(actions, engines.bun.path);
   if (previousUserUnit && (options.userUnit === undefined || !engines)) {
     log.warn('previously exported user unit may still be installed and launches this run.sh; '
       + (engines
@@ -712,7 +791,7 @@ async function materializeHost(
 
   if (layout) {
     provisionLayout(layout);
-    // Make resumption durable BEFORE PR6 retires the reuse lock.
+    // Make resumption durable before retiring the reuse lock.
     writeOutput(join(installDir, LAYOUT_MARKER), JSON.stringify({ phase: 'installing', layout }, null, 2) + '\n');
     writeOutput(join(installDir, 'bunfig.toml'), '# Runtime-owned: no preloads.\n');
   }
@@ -737,6 +816,8 @@ async function materializeHost(
   const lockedComponents: LockedComponent[] = [];
   let chCommit: string | undefined;
   for (const action of actions.clones) {
+    // Outside the clone catch: a refusal must never trigger target cleanup.
+    assertCodeTarget(action.target);
     let commit: string | undefined;
     if (isSatisfiedByLock(action, existingLock)) {
       log.info(`unchanged ${log.dim(action.key)} — kept (${log.dim(action.target)})`);
@@ -752,6 +833,7 @@ async function materializeHost(
         );
         // Remove the partial checkout so a later re-run re-clones instead
         // of a stale lock entry + existing dir passing the reconcile check.
+        assertCodeTarget(action.target);
         rmSync(action.target, { recursive: true, force: true });
         return { exitCode: 3, outDir: installDir };
       }
@@ -780,6 +862,7 @@ async function materializeHost(
       );
       return { exitCode: 2, outDir: installDir };
     }
+    assertCodeTarget(copy.target);
     log.step(`copying sibling checkout ${log.dim(copy.from)} → ${log.dim(copy.target)}`);
     rmSync(copy.target, { recursive: true, force: true });
     cpSync(copy.from, copy.target, {
@@ -796,44 +879,16 @@ async function materializeHost(
     });
   }
 
-  // ---- Lower configurations with host-rebased overlays. ----
-  // The overlay machinery reasons in `inContainerPath` terms; rebasing each
-  // source's path onto the install dir makes it emit host-absolute paths.
-  // Sibling-copy sources are included — their checkouts were copied above,
-  // so args must be rewritten to the install-dir paths just like in docker.
-  const rebasedSources = plan.sources
-    .filter((s) => s.install.kind !== 'npm-global')
-    .map((s) => ({ ...s, inContainerPath: hostPathFor(installDir, s.inContainerPath) }));
-  const rebasedLocalExts = plan.localExtensions.map((ext) => ({
-    ...ext,
-    // In-place: "container path" IS the operator's directory.
-    inContainerPath: ext.hostDir,
-  }));
-  const overlayInput: GeneratorInput = {
-    walks: plan.walks,
-    sources: rebasedSources,
-    localExtensions: rebasedLocalExts,
-    envVars: plan.envVars,
-    options: {
-      outDir: installDir,
-      noPrompts: options.noPrompts,
-      strict: plan.options.strict,
-      pinRefs: false,
-    },
-  };
   let overlays: Map<string, Partial<Recipe>>;
-  try {
-    overlays = generateOverlays(overlayInput);
-  } catch (err) {
+  try { overlays = splitOverlays ?? hostOverlays(plan, options); }
+  catch (err) {
     log.error(`overlay generation failed: ${err instanceof Error ? err.message : String(err)}`);
     return { exitCode: 2, outDir: installDir };
   }
-
   const parentRecipeBasename = recipeFilename(plan.parentWalk.path);
   try {
     for (const walk of plan.walks) {
-      const configuration = lowerToConfiguration(walk.recipe, overlays.get(walk.path), walk.path);
-      if (layout) { applyConnectorState(configuration, layout); applyWorkspaceMounts(configuration, layout); }
+      const configuration = splitConfigurations?.get(walk.path) ?? lowerToConfiguration(walk.recipe, overlays.get(walk.path), walk.path);
       if (engines) for (const server of Object.values(configuration.mcpServers ?? {})) {
         if (server.command === 'node') server.command = engines.node.path;
         if (server.command === 'bun') server.command = engines.bun.path;
@@ -892,6 +947,7 @@ async function materializeHost(
       if (!isPathWithin(installDir, resolved)) {
         throw new Error(`rendered file "${target}" resolves outside the install dir — refusing to write`);
       }
+      assertCodeTarget(resolved);
       mkdirSync(resolve(resolved, '..'), { recursive: true });
       writeFileSync(resolved, content, { mode });
     };
