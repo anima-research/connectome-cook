@@ -7,11 +7,12 @@
  * the lock — and whose target directory exists — is skipped, not re-cloned).
  *
  * Secrets never land here — values live in the backend's .env. The lock
- * records WHAT was materialized (components, commits, paths, answered
- * requirements), not credentials.
+ * records WHAT was materialized (components, commits, paths,
+ * requirement names and origins), not answers or credentials.
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
 export const LOCKFILE_NAME = 'connectome.lock';
@@ -35,6 +36,7 @@ export interface LockedComponent {
 export interface LockedRequirement {
   name: string;
   envName: string;
+  /** Legacy v1 input only; never persisted by writeLockfile. */
   value?: string;
   origin: string;
 }
@@ -64,13 +66,38 @@ export interface Lockfile {
 }
 
 export function writeLockfile(dir: string, lock: Lockfile): void {
-  writeFileSync(join(dir, LOCKFILE_NAME), JSON.stringify(lock, null, 2) + '\n');
+  // Strip legacy answers at the persistence boundary, including when an old
+  // lock is rewritten as incomplete. Do not mutate the caller's in-memory lock.
+  const sanitized = {
+    ...lock,
+    requirements: lock.requirements.map(({ value: _value, ...metadata }) => metadata),
+  };
+  const path = join(dir, LOCKFILE_NAME);
+  const temporary = join(dir, `.${LOCKFILE_NAME}.${randomUUID()}.tmp`);
+  const fd = openSync(temporary, 'wx', 0o600);
+  try {
+    try {
+      writeFileSync(fd, JSON.stringify(sanitized, null, 2) + '\n');
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, path);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
 }
 
 export function readLockfile(dir: string): Lockfile | null {
   const path = join(dir, LOCKFILE_NAME);
-  if (!existsSync(path)) return null;
-  const raw = JSON.parse(readFileSync(path, 'utf-8')) as Lockfile;
+  let content: string;
+  try {
+    content = readFileSync(path, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+  const raw = JSON.parse(content) as Lockfile;
   if (raw.version !== 1) {
     throw new Error(`${path}: unsupported lockfile version ${String(raw.version)}`);
   }
