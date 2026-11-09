@@ -307,7 +307,11 @@ async function executeClone(
   const git = async (args: string[], cwd?: string): Promise<string> => {
     // Fetch runs inside the new checkout: include its local Git configuration.
     if (action.authSecret && args[0] === 'fetch') {
-      assertUnrewrittenSourceUrl(action.url, env, action.key, values[action.authSecret], cwd);
+      assertUnrewrittenSourceUrl(action.url, env, action.key, values[action.authSecret], cwd, 'origin');
+      // No submodule network operations may inherit this source's credential,
+      // even when operator config enables recursive fetches.
+      args = ['fetch', '--no-recurse-submodules', ...args.slice(1)];
+      if (action.sslBypass) args = ['-c', 'http.sslVerify=false', ...args];
     }
     try {
       return commands ? await commands.run('git', args, cwd ?? process.cwd(), !action.authSecret, env)
@@ -336,7 +340,14 @@ async function executeClone(
       };
       localGit(['clone', '--origin', 'origin', '--no-reject-shallow', '--no-hardlinks', '--branch', 'cook-selected', '--', sourceDir, action.target], 'clone inspected source');
       localGit(['-C', action.target, 'remote', 'set-url', 'origin', action.url], 'set-url origin');
+    } else if (action.authSecret) {
+      // clone can load target-only conditional config after a cwd-only check.
+      // Initialize the real target and origin before ANY authenticated network.
+      await git(['init', action.target]);
+      await git(['remote', 'add', 'origin', action.url], action.target);
+      await git(['fetch', 'origin'], action.target);
     } else {
+      // Public sources retain the existing clone path (including URL aliases).
       await git([...sslArgs, 'clone', action.url, action.target]);
     }
     if (action.commit) {
@@ -353,7 +364,7 @@ async function executeClone(
       } else {
         await git(['checkout', action.commit], action.target);
       }
-    } else if (action.ref && action.ref !== 'main') {
+    } else if (action.ref && (action.ref !== 'main' || action.authSecret)) {
       if (action.ref.startsWith('refs/')) {
         await git(['fetch', 'origin', `${action.ref}:cook-install-checkout`], action.target);
         await git(['checkout', 'cook-install-checkout'], action.target);

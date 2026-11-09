@@ -26,7 +26,7 @@ const behavior = JSON.parse(readFileSync(${JSON.stringify(join(dir, 'git-behavio
 if (args[0] === '--version') { console.log('git version ' + (behavior.version ?? '2.53.0')); process.exit(0); }
 if (args[0] === 'ls-remote' && args[1] === '--get-url') {
   if (behavior.getUrlFail) { console.error(${JSON.stringify(SECRET)}); process.exit(128); }
-  console.log(args[2]); process.exit(0);
+  console.log(args[2] === 'origin' ? JSON.parse(readFileSync('.git/fixture-url', 'utf-8')) : args[2]); process.exit(0);
 }
 if (behavior.fail && args[0] === behavior.fail && (process.env.GIT_CONFIG_COUNT === '4' || behavior.publicFail)) {
   console.log(process.env.GIT_CONFIG_VALUE_0 ?? 'public stdout diagnostic');
@@ -46,6 +46,14 @@ if (args[0] === 'ls-remote') {
 } else if (args[0] === 'clone') {
   mkdirSync(join(args[2], '.git'), { recursive: true });
   writeFileSync(join(args[2], '.git/config'), '[remote "origin"]\\nurl = ' + args[1]);
+} else if (args[0] === 'init') {
+  mkdirSync(join(args[1], '.git'), { recursive: true });
+} else if (args[0] === 'remote') {
+  if (args[1] === 'get-url') console.log(JSON.parse(readFileSync('.git/fixture-url', 'utf-8')));
+  else {
+    writeFileSync('.git/fixture-url', JSON.stringify(args[3]));
+    writeFileSync('.git/config', '[remote "origin"]\\nurl = ' + args[3]);
+  }
 } else if (args[0] === 'rev-parse') {
   console.log('${SHA}');
 }
@@ -137,7 +145,7 @@ for (const pin of [false, true]) {
     expect(result.status).toBe(0);
     const header = `Authorization: Basic ${Buffer.from(`oauth2:${SECRET}`).toString('base64')}`;
     const calls = gitEnvironments();
-    for (const command of ['clone', 'fetch', 'checkout', 'rev-parse', ...(pin ? ['ls-remote'] : [])]) {
+    for (const command of ['init', 'remote', 'fetch', 'checkout', 'rev-parse', ...(pin ? ['ls-remote'] : [])]) {
       expect(calls.some(call => call.args[0] === command && call.env.GIT_CONFIG_COUNT === '5')).toBe(true);
     }
     for (const call of calls) {
@@ -199,7 +207,7 @@ for (const declaration of ['source only', 'runtime env', 'requirement'] as const
     }
     const header = `Authorization: Basic ${Buffer.from(`oauth2:${token}`).toString('base64')}`;
     const privateCalls = gitEnvironments().filter(call => call.env.GIT_CONFIG_VALUE_0 === header);
-    for (const command of ['ls-remote', 'clone', 'fetch', 'checkout', 'rev-parse']) {
+    for (const command of ['ls-remote', 'init', 'remote', 'fetch', 'checkout', 'rev-parse']) {
       expect(privateCalls.some(call => call.args[0] === command)).toBe(true);
     }
     // Runtime .env and requirement values match main, independently of Git auth.
@@ -667,7 +675,7 @@ test('R3 production probe: all reviewed bypasses leave every generated file cana
   console.log(`R3 production probe: ${usernames.length * 2} refused builds; ${before.size} files checked per build; no canary or writes`);
 });
 
-for (const failure of ['clone', 'fetch', 'checkout', 'ls-remote']) {
+for (const failure of ['init', 'remote', 'fetch', 'checkout', 'ls-remote']) {
   test(`R1-1: private ${failure} errors suppress helper output`, () => {
     env.FAKE_FAIL_GIT = failure;
     const result = run('install', {
@@ -978,6 +986,7 @@ test('private acquisition refuses offline URL-resolution failures without relayi
   expect(result.status).not.toBe(0);
   expect(result.stdout + result.stderr).toContain('E_AUTH_SOURCE_URL_CHECK');
   expect(result.stdout + result.stderr).not.toContain(SECRET);
-  expect(gitCalls()).toContain('["ls-remote","--get-url","https://example.invalid/private.git"]');
-  expect(gitCalls()).not.toContain('clone');
+  expect(gitCalls()).toContain('["ls-remote","--get-url","origin"]');
+  expect(gitCalls()).not.toContain('["fetch"');
+  expect(gitCalls()).not.toContain('["clone","https://example.invalid/private.git"');
 });

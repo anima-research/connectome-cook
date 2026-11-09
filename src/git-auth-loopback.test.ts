@@ -4,7 +4,27 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-test.each(['none', 'identity', 'pushInsteadOf'] as const)('R1-1: real Git authenticates pin/clone/fetch with %s fetch rewrite; public aliases still work', async (rewrite) => {
+type GitCall = { args: string[]; cwd: string };
+
+function traceGit(bin: string, dir: string): string {
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+  const callsFile = join(dir, 'calls.jsonl');
+  writeFileSync(join(bin, 'git'), `#!${process.execPath}
+import { appendFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify({ args, cwd: process.cwd() }) + '\\n');
+const result = spawnSync(${JSON.stringify(realGit)}, args, { stdio: 'inherit' });
+process.exit(result.status ?? 1);
+`, { mode: 0o755 });
+  return callsFile;
+}
+
+function gitCalls(path: string): GitCall[] {
+  return readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+}
+
+test.each(['none', 'identity', 'pushInsteadOf'] as const)('R1-1: real Git authenticates pin/init/fetch with %s fetch rewrite; public aliases still work', async (rewrite) => {
   const dir = mkdtempSync(join(tmpdir(), 'cook-git-http-'));
   const token = 'synthetic-loopback-token';
   const header = `Basic ${Buffer.from(`oauth2:${token}`).toString('base64')}`;
@@ -48,6 +68,7 @@ test.each(['none', 'identity', 'pushInsteadOf'] as const)('R1-1: real Git authen
     const publicAlias = `${origin}/public-alias.git`;
     const privateUrl = `${origin}/private.git`;
     writeFileSync(join(home, '.gitconfig'),
+      '[fetch]\n\trecurseSubmodules = true\n[submodule]\n\trecurse = true\n' +
       `[url "${origin}/public.git"]\n\tinsteadOf = ${publicAlias}\n` +
       (rewrite === 'identity' ? `[url "${privateUrl}"]\n\tinsteadOf = ${privateUrl}\n` :
         rewrite === 'pushInsteadOf' ? `[url "${origin}/other.git"]\n\tpushInsteadOf = ${privateUrl}\n` : ''));
@@ -64,6 +85,7 @@ test.each(['none', 'identity', 'pushInsteadOf'] as const)('R1-1: real Git authen
       } } },
     }));
     const out = join(dir, 'out');
+    const callsFile = traceGit(bin, dir);
     const child = spawn(process.execPath, [resolve(import.meta.dir, '../bin/cook'), 'install', recipe,
       '--out', out, '--yes', '--no-prompts', '--pin-refs', '--ch-repo', publicAlias], {
       env: { PATH: `${bin}:${process.env.PATH}`, HOME: home, PRIVATE_TOKEN: token, GIT_CONFIG_NOSYSTEM: '1' },
@@ -78,6 +100,17 @@ test.each(['none', 'identity', 'pushInsteadOf'] as const)('R1-1: real Git authen
     expect(output).not.toContain(token);
     expect(output).not.toContain(header);
     expect(status).toBe(0);
+    const calls = gitCalls(callsFile);
+    const target = join(out, 'private');
+    expect(calls.some(call => call.args[0] === 'clone' && call.args[1] === privateUrl)).toBe(false);
+    const fetches = calls.map((call, index) => ({ ...call, index }))
+      .filter(call => call.cwd === target && call.args[0] === 'fetch');
+    expect(fetches).toHaveLength(2);
+    for (const fetch of fetches) {
+      expect(fetch.args).toContain('--no-recurse-submodules');
+      expect(calls[fetch.index - 2]).toEqual({ cwd: target, args: ['remote', 'get-url', 'origin'] });
+      expect(calls[fetch.index - 1]).toEqual({ cwd: target, args: ['ls-remote', '--get-url', 'origin'] });
+    }
     expect(requests.filter(r => r.path.startsWith('/private.git/info/refs')).length).toBeGreaterThanOrEqual(3);
     expect(requests.filter(r => r.path.startsWith('/private.git/')).every(r => r.auth === header)).toBe(true);
     expect(requests.filter(r => r.path.startsWith('/public.git/')).every(r => r.auth === null)).toBe(true);
@@ -101,7 +134,7 @@ test.each(['none', 'identity', 'pushInsteadOf'] as const)('R1-1: real Git authen
     expect(await new Promise<number | null>((resolve, reject) => { rerun.on('error', reject); rerun.on('close', resolve); })).toBe(0);
     expect(rerunOutput).toContain('unchanged');
     expect(requests.length).toBe(requestCount);
-    console.log(`loopback Git: ${requests.length} requests; private pin/clone/fetch authenticated; public requests clean`);
+    console.log(`loopback Git: ${requests.length} requests; private pin/init/fetch authenticated; public requests clean`);
   } finally {
     server.stop(true);
     rmSync(dir, { recursive: true, force: true });
@@ -110,7 +143,7 @@ test.each(['none', 'identity', 'pushInsteadOf'] as const)('R1-1: real Git authen
 
 // A smart-HTTP destination is essential: Git can strip Authorization on the
 // redirected GET, then leak it on subsequent upload-pack POSTs.
-test.each(['prefix', 'exact', 'include', 'insteadOf', 'insteadOf-prefix', 'insteadOf-exact', 'insteadOf-exact-pin', 'insteadOf-cross-origin', 'insteadOf-userinfo', 'insteadOf-indexed', 'public-insteadOf-exact'] as const)('R1-1: two-origin redirect with operator %s URL config; inspect EVERY destination request', async (scope) => {
+test.each(['prefix', 'exact', 'include', 'insteadOf', 'insteadOf-prefix', 'insteadOf-exact', 'insteadOf-exact-pin', 'insteadOf-cross-origin', 'insteadOf-userinfo', 'insteadOf-indexed', 'insteadOf-gitdir', 'insteadOf-hasconfig', 'public-insteadOf-exact'] as const)('R1-1: two-origin redirect with operator %s URL config; inspect EVERY destination request', async (scope) => {
   const dir = mkdtempSync(join(tmpdir(), 'cook-redirect-'));
   const token = 'synthetic-redirect-token';
   const requestsA: Array<{ method: string; path: string; auth: string | null }> = [];
@@ -166,29 +199,46 @@ test.each(['prefix', 'exact', 'include', 'insteadOf', 'insteadOf-prefix', 'inste
     const sourceOrigin = `http://127.0.0.1:${origin.port}/`;
     const alias = scope.includes('insteadOf');
     const publicSource = scope.startsWith('public-');
+    const conditional = scope === 'insteadOf-gitdir' || scope === 'insteadOf-hasconfig';
     const sourceUrl = `${sourceOrigin}${alias ? 'alias.git' : 'repo.git'}`;
     const effectiveUrl = scope === 'insteadOf-cross-origin' ? `http://127.0.0.1:${destination.port}/repo.git`
       : scope === 'insteadOf-userinfo' ? `http://operator:synthetic-rewrite-password@127.0.0.1:${origin.port}/repo.git`
       : alias ? `${sourceOrigin}repo.git` : sourceUrl;
     const operatorUrl = scope === 'prefix' || scope === 'insteadOf-prefix' ? sourceOrigin
-      : scope.includes('insteadOf-exact') ? effectiveUrl : sourceUrl;
+      : scope.includes('insteadOf-exact') || conditional ? effectiveUrl : sourceUrl;
     // URL-specific file config (including includes) outranks unkeyed config.
     // insteadOf makes Git match HTTP settings against /repo.git, not /alias.git.
     const httpConfig = `[http "${operatorUrl}"]\n\tfollowRedirects = true\n`;
     const rewriteConfig = alias ? `[url "${effectiveUrl}"]\n\tinsteadOf = ${sourceUrl}\n` : '';
-    if (scope === 'include') {
+    if (conditional) {
+      writeFileSync(join(home, 'redirects.gitconfig'), httpConfig + rewriteConfig);
+      const condition = scope === 'insteadOf-gitdir'
+        ? `gitdir:${join(dir, 'out')}/**` : `hasconfig:remote.*.url:${sourceUrl}`;
+      writeFileSync(join(home, '.gitconfig'), `[includeIf "${condition}"]\n\tpath = redirects.gitconfig\n`);
+      // The old cook-cwd check cannot see either conditional rewrite.
+      expect(git(['ls-remote', '--get-url', sourceUrl]).toString().trim()).toBe(sourceUrl);
+      const probe = join(dir, 'out', 'probe');
+      git(['init', probe]);
+      git(['-C', probe, 'remote', 'add', 'origin', sourceUrl]);
+      for (const args of [['remote', 'get-url', 'origin'], ['ls-remote', '--get-url', 'origin']]) {
+        expect(git(['-C', probe, ...args]).toString().trim()).toBe(effectiveUrl);
+      }
+      expect(git(['-C', probe, 'config', '--get-urlmatch', 'http.followRedirects', effectiveUrl]).toString().trim()).toBe('true');
+      rmSync(probe, { recursive: true });
+    } else if (scope === 'include') {
       writeFileSync(join(home, 'redirects.gitconfig'), httpConfig);
       writeFileSync(join(home, '.gitconfig'), '[include]\n\tpath = redirects.gitconfig\n');
     } else {
       writeFileSync(join(home, '.gitconfig'), httpConfig + (scope === 'insteadOf-indexed' ? '' : rewriteConfig));
     }
-    expect(execFileSync('git', ['config', '--get-urlmatch', 'http.followRedirects', operatorUrl],
+    if (!conditional) expect(execFileSync('git', ['config', '--get-urlmatch', 'http.followRedirects', operatorUrl],
       { env, encoding: 'utf8' }).trim()).toBe('true');
     const recipe = join(dir, 'recipe.json');
     writeFileSync(recipe, JSON.stringify({ name: 'Redirect fixture', agent: { systemPrompt: 'test' },
       mcpServers: { fixture: { command: 'node', source: {
         url: sourceUrl, ...(publicSource ? {} : { authSecret: 'PRIVATE_TOKEN' }),
       } } } }));
+    const callsFile = traceGit(bin, dir);
     const child = spawn(process.execPath, [resolve(import.meta.dir, '../bin/cook'), 'install', recipe,
       '--out', join(dir, 'out'), '--yes', '--no-prompts', '--ch-repo', repo,
       ...(scope.endsWith('-pin') ? ['--pin-refs'] : [])], {
@@ -204,7 +254,10 @@ test.each(['prefix', 'exact', 'include', 'insteadOf', 'insteadOf-prefix', 'inste
     child.stdout.on('data', chunk => { output += chunk; });
     child.stderr.on('data', chunk => { output += chunk; });
     const status = await new Promise<number | null>((resolve, reject) => { child.on('error', reject); child.on('close', resolve); });
+    const calls = gitCalls(callsFile);
+    if (conditional) console.log(`conditional ${scope}: status=${status}, A=${requestsA.length}, B=${requestsB.length}`);
     if (publicSource) {
+      expect(calls.some(call => call.args[0] === 'clone' && call.args[1] === sourceUrl)).toBe(true);
       expect(status).toBe(0);
       expect(requestsA.length).toBeGreaterThan(0);
       expect(requestsB.some(r => r.method === 'POST')).toBe(true);
@@ -214,6 +267,13 @@ test.each(['prefix', 'exact', 'include', 'insteadOf', 'insteadOf-prefix', 'inste
       expect(requestsB).toEqual([]);
       if (alias) {
         expect(requestsA).toEqual([]);
+        if (conditional) {
+          const target = join(dir, 'out', 'alias');
+          expect(calls.some(call => call.args[0] === 'clone' && call.args[1] === sourceUrl)).toBe(false);
+          expect(calls.some(call => call.args.join(' ') === `init ${target}`)).toBe(true);
+          expect(calls.some(call => call.cwd === target && call.args.join(' ') === 'remote get-url origin')).toBe(true);
+          expect(calls.some(call => call.cwd === target && call.args.join(' ') === 'ls-remote --get-url origin')).toBe(true);
+        }
         expect(output).toContain('E_AUTH_SOURCE_URL_REWRITTEN');
         expect(output).toContain('the source URL is rewritten by Git configuration');
         expect(output).toContain(effectiveUrl.replace('operator:synthetic-rewrite-password@', ''));

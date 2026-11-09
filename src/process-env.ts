@@ -123,29 +123,40 @@ export function sourceGitEnvironment(
     env[`GIT_CONFIG_KEY_${count + 1 + index}`] = key;
     env[`GIT_CONFIG_VALUE_${count + 1 + index}`] = 'false';
   }
-  assertUnrewrittenSourceUrl(url, env, location, token);
   return env;
 }
 
 /** Resolve fetch rewrites offline using the acquisition environment/config.
  * pushInsteadOf affects pushes only and is intentionally irrelevant here. */
 export function assertUnrewrittenSourceUrl(
-  url: string, env: NodeJS.ProcessEnv, location: string, token?: string, cwd?: string,
+  url: string, env: NodeJS.ProcessEnv, location: string, token?: string, cwd?: string, remote?: string,
 ): void {
   let effective: string;
+  let remoteUrl: string | undefined;
+  const offline = (args: string[]) => execFileSync('git', args, {
+    env, cwd, encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'],
+  }).replace(/\r?\n$/, '');
   try {
-    effective = execFileSync('git', ['ls-remote', '--get-url', url], {
-      env, cwd, encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'],
-    }).replace(/\r?\n$/, '');
+    // A named remote activates hasconfig includes; cwd activates gitdir includes.
+    // Check both views in the initialized target, exactly where fetch will run.
+    if (remote) remoteUrl = offline(['remote', 'get-url', remote]);
+    effective = offline(['ls-remote', '--get-url', remote ?? url]);
   } catch {
     // Do not echo Git diagnostics: configuration can contain other credentials.
     throw new Error(`${location}: E_AUTH_SOURCE_URL_CHECK: could not resolve the source URL offline; no authenticated Git request made.`);
   }
+  if (remoteUrl !== undefined && remoteUrl !== url) effective = remoteUrl;
   if (effective !== url) {
     const safeUrl = effective.replace(/(\/\/)[^/?#]*@/g, '$1').replace(/^[^/]*@(?=[^/]+:)/, '');
     const display = gitFailureOutput({ stdout: safeUrl }, token);
     throw new Error(`${location}: E_AUTH_SOURCE_URL_REWRITTEN: the source URL is rewritten by Git configuration to ${display}. Credentials are only sent to the exact URL in the recipe; put the real URL in the recipe or remove the rewrite.`);
   }
+  // Defense in depth: deny redirects for the effective URL as well as all
+  // sourceGitEnvironment's original keys. Equality is mandatory above, so its
+  // exact-URL key already covers this URL; explicitly retain the effective key.
+  const last = Number(env.GIT_CONFIG_COUNT) - 1;
+  env[`GIT_CONFIG_KEY_${last}`] = `http.${effective}.followRedirects`;
+  env[`GIT_CONFIG_VALUE_${last}`] = 'false';
 }
 
 /** GIT_CONFIG_COUNT is available starting with Git 2.31. Do not try auth on older Git. */
