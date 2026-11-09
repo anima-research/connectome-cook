@@ -109,7 +109,7 @@ test('R1 scratch reuse: exactly one source fetch and local materialization', () 
   script(join(tools, 'git'), `printf '%s\\n' "$*" >> '${trace}'\nexec '${realGit}' "$@"`);
   const result = install(true, { ...process.env, PATH: tools + ':' + process.env.PATH });
   expect(result.status).toBe(0);
-  const lines = readFileSync(trace, 'utf8').split('\n').filter(line => line.includes(repo) && /^(fetch|clone|ls-remote) /.test(line));
+  const lines = readFileSync(trace, 'utf8').split('\n').filter(line => line.includes(repo) && /(?:^| )(fetch|clone|ls-remote) /.test(line));
   expect(lines.length).toBe(1);
   expect(lines[0]).toContain('fetch');
 });
@@ -144,7 +144,7 @@ test('R1 pinned acquisition: --pin-refs does not look up the host twice', () => 
   script(join(tools, 'git'), `printf '%s\\n' "$*" >> '${trace}'\nexec '${realGit}' "$@"`);
   const result = spawnSync(process.execPath, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, '--ch-ref', 'main', '--pin-refs', '--no-prompts', '--yes', '--bun-path', bun, '--node-path', node], { encoding: 'utf8', env: { ...process.env, PATH: tools + ':' + process.env.PATH } });
   expect(result.status).toBe(0);
-  const lines = readFileSync(trace, 'utf8').split('\n').filter(line => line.includes(repo) && /^(fetch|clone|ls-remote) /.test(line));
+  const lines = readFileSync(trace, 'utf8').split('\n').filter(line => line.includes(repo) && /(?:^| )(fetch|clone|ls-remote) /.test(line));
   expect(lines.length).toBe(1); expect(lines[0]).toContain('fetch');
 });
 
@@ -163,7 +163,7 @@ for (const initial of [false, true]) test(`failed engine transition ${initial ? 
   expect(install(initial, env).status).toBe(0);
   writeFileSync(fail, 'fail');
   expect(install(!initial, env).status).toBe(3);
-  expect(existsSync(join(out, 'connectome.lock'))).toBe(false);
+  expect(JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8')).incomplete).toBe(true);
   rmSync(fail);
   const retry = install(initial, env); expect(retry.status).toBe(0);
   expect(retry.stdout).not.toContain('unchanged');
@@ -190,7 +190,7 @@ for (const spelling of ['parent', 'dot']) test(`relative local host source (${sp
 test('scp host:path stays a remote source rather than a local path', () => {
   const tools = join(dir, 'tools'); mkdirSync(tools); const trace = join(dir, 'git.trace');
   const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
-  script(join(tools, 'git'), `case "$1" in fetch|ls-remote) printf '%s\\n' "$*" >> '${trace}'; exit 2;; esac\nexec '${realGit}' "$@"`);
+  script(join(tools, 'git'), `case "$*" in *fetch*|*ls-remote*) printf '%s\\n' "$*" >> '${trace}'; exit 2;; esac\nexec '${realGit}' "$@"`);
   const old = process.env.PATH;
   try {
     process.env.PATH = tools + ':' + old;
@@ -204,7 +204,7 @@ test('scp host:path stays a remote source rather than a local path', () => {
 test('signalled git fetch reports TIMEOUT without leaking output or probing refs', () => {
   const tools = join(dir, 'tools'); mkdirSync(tools); const trace = join(dir, 'git.trace');
   const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
-  script(join(tools, 'git'), `printf '%s\\n' "$*" >> '${trace}'\nif [ "$1" = fetch ]; then echo SECRET_GIT_OUTPUT >&2; kill -TERM $$; fi\nexec '${realGit}' "$@"`);
+  script(join(tools, 'git'), `printf '%s\\n' "$*" >> '${trace}'\nif [ "$1" = fetch ] || [ "$2" = fetch ]; then echo SECRET_GIT_OUTPUT >&2; kill -TERM $$; fi\nexec '${realGit}' "$@"`);
   const result = install(true, { ...process.env, PATH: tools + ':' + process.env.PATH });
   expect(result.stderr).toContain('E_HOST_ENGINE_TIMEOUT:');
   expect(result.stderr).not.toContain('SECRET_GIT_OUTPUT');
@@ -233,7 +233,7 @@ for (const phase of ['fetch', 'build']) for (const signal of ['SIGINT', 'SIGTERM
   if (phase === 'build') script(bun, `if [ "$1" = --version ]; then echo 1.4.4; else touch '${marker}'; sleep 30; fi`);
   else {
     const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
-    script(join(tools, 'git'), `if [ "$1" = fetch ]; then touch '${marker}'; exec sleep 30; fi\nexec '${realGit}' "$@"`);
+    script(join(tools, 'git'), `if [ "$1" = fetch ] || [ "$2" = fetch ]; then touch '${marker}'; exec sleep 30; fi\nexec '${realGit}' "$@"`);
   }
   const child = spawn(process.execPath, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, '--no-prompts', '--yes', '--bun-path', bun, '--node-path', node], { detached: true, stdio: 'ignore', env: { ...process.env, TMPDIR: scratch, PATH: tools + ':' + process.env.PATH } });
   const exited = new Promise<{ code: number | null; signal: string | null }>(resolve => child.on('exit', (code, signal) => resolve({ code, signal })));
@@ -286,4 +286,165 @@ test('missing semver reports a coded refusal with a dependency install hint', ()
   expect(result.stderr).toContain('E_HOST_ENGINE_DEPENDENCY:');
   expect(result.stderr).toContain('run bun install');
   expect(existsSync(out)).toBe(false);
+});
+
+for (const engine of ['bun', 'node'] as const) for (const observed of engine === 'bun' ? ['1.3.10', '1.4.5'] : ['20.0.0', '22.24.0']) test(`R3-1 directory shim ${engine} observes ${observed} in host and refuses before build`, () => {
+  const caller = join(dir, 'caller'); mkdirSync(caller);
+  writeFileSync(join(caller, '.tool-versions'), engine === 'bun' ? '1.4.4' : '22.23.3');
+  const trace = join(dir, 'probes');
+  script(engine === 'bun' ? bun : node, `p="$PWD"; v='${observed}'; while :; do
+    if [ -f "$p/.tool-versions" ]; then v=$(cat "$p/.tool-versions"); break; fi
+    [ "$p" = / ] && break; p=$(dirname "$p")
+  done
+  echo "$PWD $* $v" >> '${trace}'
+  if [ "$1" = --version ]; then echo "$v"; else touch '${join(dir, 'built')}'; fi`);
+  const result = spawnSync(process.execPath, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, '--no-prompts', '--yes', '--bun-path', bun, '--node-path', node], { cwd: caller, encoding: 'utf8' });
+  expect(result.status).toBe(3);
+  expect(result.stderr).toContain(observed === '1.3.10' || observed === '20.0.0' ? 'E_HOST_ENGINE_RANGE:' : 'E_HOST_ENGINE_CHANGED:');
+  expect(readFileSync(trace, 'utf8')).toContain(`${join(out, 'app')} --version ${observed}`);
+  expect(existsSync(join(dir, 'built'))).toBe(false);
+  expect(existsSync(join(out, 'run.sh'))).toBe(false);
+});
+
+test('R3-4 failed ref reinstall preserves an incomplete lock, both run forms refuse, retry rebuilds', () => {
+  const env = { ...process.env, PATH: dir + ':' + process.env.PATH };
+  expect(install(false, env).status).toBe(0);
+  writeFileSync(join(out, 'app', 'stale'), 'stale');
+  const failed = spawnSync(process.execPath, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, '--ch-ref', 'missing', '--no-prompts', '--yes'], { encoding: 'utf8', env });
+  expect(failed.status).toBe(3);
+  expect(existsSync(join(out, 'connectome.lock'))).toBe(true);
+  expect(JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8')).incomplete).toBe(true);
+  for (const args of [[out], [recipe, '--out', out]]) {
+    const run = spawnSync(process.execPath, [resolve('bin/cook'), 'run', ...args], { encoding: 'utf8', env });
+    expect(run.status).toBe(1);
+    expect(run.stderr).toContain('last install failed; re-run `cook install`');
+    expect(run.stdout).not.toContain('Write');
+  }
+  const retry = install(false, env); expect(retry.status).toBe(0);
+  expect(retry.stdout).not.toContain('unchanged');
+  expect(existsSync(join(out, 'app', 'stale'))).toBe(false);
+  expect(JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8')).incomplete).toBeUndefined();
+});
+
+for (const withNextBuild of [true, false]) test(`R3-5 SIGTERM to cook alone stops before ${withNextBuild ? 'the next build' : 'lock publication'} and cleans scratch`, async () => {
+  const scratch = join(dir, 'scratch'); mkdirSync(scratch);
+  const marker = join(dir, 'building'), next = join(dir, 'next');
+  script(bun, `if [ "$1" = --version ]; then echo 1.4.4; else touch '${marker}'; sleep 1; fi`);
+  if (withNextBuild) writeFileSync(recipe, JSON.stringify({ name: 'Fixture', agent: { systemPrompt: 'x' }, mcpServers: { fixture: { command: 'node', source: { url: repo, install: { kind: 'custom', run: `touch '${next}'`, runtime: 'custom' } } } } }));
+  const child = spawn(process.execPath, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, '--no-prompts', '--yes', '--bun-path', bun, '--node-path', node], { stdio: 'ignore', env: { ...process.env, TMPDIR: scratch } });
+  const exited = new Promise<string | null>(r => child.on('exit', (_code, signal) => r(signal)));
+  try {
+    const deadline = Date.now() + 4000;
+    while (!existsSync(marker) && Date.now() < deadline) await new Promise(r => setTimeout(r, 20));
+    expect(existsSync(marker)).toBe(true);
+    process.kill(child.pid!, 'SIGTERM');
+    expect(await exited).toBe('SIGTERM');
+    expect(existsSync(next)).toBe(false);
+    expect(existsSync(join(out, 'connectome.lock'))).toBe(false);
+    expect(readdirSync(scratch)).toEqual([]);
+  } finally { try { child.kill('SIGKILL'); } catch {} await exited; }
+}, 10000);
+
+test('R3-2 absolute GIT_DIR and repository-local variables never touch an unrelated repository', () => {
+  const unrelated = join(dir, 'unrelated');
+  execFileSync('git', ['init', unrelated], { stdio: 'pipe' });
+  const before = execFileSync('find', [unrelated, '-type', 'f', '-exec', 'sha256sum', '{}', '+'], { encoding: 'utf8' });
+  const env = { ...process.env, GIT_DIR: join(unrelated, '.git'), GIT_WORK_TREE: unrelated, GIT_INDEX_FILE: join(unrelated, 'index') };
+  // Both pre-confirm inspection and every clone follow-up are exercised.
+  const refused = spawnSync(process.execPath, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, '--no-prompts', '--bun-path', bun, '--node-path', node], { encoding: 'utf8', env });
+  expect(refused.status).toBe(1); expect(existsSync(out)).toBe(false);
+  const result = install(true, env); expect(result.status).toBe(0);
+  const lock = JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8'));
+  expect(lock.connectomeHost.commit).toBe(git('rev-parse', 'HEAD'));
+  expect(execFileSync('git', ['-C', join(out, 'app'), 'for-each-ref'], { encoding: 'utf8' })).not.toContain('cook-selected');
+  expect(execFileSync('find', [unrelated, '-type', 'f', '-exec', 'sha256sum', '{}', '+'], { encoding: 'utf8' })).toBe(before);
+});
+
+test('R3-3 reviewer template cannot overwrite selected node, even before confirmation', () => {
+  const original = readFileSync(node, 'utf8');
+  writeFileSync(recipe, JSON.stringify({ name: 'Fixture', agent: { systemPrompt: 'x' }, containerTemplateFiles: [{ hostPath: 't.tmpl', inContainer: '/.cook-engines/bin/node', template: 'hello-template' }] }));
+  const result = install();
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain('E_HOST_ENGINE_RESERVED:');
+  expect(result.stdout).not.toContain('Host install plan');
+  expect(existsSync(out)).toBe(false);
+  expect(readFileSync(node, 'utf8')).toBe(original);
+});
+
+for (const config of ['safe.bareRepository=explicit', 'clone.defaultRemoteName=upstream', 'clone.rejectShallow=true']) test(`R3-6 git ${config} permits selected install`, () => {
+  const configFile = join(dir, 'gitconfig');
+  const [key, value] = config.split('=');
+  execFileSync('git', ['config', '--file', configFile, key!, value!]);
+  const result = install(true, {
+    ...process.env, GIT_CONFIG_GLOBAL: configFile,
+    // Scratch ref updates need an identity; never infer it via hostname/DNS
+    // or depend on user.email from the machine's replaced global config.
+    GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid',
+    GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.invalid',
+  });
+  expect(result.status).toBe(0);
+  expect(execFileSync('git', ['-C', join(out, 'app'), 'remote', 'get-url', 'origin'], { encoding: 'utf8' }).trim()).toBe(repo);
+});
+
+test('R3-6 SHA-256 host repositories refuse with an explicit unsupported error', () => {
+  rmSync(repo, { recursive: true }); mkdirSync(repo);
+  git('init', '--object-format=sha256', '-b', 'main');
+  writeFileSync(join(repo, 'package.json'), JSON.stringify({ engines: { bun: '*', node: '*' } }));
+  git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'add', '.');
+  git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'sha256');
+  const result = install();
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain('E_HOST_ENGINE_OBJECT_FORMAT: SHA-256 host repositories are unsupported');
+  expect(existsSync(out)).toBe(false);
+});
+
+for (const size of [40, 64]) test(`R3-7 unadvertised full ${size}-hex SHA stays FETCH without a ref probe`, () => {
+  const tools = join(dir, 'tools'); mkdirSync(tools); const trace = join(dir, 'git.trace');
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+  script(join(tools, 'git'), `echo "$*" >> '${trace}'
+    if [ "$2" = fetch ]; then exit 1; fi
+    if [ "$2" = ls-remote ]; then exit 2; fi
+    exec '${realGit}' "$@"`);
+  const old = process.env.PATH;
+  try {
+    process.env.PATH = tools + ':' + old;
+    expect(() => preflight('a'.repeat(size))).toThrow('E_HOST_ENGINE_FETCH:');
+  } finally { process.env.PATH = old; }
+  expect(readFileSync(trace, 'utf8')).not.toContain('ls-remote');
+});
+
+test('R3-4 declining a changed install leaves the prior lock unmarked', () => {
+  const env = { ...process.env, PATH: dir + ':' + process.env.PATH };
+  expect(install(false, env).status).toBe(0);
+  const before = readFileSync(join(out, 'connectome.lock'), 'utf8');
+  const result = spawnSync(process.execPath, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, '--ch-ref', 'missing', '--no-prompts'], { encoding: 'utf8', env });
+  expect(result.status).toBe(1);
+  expect(readFileSync(join(out, 'connectome.lock'), 'utf8')).toBe(before);
+});
+
+test('R3-1 lock records the engine observed from the host, not the preflight canonical path', () => {
+  const first = join(dir, 'first'), second = join(dir, 'second');
+  script(second, 'if [ "$1" = --version ]; then echo 1.4.4; else echo built > builds; fi');
+  script(first, `echo 1.4.4; ln -sf '${second}' '${bun}'`);
+  rmSync(bun); symlinkSync(first, bun);
+  const result = install(); expect(result.status).toBe(0);
+  const lock = JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8'));
+  expect(lock.engines.bun).toEqual({ path: bun, realPath: second, version: '1.4.4' });
+  expect(lock.engines.node.version).toBe('22.23.3');
+});
+
+test('R3-7 failed component build change marks the lock and retry rebuilds the previously reused host', () => {
+  const fail = join(dir, 'fail');
+  const writeRecipe = (run: string) => writeFileSync(recipe, JSON.stringify({ name: 'Fixture', agent: { systemPrompt: 'x' }, mcpServers: { fixture: { command: 'node', source: { url: repo, install: { kind: 'custom', run, runtime: 'custom' } } } } }));
+  const env = { ...process.env, PATH: dir + ':' + process.env.PATH };
+  writeRecipe('echo old > built'); expect(install(false, env).status).toBe(0);
+  writeFileSync(join(out, 'app', 'stale'), 'stale'); writeFileSync(fail, 'fail');
+  writeRecipe(`test ! -e '${fail}' && echo new > built`);
+  expect(install(false, env).status).toBe(3);
+  expect(JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8')).incomplete).toBe(true);
+  rmSync(fail);
+  const retry = install(false, env); expect(retry.status).toBe(0);
+  expect(retry.stdout).not.toContain('unchanged');
+  expect(existsSync(join(out, 'app', 'stale'))).toBe(false);
+  expect(readFileSync(join(out, 'repo', 'built'), 'utf8').trim()).toBe('new');
 });

@@ -310,6 +310,10 @@ function launchFromLock(dir: string, passthroughArgs: string[]): Promise<number>
     log.error(`${dir}: no ${LOCKFILE_NAME} — nothing to launch`);
     return Promise.resolve(1);
   }
+  if (lock.incomplete) {
+    log.error(`${dir}: last install failed; re-run \`cook install\``);
+    return Promise.resolve(1);
+  }
   let command: string;
   let args: string[];
   const cwd = dir;
