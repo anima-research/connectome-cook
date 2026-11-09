@@ -162,6 +162,8 @@ under the install dir, resolves host requirements (probe + confirm), writes
 the lowered configurations, a sourceable .env, a run.sh launcher, and
 ${log.dim('connectome.lock')}.  Re-running reconciles: components unchanged in the
 lock are kept, everything else is re-cloned.
+COOK_PASS_ENV selects extra parent environment names (comma/space-separated)
+for build tools without persisting their values.
 
 ${log.bold('SAFETY:')} unlike \`cook build\`, install commands run ON THIS MACHINE.
 The full action plan is printed and confirmed first.  Non-interactive runs

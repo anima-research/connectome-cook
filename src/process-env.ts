@@ -58,7 +58,7 @@ export function gitEnvironment(base = processAllowlistEnv(), excluded: Iterable<
   // Explicit build opt-ins must not redirect Git repositories or bypass its
   // separate authentication/configuration policy. Re-add Git's channels below.
   for (const key of Object.keys(env)) {
-    if (/^(?:GIT_|GCM_)/.test(key) || [
+    if (/^GCM_/.test(key) || [
       'GH_TOKEN', 'GITHUB_TOKEN', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR',
       'XDG_CONFIG_HOME', 'SSH_ASKPASS', 'COOK_PASS_ENV',
     ].includes(key)) delete env[key];

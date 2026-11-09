@@ -958,3 +958,10 @@ test('R1-8: build failures explain the environment migration', () => {
   expect(result.stdout + result.stderr).toContain('build failed');
   expect(result.stdout + result.stderr).toContain('COOK_PASS_ENV');
 });
+
+test('R1-8: merged install help retains the explicit environment migration hint', () => {
+  const result = run('install', undefined, ['--help']);
+  expect(result.status).toBe(0);
+  expect(result.stdout).toContain('COOK_PASS_ENV selects extra parent environment names');
+  expect(gitCalls()).toBe('');
+});
