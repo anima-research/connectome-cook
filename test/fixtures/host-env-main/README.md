@@ -18,5 +18,3 @@ bun -e 'import { cases, materialize } from "./src/test-support/host-env-equivale
 for (const name of cases) await Bun.write(`test/fixtures/host-env-main/${name}.json`,
   JSON.stringify(materialize(`${process.cwd()}/.cache/c-up916/bin/cook`, name), null, 2) + "\n");'
 ```
-
-Run the capture and tests inside the dispatch's memory-limited user scope.
