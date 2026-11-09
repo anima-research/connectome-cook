@@ -1,3 +1,5 @@
+import { PinnedCommands } from '../pinned-commands.js';
+import { applyHostDependencies, assertHostDependencyReinstall, parseHostDependencies, preflightHostDependencies, verifyHostDependencyResolutions, type LockedHostDependency } from '../host-dependency.js';
 /**
  * Host backend — materializes an InstallPlan directly onto the operator's
  * machine instead of into a docker image. This is the "link against the
@@ -33,7 +35,7 @@
  */
 
 import { execFileSync, execSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
 import { knownSecretEnvironmentNames, sourceGitEnvironment, processAllowlistEnv } from '../process-env.js';
@@ -59,9 +61,22 @@ import {
   type Lockfile,
   type LockedComponent,
 } from '../lockfile.js';
+import { renderUserUnit, validateUserUnit } from '../host-unit.js';
+import { assertHostEnginePath } from '../host-engine-path.js';
+import type { HostEngines, HostEnginePreflight } from '../host-engines.js';
 import type { BuildResult } from './docker.js';
 
 export interface HostBackendOptions {
+  /** Repeatable name=absolute-archive#sha256=hex inputs. */
+  hostDependencies?: string | string[];
+  /** Explicitly restore the unmodified host dependency declarations. */
+  dropHostDependencies?: boolean;
+  /** Export a static user unit under the installation; never install/start it. */
+  userUnit?: string;
+  /** Both absolute paths opt into fail-closed host engine validation. */
+  bunPath?: string;
+  /** Absolute Node path, required together with bunPath. */
+  nodePath?: string;
   /** Install root. Default: ~/.connectome/installs/<slug>. */
   installDir: string;
   /** Non-interactive mode (no prompts at all). */
@@ -199,8 +214,15 @@ export function planHostActions(plan: InstallPlan, options: HostBackendOptions):
   return { clones, copies, skipped, localExtensionPaths };
 }
 
+/** Bind the host install command by role, independently of planner ordering. */
+export function bindHostEngine(actions: HostActions, bunPath: string): void {
+  const host = actions.clones.find(action => action.role === 'connectome-host');
+  if (!host) throw new Error('E_HOST_ENGINE_PLAN: connectome-host clone is missing');
+  host.buildCommand = shellQuote(bunPath) + ' install';
+}
+
 /** Render the confirm-gate preview. Pure (string). */
-export function renderActionPreview(actions: HostActions, options: HostBackendOptions): string {
+export function renderActionPreview(actions: HostActions, options: HostBackendOptions, dependencies: LockedHostDependency[] = []): string {
   const lines: string[] = [];
   lines.push(`Host install plan → ${options.installDir}`);
   lines.push('');
@@ -211,6 +233,7 @@ export function renderActionPreview(actions: HostActions, options: HostBackendOp
     if (c.buildCommand) lines.push(`      then run: ${c.buildCommand}`);
     if (c.authSecret) lines.push(`      (private clone: token from $${c.authSecret})`);
   }
+  for (const d of dependencies) lines.push(`  - REPLACE dependency ${d.name} ${d.originalRange} → ${d.packageJsonDelta.direct.after} (sha256 ${d.sha256.slice(0, 12)}…) + same-name ${d.packageJsonDelta.override.section}`);
   for (const c of actions.copies) {
     lines.push(`  - COPY ${c.from} → ${c.target} (sibling checkout)`);
   }
@@ -242,7 +265,7 @@ export function isSatisfiedByLock(
   action: CloneAction,
   lock: Lockfile | null,
 ): boolean {
-  if (!lock || !existsSync(action.target)) return false;
+  if (!lock || lock.incomplete || !existsSync(action.target)) return false;
   if (action.role === 'connectome-host') {
     return lock.connectomeHost.url === action.url
       && lock.connectomeHost.ref === action.ref
@@ -256,62 +279,117 @@ export function isSatisfiedByLock(
     && (action.commit === undefined || entry.commit === action.commit);
 }
 
+/** Opt-in inputs for one clone+build action. */
+interface CloneContext {
+  /** Scratch store holding the commit engine preflight inspected. */
+  sourceDir?: string | undefined;
+  /** Runs once the checkout exists, before anything is written into or installed in it. */
+  beforeBuild?: (() => void) | undefined;
+  dependencies?: LockedHostDependency[] | undefined;
+  onDependencyMutation?: (() => void) | undefined;
+  /** Checkout staged by dependency preflight; takes precedence over sourceDir. */
+  preparedCheckout?: string | undefined;
+  commands?: PinnedCommands | undefined;
+  excluded?: Iterable<string>;
+  /** Operator-selected Bun for the host install; PATH lookup otherwise. */
+  bun?: string | undefined;
+}
+
 /** Execute one clone+build action. Throws on failure; the caller removes
  *  the target on failure so no half-built checkout survives. */
-function executeClone(action: CloneAction, buildEnv: NodeJS.ProcessEnv, values: Record<string, string>, excluded: Iterable<string>): { commit?: string } {
-  rmSync(action.target, { recursive: true, force: true });
-  mkdirSync(resolve(action.target, '..'), { recursive: true });
-
-  const gitEnv = sourceGitEnvironment(action.url, action.authSecret, values, action.key, buildEnv, excluded);
-  // Credential helpers and Git trace settings may echo the header. Never relay
-  // private acquisition output or the original exec error (which includes it).
-  const git = (args: string[], cwd?: string): string => {
+async function executeClone(
+  action: CloneAction, values: Record<string, string>, buildEnv: NodeJS.ProcessEnv, context: CloneContext = {},
+): Promise<{ commit?: string }> {
+  const { beforeBuild, dependencies, onDependencyMutation, preparedCheckout, commands } = context;
+  // A dependency preflight checkout already holds the inspected commit.
+  const sourceDir = preparedCheckout ? undefined : context.sourceDir;
+  const env = sourceGitEnvironment(action.url, action.authSecret, values, action.key, buildEnv, context.excluded);
+  const git = async (args: string[], cwd?: string): Promise<string> => {
     try {
-      return execFileSync('git', args, {
-        ...(cwd ? { cwd } : {}), env: gitEnv, encoding: 'utf-8',
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      return commands ? await commands.run('git', args, cwd ?? process.cwd(), false, env)
+        : execFileSync('git', args, { env, cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     } catch (err) {
       const { status, code } = err as { status?: number; code?: string };
       throw new Error(`${action.key}: git ${args[0]} failed (${status ?? code ?? 'unknown'}); Git output withheld to protect credentials.`);
     }
   };
-  const sslArgs = action.sslBypass ? ['-c', 'http.sslVerify=false'] : [];
-  log.step(`cloning ${log.dim(action.url)}${action.ref !== 'main' ? `@${action.ref}` : ''} → ${log.dim(action.target)}`);
-  git([...sslArgs, 'clone', action.url, action.target]);
-  if (action.commit) {
-    // Pinned build: check out the exact SHA the operator resolved at cook
-    // time, regardless of where the branch tip has moved since. A refspec
-    // pin (refs/merge-requests/*, refs/pull/*) isn't fetched by the plain
-    // clone — fetch the ref first so the SHA exists in the object store.
-    if (action.ref.startsWith('refs/')) {
-      git(['fetch', 'origin', action.ref], action.target);
-    }
-    git(['checkout', action.commit], action.target);
-  } else if (action.ref && action.ref !== 'main') {
-    if (action.ref.startsWith('refs/')) {
-      git(['fetch', 'origin', `${action.ref}:cook-install-checkout`], action.target);
-      git(['checkout', 'cook-install-checkout'], action.target);
+  rmSync(action.target, { recursive: true, force: true });
+  mkdirSync(resolve(action.target, '..'), { recursive: true });
+
+  if (preparedCheckout) {
+    log.step(`using preflight checkout → ${log.dim(action.target)}`);
+    cpSync(preparedCheckout, action.target, { recursive: true });
+    // Populate files only after confirmation; preflight reads Git objects, not a worktree.
+    await git(['checkout', '--detach', action.commit!], action.target);
+  } else {
+    const sslArgs = action.sslBypass ? ['-c', 'http.sslVerify=false'] : [];
+    log.step(`${sourceDir ? 'materializing inspected host from local scratch for' : 'cloning'} ${log.dim(action.url)}${action.ref !== 'main' ? `@${action.ref}` : ''} → ${log.dim(action.target)}`);
+    if (sourceDir) {
+      const localGit = (args: string[], step: string) => {
+        try { execFileSync('git', args, { env, stdio: ['ignore', 'pipe', 'pipe'] }); }
+        catch { throw new Error(`E_HOST_ENGINE_CLONE: git ${step} failed`); }
+      };
+      localGit(['clone', '--origin', 'origin', '--no-reject-shallow', '--no-hardlinks', '--branch', 'cook-selected', '--', sourceDir, action.target], 'clone inspected source');
+      localGit(['-C', action.target, 'remote', 'set-url', 'origin', action.url], 'set-url origin');
     } else {
-      git(['checkout', action.ref], action.target);
+      await git([...sslArgs, 'clone', action.url, action.target]);
+    }
+    if (action.commit) {
+      // Pinned build: check out the exact SHA the operator resolved at cook
+      // time, regardless of where the branch tip has moved since. A refspec
+      // pin (refs/merge-requests/*, refs/pull/*) isn't fetched by the plain
+      // clone — fetch the ref first so the SHA exists in the object store.
+      if (!sourceDir && action.ref.startsWith('refs/')) {
+        await git(['fetch', 'origin', action.ref], action.target);
+      }
+      if (sourceDir) {
+        try { execFileSync('git', ['checkout', action.commit], { env, cwd: action.target, stdio: ['ignore', 'pipe', 'pipe'] }); }
+        catch { throw new Error('E_HOST_ENGINE_CHECKOUT: git checkout inspected commit failed'); }
+      } else {
+        await git(['checkout', action.commit], action.target);
+      }
+    } else if (action.ref && action.ref !== 'main') {
+      if (action.ref.startsWith('refs/')) {
+        await git(['fetch', 'origin', `${action.ref}:cook-install-checkout`], action.target);
+        await git(['checkout', 'cook-install-checkout'], action.target);
+      } else {
+        await git(['checkout', action.ref], action.target);
+      }
     }
   }
+  if (sourceDir) {
+    try {
+      execFileSync('git', ['branch', '-D', 'cook-selected'], { env, cwd: action.target, stdio: 'pipe' });
+      execFileSync('git', ['update-ref', '-d', 'refs/remotes/origin/cook-selected'], { env, cwd: action.target, stdio: 'pipe' });
+    } catch { throw new Error('E_HOST_ENGINE_CLONE: removing synthetic refs failed'); }
+  }
+
   let commit: string | undefined;
   try {
-    const head = git(['rev-parse', 'HEAD'], action.target).trim();
-    if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(head)) commit = head;
+    commit = commands ? await commands.run('git', ['rev-parse', 'HEAD'], action.target, false, env)
+      : execFileSync('git', ['rev-parse', 'HEAD'], { env, cwd: action.target }).toString().trim();
   } catch {
     // Non-fatal — lock entry just omits the commit.
   }
 
+  beforeBuild?.();
+  if (dependencies?.length) {
+    applyHostDependencies(action.target, dependencies);
+    onDependencyMutation?.();
+  }
   if (action.buildCommand) {
     log.step(`building ${log.dim(action.target)}: ${action.buildCommand}`);
-    execSync(action.buildCommand, {
+    // The fixed host build needs no shell: Bun itself must be the direct child
+    // so PID-only cancellation stops it, without signaling any helpers.
+    if (commands && action.role === 'connectome-host') await commands.run(context.bun ?? 'bun', ['install'], action.target, true, buildEnv);
+    else if (commands) await commands.run('/bin/sh', ['-c', action.buildCommand], action.target, true, buildEnv);
+    else execSync(action.buildCommand, {
       cwd: action.target,
       stdio: ['ignore', 'inherit', 'inherit'],
       env: buildEnv,
     });
   }
+  if (dependencies?.length) verifyHostDependencyResolutions(action.target, dependencies);
   return { ...(commit !== undefined ? { commit } : {}) };
 }
 
@@ -376,7 +454,7 @@ export interface LauncherEnvsubst {
 
 export function renderLauncher(
   parentRecipeBasename: string,
-  opts: { hasSidecars: boolean; envsubstFiles: LauncherEnvsubst[] },
+  opts: { hasSidecars: boolean; envsubstFiles: LauncherEnvsubst[]; engines?: HostEngines },
 ): string {
   const lines = [
     '#!/usr/bin/env bash',
@@ -387,6 +465,11 @@ export function renderLauncher(
     '  set -a; . ./.env; set +a',
     'fi',
   ];
+  if (opts.engines) {
+    // Match selected-engine builds without importing unrelated engine siblings.
+    // PWD is the install root here; .env has already been sourced.
+    lines.push('export PATH="$PWD/.cook-engines/bin${PATH:+:$PATH}"');
+  }
   if (opts.hasSidecars) {
     lines.push(
       '',
@@ -421,7 +504,7 @@ export function renderLauncher(
     'export DATA_DIR="${DATA_DIR:-$PWD/data}"',
     'mkdir -p "$DATA_DIR"',
     'cd app',
-    `exec bun src/index.ts "../recipes/${parentRecipeBasename}" "$@"`,
+    `exec ${opts.engines ? shellQuote(opts.engines.bun.path) : "bun"} src/index.ts "../recipes/${parentRecipeBasename}" "$@"`,
     '',
   );
   return lines.join('\n');
@@ -432,7 +515,6 @@ export async function runHostBackend(
   plan: InstallPlan,
   options: HostBackendOptions,
 ): Promise<BuildResult> {
-  const installDir = options.installDir;
   const excluded = knownSecretEnvironmentNames(plan);
   // Preflight every source before previewing URLs or making any changes.
   assertCredentialFreeSourceUrl(options.chRepoUrl, '--ch-repo');
@@ -440,9 +522,115 @@ export async function runHostBackend(
     assertCredentialFreeSourceUrl(source.url, `${sourceLocation(source)}.url`);
     sourceGitEnvironment(source.url, source.authSecret, plan.values, sourceLocation(source), undefined, excluded);
   }
-  // No requirements, env-file values, runtime substitutions or authSecret
-  // values are injected. Explicit opt-ins always read the operator's parent.
+  if (options.userUnit !== undefined) {
+    if (!options.bunPath || !options.nodePath) throw new Error('E_HOST_UNIT: --user-unit requires both --bun-path and --node-path');
+    validateUserUnit(options.userUnit);
+    renderUserUnit(options.installDir, options.userUnit);
+  }
+  // Keep signal handling opt-in: the flagless backend remains unchanged.
+  if (options.hostDependencies === undefined) return runWithSelectedEngines(plan, options);
+  const commands = new PinnedCommands();
+  let removeStaging = () => {};
+  let signalExit: Promise<void> | undefined;
+  const signals = ['SIGINT', 'SIGTERM'] as const;
+  const detach = () => signals.forEach((signal, i) => process.off(signal, handlers[i]!));
+  const handlers = signals.map(signal => () => {
+    if (signalExit) return;
+    signalExit = (async () => {
+      try {
+        await commands.cancel(signal);
+      } catch { /* Best-effort cleanup must never swallow the original signal. */ }
+      finally {
+        try { removeStaging(); }
+        catch { /* Cleanup failure must not replace the signal exit. */ }
+        finally {
+          detach();
+          process.kill(process.pid, signal);
+        }
+      }
+    })();
+  });
+  signals.forEach((signal, i) => process.on(signal, handlers[i]!));
+  try {
+    return await runWithSelectedEngines(plan, options, cleanup => { removeStaging = cleanup; }, commands);
+  } finally {
+    if (signalExit) await signalExit;
+    try { removeStaging(); }
+    finally { detach(); }
+  }
+}
+
+/** Inspect operator-selected engines, if any, before anything is materialized. */
+async function runWithSelectedEngines(
+  plan: InstallPlan, options: HostBackendOptions, onStaged?: (cleanup: () => void) => void, commands?: PinnedCommands,
+): Promise<BuildResult> {
+  if (options.bunPath !== undefined || options.nodePath !== undefined) {
+    if (!options.bunPath || !options.nodePath) throw new Error('E_HOST_ENGINE_PATH: both --bun-path and --node-path are required');
+    assertHostEnginePath(resolve(options.installDir));
+    const { preflightHostEngines } = await import('../host-engines.js').catch(() => {
+      throw new Error('E_HOST_ENGINE_DEPENDENCY: cannot load engine preflight dependencies; run bun install');
+    });
+    let removeScratch = () => {};
+    const signals = ['SIGINT', 'SIGTERM'] as const;
+    const cleanup = () => {
+      removeScratch();
+      signals.forEach((signal, i) => process.off(signal, handlers[i]!));
+    };
+    const handlers = signals.map(signal => () => { cleanup(); process.kill(process.pid, signal); });
+    signals.forEach((signal, i) => process.on(signal, handlers[i]!));
+    try {
+      const checked = preflightHostEngines(options.chRepoUrl, options.chCommit ?? options.chRef, options.bunPath, options.nodePath, cleanup => { removeScratch = cleanup; });
+      options = { ...options, chRepoUrl: checked.sourceUrl, chCommit: checked.commit };
+      return await materializeHost(plan, options, checked, onStaged, commands);
+    } finally {
+      // Sync git/build subprocesses defer JS signal delivery. Drain pending
+      // signals before unregistering handlers (and before CLI process.exit).
+      await new Promise<void>(resolve => setImmediate(resolve));
+      cleanup();
+    }
+  }
+  return materializeHost(plan, options, undefined, onStaged, commands);
+}
+
+/** Materialization starts only after engine inspection has succeeded. */
+async function materializeHost(
+  plan: InstallPlan,
+  options: HostBackendOptions,
+  checked?: HostEnginePreflight,
+  onStaged?: (cleanup: () => void) => void,
+  commands?: PinnedCommands,
+): Promise<BuildResult> {
+  let installDir = options.installDir;
+  const dependencyInputs = parseHostDependencies(options.hostDependencies);
+  let engines = checked?.engines;
   const buildEnv = processAllowlistEnv();
+  let existingLock: Lockfile | null = null;
+  try {
+    existingLock = readLockfile(installDir);
+  } catch (err) {
+    log.warn(`existing ${LOCKFILE_NAME} unreadable (${err instanceof Error ? err.message : String(err)}) — treating as fresh install`);
+  }
+
+  const hasRecordedPins = assertHostDependencyReinstall(installDir, existingLock?.hostDependencies, dependencyInputs, options.dropHostDependencies);
+  const dependencies = dependencyInputs.length ? await preflightHostDependencies(options.chRepoUrl, options.chCommit ?? options.chRef, dependencyInputs, installDir, onStaged, commands) : undefined;
+  if (dependencies) {
+    installDir = dependencies.installDir;
+    options = { ...options, installDir, chCommit: dependencies.commit };
+    // Engine preflight checked the spelling the operator typed, before symlinks resolved.
+    if (engines) assertHostEnginePath(installDir);
+  }
+  const userUnit = options.userUnit !== undefined ? renderUserUnit(installDir, options.userUnit) : undefined;
+  let keepSnapshots = false;
+  let completed = false;
+  const cleanup = () => {
+    dependencies?.cleanup();
+    if (!completed) {
+      if (keepSnapshots) rmSync(join(installDir, 'app'), { recursive: true, force: true });
+      dependencies?.discardNew();
+    }
+  };
+  if (dependencies) onStaged?.(cleanup);
+  try {
   const parent = plan.parentWalk.recipe;
   const hasSidecars = (parent.services ?? []).length > 0;
 
@@ -460,15 +648,53 @@ export async function runHostBackend(
   }
 
   const actions = planHostActions(plan, options);
-  let existingLock: Lockfile | null = null;
-  try {
-    existingLock = readLockfile(installDir);
-  } catch (err) {
-    log.warn(`existing ${LOCKFILE_NAME} unreadable (${err instanceof Error ? err.message : String(err)}) — treating as fresh install`);
+  if (dependencies) {
+    const inputRoot = join(installDir, 'host-inputs');
+    const targets = [...actions.clones.map(a => a.target), ...actions.copies.map(a => a.target),
+      ...runtimeFiles.map(f => f.kind === 'sidecar-template' ? resolve(installDir, f.relPath) : hostPathFor(installDir, f.inContainer!))];
+    if (targets.some(target => target === inputRoot || target.startsWith(inputRoot + '/') || inputRoot.startsWith(target + '/'))) {
+      throw new Error('E_HOST_DEPENDENCY_OVERLAP: recipe target overlaps host inputs');
+    }
   }
+  const reserved = resolve(installDir, '.cook-engines');
+  const refuseReserved = (target: string) => {
+    const path = resolve(target);
+    if (path === reserved || path.startsWith(reserved + '/')) {
+      throw new Error('E_HOST_ENGINE_RESERVED: clone, copy and template targets must not use .cook-engines');
+    }
+  };
+  for (const action of [...actions.clones, ...actions.copies]) refuseReserved(action.target);
+  for (const file of runtimeFiles) {
+    refuseReserved(file.kind === 'sidecar-template'
+      ? join(installDir, file.relPath) : hostPathFor(installDir, file.inContainer!));
+  }
+  if (engines) bindHostEngine(actions, engines.bun.path);
+
+  const existingLockOnDisk = existingLock;
+  // Preserve the operator hint separately from clone reuse invalidation.
+  const previousUserUnit = existingLock?.launch.kind === 'script' ? existingLock.launch.userUnit : undefined;
+  if (previousUserUnit && (options.userUnit === undefined || !engines)) {
+    log.warn('previously exported user unit may still be installed and launches this run.sh; '
+      + (engines
+        ? 'no --user-unit supplied: export is not refreshed; review installed copies'
+        : 'selected engines are being removed: installed copies may fail or use unvalidated PATH engines; review or disable them'));
+  }
+  const userUnitHint = userUnit !== undefined ? join(installDir, options.userUnit!)
+    : engines ? previousUserUnit : undefined;
+
+  const engineBindingChanged = JSON.stringify(existingLock?.engines) !== JSON.stringify(engines);
+  // A host carrying (or shedding) pinned inputs is rebuilt even when its clone matches the lock.
+  const rebuildHost = dependencies || (options.dropHostDependencies && hasRecordedPins) || existingLock?.hostDependencies?.length;
+  const canReuse = (action: CloneAction) => !(action.role === 'connectome-host' && rebuildHost) && isSatisfiedByLock(action, existingLock);
+  // Mark the disk lock incomplete before destructive work if ANY clone
+  // cannot be reused. Otherwise an interrupted ref/build/engine change could leave an
+  // old lock authorizing a newly built checkout on the next run.
+  const invalidateLock = !existingLock || engineBindingChanged
+    || actions.clones.some(action => !canReuse(action));
+  if (engineBindingChanged) existingLock = null;
 
   // ---- Confirm gate: commands run on the operator's machine. ----
-  process.stdout.write(renderActionPreview(actions, options) + '\n\n');
+  process.stdout.write(renderActionPreview(actions, options, dependencies?.records) + '\n\n');
   if (options.noPrompts) {
     if (!options.yes) {
       log.error('host install runs commands on this machine; non-interactive mode requires --yes');
@@ -487,22 +713,56 @@ export async function runHostBackend(
     }
   }
 
+  dependencies?.materialize();
+  if (invalidateLock && existingLockOnDisk) writeLockfile(installDir, { ...existingLockOnDisk, incomplete: true });
+
   mkdirSync(installDir, { recursive: true });
   mkdirSync(join(installDir, 'recipes'), { recursive: true });
+  const engineRoot = join(installDir, '.cook-engines');
+  // Also remove links left by a failed selected-engine install with no lock.
+  rmSync(engineRoot, { recursive: true, force: true });
+  if (engines) {
+    const binDir = join(engineRoot, 'bin');
+    mkdirSync(binDir, { recursive: true, mode: 0o700 });
+    symlinkSync(engines.bun.path, join(binDir, 'bun'));
+    symlinkSync(engines.node.path, join(binDir, 'node'));
+    const { hostBuildPath } = await import('../host-engines.js');
+    buildEnv.PATH = hostBuildPath(binDir, buildEnv.PATH);
+  }
 
   // ---- Clone + build components (idempotent against the lock). ----
   const lockedComponents: LockedComponent[] = [];
   let chCommit: string | undefined;
   for (const action of actions.clones) {
+    if (checked) await new Promise<void>(r => setImmediate(r));
+    const recheck = action.role === 'connectome-host' && checked
+      ? () => { engines = checked.recheck(action.target); } : undefined;
     let commit: string | undefined;
-    if (isSatisfiedByLock(action, existingLock)) {
+    if (canReuse(action)) {
+      try { recheck?.(); }
+      catch (err) {
+        // A directory-sensitive shim can change even on a reusable checkout.
+        if (existingLockOnDisk) writeLockfile(installDir, { ...existingLockOnDisk, incomplete: true });
+        log.error(err instanceof Error ? err.message : String(err));
+        return { exitCode: 3, outDir: installDir };
+      }
       log.info(`unchanged ${log.dim(action.key)} — kept (${log.dim(action.target)})`);
       commit = action.role === 'connectome-host'
         ? existingLock!.connectomeHost.commit
         : existingLock!.components.find((c) => c.key === action.key)?.commit;
     } else {
       try {
-        commit = executeClone(action, buildEnv, plan.values, excluded).commit;
+        const isHost = action.role === 'connectome-host';
+        commit = (await executeClone(action, plan.values, buildEnv, {
+          sourceDir: isHost ? checked?.sourceDir : undefined,
+          beforeBuild: recheck,
+          dependencies: isHost ? dependencies?.records : undefined,
+          onDependencyMutation: () => { keepSnapshots = true; },
+          preparedCheckout: isHost ? dependencies?.checkout : undefined,
+          commands,
+          excluded: knownSecretEnvironmentNames(plan),
+          bun: engines?.bun.path,
+        })).commit;
       } catch (err) {
         log.error(
           `install of ${action.key} failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -527,6 +787,10 @@ export async function runHostBackend(
       });
     }
   }
+
+  // Also drain signals delivered during the final synchronous build before
+  // publishing launch files or a successful lock.
+  if (checked) await new Promise<void>(r => setImmediate(r));
 
   // ---- Sibling copies (docker's context-COPY equivalent). ----
   for (const copy of actions.copies) {
@@ -590,6 +854,10 @@ export async function runHostBackend(
   try {
     for (const walk of plan.walks) {
       const configuration = lowerToConfiguration(walk.recipe, overlays.get(walk.path), walk.path);
+      if (engines) for (const server of Object.values(configuration.mcpServers ?? {})) {
+        if (server.command === 'node') server.command = engines.node.path;
+        if (server.command === 'bun') server.command = engines.bun.path;
+      }
       writeFileSync(
         join(installDir, 'recipes', recipeFilename(walk.path)),
         JSON.stringify(configuration, null, 2) + '\n',
@@ -687,20 +955,27 @@ export async function runHostBackend(
       );
     }
 
-    // Runtime artifacts deliberately retain upstream main's value-bag semantics.
-    // Git/build environment filtering must not change what a later launch sees.
     if (Object.keys(plan.values).length > 0) {
       writeFileSync(join(installDir, '.env'), renderShellEnvFile(plan.values), { mode: 0o600 });
     }
     writeFileSync(
       join(installDir, 'run.sh'),
-      renderLauncher(parentRecipeBasename, { hasSidecars, envsubstFiles }),
+      renderLauncher(parentRecipeBasename, { hasSidecars, envsubstFiles, engines }),
       { mode: 0o755 },
     );
+
+    if (userUnit !== undefined) {
+      const unitPath = join(installDir, options.userUnit!);
+      writeFileSync(unitPath, userUnit, { mode: 0o600 });
+      // writeFileSync's mode applies only to new files, not reconciled exports.
+      chmodSync(unitPath, 0o600);
+    }
 
     const lock: Lockfile = {
       version: 1,
       backend: 'host',
+      ...(dependencies ? { hostDependencies: dependencies.records } : {}),
+      ...(engines ? { engines } : {}),
       recipePath: plan.recipePath,
       createdAt: new Date().toISOString(),
       connectomeHost: {
@@ -721,7 +996,7 @@ export async function runHostBackend(
         origin: r.origin,
         ...(r.value !== undefined ? { value: r.value } : {}),
       })),
-      launch: { kind: 'script', script: join(installDir, 'run.sh') },
+      launch: { kind: 'script', script: join(installDir, 'run.sh'), ...(userUnitHint !== undefined ? { userUnit: userUnitHint } : {}) },
     };
     writeLockfile(installDir, lock);
   } catch (err) {
@@ -732,5 +1007,9 @@ export async function runHostBackend(
   log.success(`host install complete → ${installDir}`);
   log.info('');
   log.info(`Next: ${log.bold(`${join(installDir, 'run.sh')}`)}`);
+  completed = true;
   return { exitCode: 0, outDir: installDir };
+  } finally {
+    cleanup();
+  }
 }

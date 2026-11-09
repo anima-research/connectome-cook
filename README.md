@@ -257,6 +257,9 @@ unchanged; its existing credentialed-remote persistence is not fixed here.
 
 A recipe tree whose agents all explicitly set `agent.provider` to `openai-codex` needs no implicit Anthropic credential. Trees containing an Anthropic agent, an omitted provider (which defaults to Anthropic), or an unknown provider retain the Anthropic requirement: either `ANTHROPIC_API_KEY` (a standard API key from [console.anthropic.com](https://console.anthropic.com/)) or `ANTHROPIC_AUTH_TOKEN` (a long-lived OAuth bearer token, sent by connectome-host as `Authorization: Bearer` instead of `x-api-key`). Cook's prompts, generated `.env.example`, and missing-value checks accept either — press Enter at the `ANTHROPIC_API_KEY` prompt to be offered the auth-token alternative. If both are set, connectome-host prefers the auth token. For every provider, when a recipe explicitly substitutes `${ANTHROPIC_API_KEY}` (or `${ANTHROPIC_AUTH_TOKEN}`) without a default, that exact name is required — connectome-host errors at startup on a missing `${VAR}` — so the other credential can't stand in for it. Default-valued references remain optional in Codex-only trees. Cook does not configure Codex authentication.
 
+Host installs: [operator-selected engine preflight](docs/host-engines.md) and
+[static systemd user-unit export](docs/host-user-unit.md).
+
 ## What gets generated
 
 ```
@@ -320,6 +323,10 @@ connectome-cook/
 ## Future home
 
 For now this lives in @Tengro's namespace. Once the CLI is meaningfully battle-tested against richer recipe trees (multi-source, BuildKit secrets, mixed install patterns), it'll be handed off to anima-research alongside connectome-host.
+
+Host installs: [hash-pinned local dependency inputs](docs/host-dependency.md).
+With `--host-dependency`, nested npm overrides (even unrelated ones) refuse
+before install writes; disjoint flat overrides and resolutions remain supported.
 
 ## License
 
