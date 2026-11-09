@@ -375,7 +375,13 @@ for (const config of ['safe.bareRepository=explicit', 'clone.defaultRemoteName=u
   const configFile = join(dir, 'gitconfig');
   const [key, value] = config.split('=');
   execFileSync('git', ['config', '--file', configFile, key!, value!]);
-  const result = install(true, { ...process.env, GIT_CONFIG_GLOBAL: configFile });
+  const result = install(true, {
+    ...process.env, GIT_CONFIG_GLOBAL: configFile,
+    // Scratch ref updates need an identity; never infer it via hostname/DNS
+    // or depend on user.email from the machine's replaced global config.
+    GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid',
+    GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.invalid',
+  });
   expect(result.status).toBe(0);
   expect(execFileSync('git', ['-C', join(out, 'app'), 'remote', 'get-url', 'origin'], { encoding: 'utf8' }).trim()).toBe(repo);
 });
