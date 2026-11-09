@@ -4,6 +4,7 @@ import { accessSync, constants, mkdtempSync, realpathSync, rmSync, statSync } fr
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { satisfies, valid, validRange } from 'semver';
+import { repositoryIndependentGitEnv } from './git-env.js';
 import { assertCredentialFreeSourceUrl } from './source-url.js';
 import { assertHostEnginePath } from './host-engine-path.js';
 
@@ -16,7 +17,7 @@ export function hostBuildPath(binDir: string, parentPath?: string): string {
   return [binDir, ...(parentPath?.split(':') ?? [])].filter(Boolean).join(':');
 }
 
-export function checkEngine(path: string, range: unknown, engine = 'engine'): HostEngine {
+export function checkEngine(path: string, range: unknown, engine = 'engine', cwd?: string): HostEngine {
   if (!isAbsolute(path) || /[\0\r\n]/.test(path)) {
     throw new Error(`E_HOST_ENGINE_PATH: ${engine} requires an absolute executable path`);
   }
@@ -35,7 +36,7 @@ export function checkEngine(path: string, range: unknown, engine = 'engine'): Ho
   let output: string;
   try {
     // Preserve argv[0] for multi-call shims. Never echo subprocess output.
-    output = execFileSync(path, ['--version'], { encoding: 'utf8', timeout: 10000, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    output = execFileSync(path, ['--version'], { encoding: 'utf8', timeout: 10000, cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   } catch { throw new Error(`E_HOST_ENGINE_EXEC: ${engine} --version failed (execution, timeout or non-zero exit)`); }
   const version = valid(output);
   if (!version) throw new Error(`E_HOST_ENGINE_VERSION: ${engine} returned an invalid version`);
@@ -52,6 +53,7 @@ export interface HostEnginePreflight {
   sourceDir: string;
   sourceUrl: string;
   cleanup: () => void;
+  recheck: (cwd: string) => HostEngines;
 }
 
 /** Fetch once, inspect without builds, and retain that exact object store for
@@ -62,11 +64,12 @@ export function preflightHostEngines(url: string, ref: string, bunPath: string, 
   // Git treats a colon before the first slash as a remote (including scp
   // host:path). Resolve only local spellings, as git clone does for origin.
   if (!isAbsolute(url) && !/^[^/]+:/.test(url)) url = process.cwd() + '/' + url;
+  const env = repositoryIndependentGitEnv();
   const scratch = mkdtempSync(join(tmpdir(), 'cook-engines-'));
   const cleanup = () => rmSync(scratch, { recursive: true, force: true });
   onScratch?.(cleanup);
-  const runGit = (args: string[]) => execFileSync('git', args, {
-    cwd: scratch, env: process.env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000,
+  const runGit = (args: string[]) => execFileSync('git', ['--git-dir=.', ...args], {
+    cwd: scratch, env: { ...env, LC_ALL: 'C' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000,
   }).trim();
   const timedOut = (err: unknown) => {
     const failure = err as { signal?: string; code?: string };
@@ -75,6 +78,9 @@ export function preflightHostEngines(url: string, ref: string, bunPath: string, 
   const git = (args: string[], code: string, step: string) => {
     try { return runGit(args); }
     catch (err) {
+      if (code === 'FETCH' && /mismatched algorithms|does not support.*hash algorithm/i.test(String((err as { stderr?: unknown }).stderr))) {
+        throw new Error('E_HOST_ENGINE_OBJECT_FORMAT: SHA-256 host repositories are unsupported');
+      }
       if (timedOut(err)) code = 'TIMEOUT';
       else if (code === 'FETCH' && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(ref)) {
         // A failed fetch alone cannot distinguish a missing ref from transport
@@ -89,7 +95,7 @@ export function preflightHostEngines(url: string, ref: string, bunPath: string, 
     }
   };
   try {
-    git(['init', '--bare', '.'], 'INIT', 'init');
+    git(['init', '--bare', '--object-format=sha1', '.'], 'INIT', 'init');
     git(['fetch', '--depth=1', '--', url, ref], 'FETCH', 'fetch');
     const commit = git(['rev-parse', 'FETCH_HEAD^{commit}'], 'COMMIT', 'rev-parse FETCH_HEAD');
     const json = git(['show', commit + ':package.json'], 'PACKAGE', 'show package.json');
@@ -98,6 +104,18 @@ export function preflightHostEngines(url: string, ref: string, bunPath: string, 
     catch { throw new Error('E_HOST_ENGINE_PACKAGE: invalid package.json'); }
     const engines = { bun: checkEngine(bunPath, pkg?.engines?.bun, 'bun'), node: checkEngine(nodePath, pkg?.engines?.node, 'node') };
     git(['update-ref', 'refs/heads/cook-selected', commit], 'COMMIT', 'update-ref cook-selected');
-    return { engines, commit, sourceDir: scratch, sourceUrl: url, cleanup };
+    const recheck = (cwd: string): HostEngines => {
+      const observed = {
+        bun: checkEngine(bunPath, pkg?.engines?.bun, 'bun', cwd),
+        node: checkEngine(nodePath, pkg?.engines?.node, 'node', cwd),
+      };
+      for (const engine of ['bun', 'node'] as const) {
+        if (observed[engine].version !== engines[engine].version) {
+          throw new Error(`E_HOST_ENGINE_CHANGED: ${engine} observed ${observed[engine].version} in host; preflight ${engines[engine].version}`);
+        }
+      }
+      return observed;
+    };
+    return { engines, commit, sourceDir: scratch, sourceUrl: url, cleanup, recheck };
   } catch (err) { cleanup(); throw err; }
 }

@@ -482,7 +482,7 @@ test('split failed first build resumes only the same layout', () => {
   expect(install(args).status).toBe(0);
 });
 
-test('split failed reinstall retires reuse lock and remains resumable', () => {
+test('split failed reinstall marks reuse lock incomplete and remains resumable', () => {
   const args = ['--layout', layoutFile(), '--bun-path', bun, '--node-path', node];
   expect(install(args).status).toBe(0);
   writeFileSync(join(repo, 'new-file'), 'changed');
@@ -490,7 +490,8 @@ test('split failed reinstall retires reuse lock and remains resumable', () => {
   execFileSync('git', ['commit', '-m', 'Change host'], { cwd: repo, stdio: 'pipe' });
   writeFileSync(bun, '#!/bin/sh\nif [ "$1" = --version ]; then echo 1.4.4; else exit 42; fi\n');
   expect(install(args).status).toBe(3);
-  expect(existsSync(join(out, 'connectome.lock'))).toBe(false);
+  expect(JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8')).incomplete).toBe(true);
+  expect(statSync(join(out, 'connectome.lock')).mode & 0o7777).toBe(0o600);
   expect(existsSync(join(out, 'run.sh'))).toBe(true);
   writeFileSync(bun, '#!/bin/sh\nif [ "$1" = --version ]; then echo 1.4.4; fi\n');
   expect(install(args).status).toBe(0);
@@ -704,4 +705,95 @@ test('R3-9 refuses unreleased raw-layout marker format', () => {
   expect(install(args).status).toBe(0);
   writeFileSync(join(out, '.cook-layout.json'), JSON.stringify(splitLayout()));
   expect(install(args).stderr).toContain('E_HOST_LAYOUT: unreadable runtime layout marker');
+});
+
+
+test('merge interaction: split unit launcher uses config env and runtime-only selected engine PATH from state cwd', () => {
+  const c = splitLayout();
+  const tools = join(dir, 'tools'); mkdirSync(tools);
+  writeFileSync(join(tools, 'probe-node'), '#!/usr/bin/env node\n', { mode: 0o755 });
+  writeFileSync(join(dir, 'probe-node'), '#!/bin/sh\necho WRONG_SIBLING\n', { mode: 0o755 });
+  writeFileSync(node, '#!/bin/sh\nif [ "$1" = --version ]; then echo v22.23.3; else printf "%s\\n" "$PWD" "$DATA_DIR" "$WORKSPACE_DIR" "$COOK_INTERACTION" "$PATH"; fi\n');
+  writeFileSync(bun, '#!/bin/sh\nif [ "$1" = --version ]; then echo 1.4.4; elif [ "$1" = install ]; then probe-node > ../build-path-probe; else exec probe-node; fi\n');
+  const original = JSON.parse(readFileSync(recipe, 'utf8'));
+  original.mcpServers.local.env = { COOK_INTERACTION: '${COOK_INTERACTION}' };
+  writeFileSync(recipe, JSON.stringify(original));
+  const envFile = join(dir, 'operator.env'); writeFileSync(envFile, 'COOK_INTERACTION=config-root\n');
+  const result = spawnSync(process.execPath, [resolve('bin/cook'), 'install', recipe, '--out', out,
+    '--ch-repo', repo, '--ch-ref', 'main', '--no-prompts', '--yes', '--layout', layoutFile(),
+    '--bun-path', bun, '--node-path', node, '--user-unit', 'example.service', '--env-file', envFile],
+    { encoding: 'utf8', env: { ...process.env, PATH: tools + ':' + process.env.PATH } });
+  if (result.status) console.error(result.stdout, result.stderr);
+  expect(result.status).toBe(0);
+  expect(readFileSync(join(out, 'build-path-probe'), 'utf8').split('\n')[0]).toBe(join(out, 'app'));
+  expect(readlinkSync(join(c.runtime, '.cook-engines/bin/node'))).toBe(node);
+  expect(existsSync(join(c.state, '.cook-engines'))).toBe(false);
+  const unit = readFileSync(join(out, 'example.service'), 'utf8');
+  expect(unit).toContain('WorkingDirectory=' + c.state + '\n');
+  expect(unit).toContain('ExecStart=/bin/bash "' + join(c.runtime, 'run.sh') + '" --headless');
+  // Upstream exports no EnvironmentFile: run.sh sources the shell-format env.
+  expect(unit).not.toContain('EnvironmentFile=');
+  expect(existsSync(join(c.runtime, '.env'))).toBe(false);
+  expect(readFileSync(join(c.config, '.env'), 'utf8')).toContain('COOK_INTERACTION');
+  const launched = spawnSync('/bin/bash', [join(out, 'run.sh'), '--headless'], {
+    cwd: c.state, encoding: 'utf8', env: { PATH: tools + ':/usr/bin:/bin', COOK_INTERACTION: 'manager-drop-in' },
+  });
+  expect(launched.status).toBe(0);
+  const lines = launched.stdout.trim().split('\n');
+  expect(lines.slice(0, 4)).toEqual([c.state, c.state, c.workspace, 'config-root']);
+  expect(lines[4]).toBe(join(c.runtime, '.cook-engines/bin') + ':' + tools + ':/usr/bin:/bin');
+});
+
+test('merge interaction: split engine change preserves private incomplete layout and unit hint, refuses run, rebuilds on retry', () => {
+  const c = splitLayout(), file = layoutFile();
+  const args = ['--layout', file, '--bun-path', bun, '--node-path', node];
+  expect(install([...args, '--user-unit', 'example.service']).status).toBe(0);
+  const otherNode = join(dir, 'other-node'); writeFileSync(otherNode, readFileSync(node), { mode: 0o755 });
+  args[args.length - 1] = otherNode;
+  writeFileSync(bun, '#!/bin/sh\nif [ "$1" = --version ]; then echo 1.4.4; else exit 42; fi\n');
+  expect(install(args).status).toBe(3);
+  const lockPath = join(out, 'connectome.lock');
+  const incomplete = JSON.parse(readFileSync(lockPath, 'utf8'));
+  expect(incomplete.incomplete).toBe(true);
+  expect(incomplete.layout).toEqual(c);
+  expect(incomplete.launch.userUnit).toBe(join(out, 'example.service'));
+  expect(statSync(lockPath).mode & 0o7777).toBe(0o600);
+  for (const runArgs of [[out], [recipe, '--out', out]]) {
+    const run = spawnSync(process.execPath, [resolve('bin/cook'), 'run', ...runArgs], { encoding: 'utf8' });
+    expect(run.status).toBe(1); expect(run.stderr).toContain('last install failed');
+  }
+  const marker = join(dir, 'rebuilt');
+  writeFileSync(bun, `#!/bin/sh\nif [ "$1" = --version ]; then echo 1.4.4; else touch '${marker}'; fi\n`);
+  expect(install(args).status).toBe(0);
+  expect(existsSync(marker)).toBe(true);
+  const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+  expect(lock.incomplete).toBeUndefined();
+  expect(lock.engines.node.path).toBe(otherNode);
+  expect(lock.layout).toEqual(c);
+  expect(lock.launch.userUnit).toBe(join(out, 'example.service'));
+});
+
+test('merge interaction: reusable split host rechecks cwd shim and atomically marks lock incomplete before refusing', () => {
+  const args = ['--layout', layoutFile(), '--bun-path', bun, '--node-path', node];
+  expect(install(args).status).toBe(0);
+  const build = join(dir, 'build-ran');
+  writeFileSync(bun, `#!/bin/sh\nif [ "$1" = --version ]; then echo 1.4.4; else touch '${build}'; fi\n`);
+  writeFileSync(node, `#!/bin/sh\nif [ "$PWD" = '${join(out, 'app')}' ]; then echo v20.0.0; else echo v22.23.3; fi\n`);
+  const lockPath = join(out, 'connectome.lock'), oldInode = statSync(lockPath).ino;
+  const result = install(args);
+  expect(result.status).toBe(3);
+  expect(result.stderr).toContain('E_HOST_ENGINE_RANGE');
+  expect(existsSync(build)).toBe(false);
+  expect(statSync(lockPath).ino).not.toBe(oldInode);
+  expect(statSync(lockPath).mode & 0o7777).toBe(0o600);
+  expect(JSON.parse(readFileSync(lockPath, 'utf8')).incomplete).toBe(true);
+});
+
+for (const target of ['host-inputs', 'host-inputs/nested']) test(`merge dependency interaction: split reserves retained input target ${target} without active pins`, () => {
+  const original = JSON.parse(readFileSync(recipe, 'utf8'));
+  original.mcpServers.local.source = { url: repo, install: { run: 'true', runtime: 'custom' }, inContainer: { path: '/' + target } };
+  writeFileSync(recipe, JSON.stringify(original));
+  const result = install(['--layout', layoutFile(), '--bun-path', bun, '--node-path', node]);
+  expect(result.status).toBe(1); expect(result.stderr).toContain('E_HOST_LAYOUT');
+  expect(result.stdout).not.toContain('Host install plan'); expect(existsSync(out)).toBe(false);
 });

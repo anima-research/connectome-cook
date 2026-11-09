@@ -113,10 +113,12 @@ This first opt-in supports standalone hosts: sidecars, container template files
 and legacy recipe credentialFiles refuse rather than leaving mutable files in
 the code tree. Use the default layout for those shapes. Changing or removing a recorded layout on reconcile refuses. The persistent
 runtime `.cook-layout.json` marker records `installing` after confirmation,
-before retiring any stale reuse lock or starting builds; only after the new lock
+before invalidating any stale reuse lock or starting builds; only after the new lock
 is durable does it become `installed`. An interrupted `installing` phase can
-resume with the exact same layout, even when lock retirement left no lock and
-an older launcher remains. No missing lock authorizes clone reuse.
+resume with the exact same layout, even after a failed first install left no
+lock. A failed reinstall keeps the prior lock marked `incomplete`, preserving
+layout, engine, dependency and unit metadata without authorizing clone reuse.
+Both `cook run` forms refuse an incomplete lock.
 Both marker and lock use same-directory temp files, fsync, atomic rename and
 parent-directory fsync. Malformed or unknown marker phases refuse.
 

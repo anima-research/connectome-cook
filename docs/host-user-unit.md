@@ -72,3 +72,15 @@ installed copies still launch the same run.sh, and removing selected engines can
 make them fail or use unvalidated PATH engines. Review or disable those copies.
 While engines remain selected, the existing hint is retained even without a new
 export; leaving selected engines drops the hint after the warning.
+
+With `--layout`, the exported unit instead uses the private **state** root as
+WorkingDirectory and still invokes the absolute **runtime** root's `run.sh`.
+The launcher sources **config**/.env (which still overrides a drop-in's
+EnvironmentFile), then binds DATA_DIR, WORKSPACE_DIR and the absolute recipe
+path to the declared roots. Cook does not emit an EnvironmentFile directive:
+its generated .env is shell syntax, not systemd environment-file syntax.
+The selected-engine bin directory stays under **runtime**/.cook-engines/bin;
+it is prepended before changing to state, never under state or workspace.
+Failed split reinstalls retain an atomically replaced private lock marked
+`incomplete`; both `cook run` forms refuse it, and a retry rebuilds rather than
+reusing interrupted work. Layout identity and exported-unit hints survive.
