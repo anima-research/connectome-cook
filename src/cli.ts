@@ -589,8 +589,10 @@ export async function main(argv: string[]): Promise<void> {
   }
 
   const commandArgs = argv.slice(1, argv.indexOf('--') === -1 ? undefined : argv.indexOf('--'));
-  if (first !== 'install' && commandArgs.some(arg => arg === '--host-dependency' || arg.startsWith('--host-dependency='))) {
-    throw new Error('--host-dependency is only supported by install');
+  for (const flag of ['--host-dependency', '--drop-host-dependencies']) {
+    if (first !== 'install' && commandArgs.some(arg => arg === flag || arg.startsWith(flag + '='))) {
+      throw new Error(`${flag} is only supported by install`);
+    }
   }
   const handler = SUBCOMMANDS[first];
   if (!handler) {

@@ -3,6 +3,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, lstatSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { createServer, type Socket } from 'node:net';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
@@ -428,7 +429,7 @@ test('R2-6 resolves same-user output links and previews the canonical path', () 
   const record = JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8')).hostDependencies[0];
   expect(record.snapshot).toBe(join(actual, 'new-install/host-inputs', digest + '.tgz'));
 });
-for (const owner of [0, 1003]) test(`R2-6 link owner ${owner} follows root/same-user trust policy`, () => {
+for (const owner of [0, 1003]) test(`R2-6 link owner ${owner} follows root/same-user trust policy`, async () => {
   const actual = join(dir, 'actual'); mkdirSync(actual);
   const link = join(dir, 'linked'); symlinkSync(actual, link);
   const original = fs.lstatSync;
@@ -437,11 +438,11 @@ for (const owner of [0, 1003]) test(`R2-6 link owner ${owner} follows root/same-
     if (String(path) === link) stat.uid = owner;
     return stat;
   }) as typeof fs.lstatSync);
-  let checked: ReturnType<typeof preflightHostDependencies> | undefined;
+  let checked: Awaited<ReturnType<typeof preflightHostDependencies>> | undefined;
   try {
-    const run = () => { checked = preflightHostDependencies(repo, 'main', parseHostDependencies(option()), join(link, 'install')); };
-    if (owner === 0) expect(run).not.toThrow();
-    else { expect(run).toThrow('E_HOST_DEPENDENCY_STORAGE'); expect(existsSync(join(actual, 'install'))).toBe(false); }
+    const run = async () => { checked = await preflightHostDependencies(repo, 'main', parseHostDependencies(option()), join(link, 'install')); };
+    if (owner === 0) await run();
+    else { await expect(run()).rejects.toThrow('E_HOST_DEPENDENCY_STORAGE'); expect(existsSync(join(actual, 'install'))).toBe(false); }
   } finally { spy.mockRestore(); checked?.cleanup(); }
 });
 test('R1-5 rejects an unsafe existing input directory before preview', () => {
@@ -492,31 +493,31 @@ test('R1-nit extended headers report the unsupported entry, not just valid ustar
   expect(() => archivePackage(gzipSync(tar([{ path: 'package/PaxHeader', type: 'x' }])))).toThrow('pax/extended header entry');
 });
 
-test('R1-5 unsupported platforms refuse read-only before staging or output', () => {
+test('R1-5 unsupported platforms refuse read-only before staging or output', async () => {
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
   try {
     Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
-    expect(() => preflightHostDependencies(repo, 'main', parseHostDependencies(option()), out)).toThrow('E_HOST_DEPENDENCY_STORAGE');
+    await expect(preflightHostDependencies(repo, 'main', parseHostDependencies(option()), out)).rejects.toThrow('E_HOST_DEPENDENCY_STORAGE');
     expect(existsSync(out)).toBe(false);
     expect(readdirSync(join(dir, 'staging'))).toEqual([]);
   } finally { Object.defineProperty(process, 'platform', platform); }
 });
-test('R1-nit durability syncs the snapshot before its containing directory', () => {
+test('R1-nit durability syncs the snapshot before its containing directory', async () => {
   const synced: string[] = [], original = fs.fsyncSync;
   const spy = spyOn(fs, 'fsyncSync').mockImplementation(fd => {
     synced.push(fs.readlinkSync('/proc/self/fd/' + fd)); original(fd);
   });
-  let checked: ReturnType<typeof preflightHostDependencies> | undefined;
+  let checked: Awaited<ReturnType<typeof preflightHostDependencies>> | undefined;
   try {
-    checked = preflightHostDependencies(repo, 'main', parseHostDependencies(option()), out);
+    checked = await preflightHostDependencies(repo, 'main', parseHostDependencies(option()), out);
     checked.materialize();
     const snapshot = join(out, 'host-inputs', digest + '.tgz');
     expect(synced).toContain(snapshot);
     expect(synced.lastIndexOf(join(out, 'host-inputs'))).toBeGreaterThan(synced.indexOf(snapshot));
   } finally { spy.mockRestore(); checked?.cleanup(); checked?.discardNew(); }
 });
-test('R1-nit durability failure refuses and discards only the new snapshot', () => {
-  const checked = preflightHostDependencies(repo, 'main', parseHostDependencies(option()), out);
+test('R1-nit durability failure refuses and discards only the new snapshot', async () => {
+  const checked = await preflightHostDependencies(repo, 'main', parseHostDependencies(option()), out);
   const snapshot = join(out, 'host-inputs', digest + '.tgz'), original = fs.fsyncSync;
   const spy = spyOn(fs, 'fsyncSync').mockImplementation(fd => {
     if (fs.readlinkSync('/proc/self/fd/' + fd) === snapshot) throw new Error('fixture fsync failure');
@@ -527,8 +528,8 @@ test('R1-nit durability failure refuses and discards only the new snapshot', () 
     expect(existsSync(snapshot)).toBe(false);
   } finally { spy.mockRestore(); checked.cleanup(); checked.discardNew(); }
 });
-test('R1-4 an exclusive-create race never claims or deletes another snapshot', () => {
-  const checked = preflightHostDependencies(repo, 'main', parseHostDependencies(option()), out);
+test('R1-4 an exclusive-create race never claims or deletes another snapshot', async () => {
+  const checked = await preflightHostDependencies(repo, 'main', parseHostDependencies(option()), out);
   const snapshot = join(out, 'host-inputs', digest + '.tgz'), original = fs.openSync;
   let injected = false;
   const spy = spyOn(fs, 'openSync').mockImplementation((path, flags, mode) => {
@@ -659,7 +660,7 @@ test('R2-1/R2-2 full non-tip SHA still installs the selected commit with history
   expect(appGit('rev-parse', '--is-shallow-repository')).toBe('false');
   expect(appGit('describe', '--tags')).toMatch(/^v1\.0\.0-1-g/);
 });
-test('R2-6 refuses another-user link reached inside a trusted link target', () => {
+test('R2-6 refuses another-user link reached inside a trusted link target', async () => {
   const actual = join(dir, 'actual'); mkdirSync(actual);
   const untrusted = join(dir, 'other-link'); symlinkSync(actual, untrusted);
   const trusted = join(dir, 'trusted-link'); symlinkSync('other-link/../actual', trusted);
@@ -670,7 +671,142 @@ test('R2-6 refuses another-user link reached inside a trusted link target', () =
     return stat;
   }) as typeof fs.lstatSync);
   try {
-    expect(() => preflightHostDependencies(repo, 'main', parseHostDependencies(option()), join(trusted, 'install'))).toThrow('E_HOST_DEPENDENCY_STORAGE');
+    await expect(preflightHostDependencies(repo, 'main', parseHostDependencies(option()), join(trusted, 'install'))).rejects.toThrow('E_HOST_DEPENDENCY_STORAGE');
     expect(existsSync(join(actual, 'install'))).toBe(false);
   } finally { spy.mockRestore(); }
 });
+
+
+test('R3-P2 pinned build retains its controlling terminal under a PTY', () => {
+  writeFileSync(join(shim, 'bun'), `#!/bin/sh\nexec 3<>/dev/tty || exit 3\nprintf 'build has controlling tty\\n' >&3\nexec env BUN_INSTALL_CACHE_DIR='${join(dir, "cache")}' '${realBun}' "$@" --offline\n`);
+  const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+  const args = [realBun, resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo,
+    '--ch-ref', 'main', '--no-prompts', '--yes', '--host-dependency', option()];
+  const result = spawnSync('script', ['-q', '-e', '-c', args.map(quote).join(' '), '/dev/null'], {
+    encoding: 'utf8', timeout: 10000,
+    env: { ...process.env, TMPDIR: join(dir, 'staging'), PATH: shim + ':' + process.env.PATH },
+  });
+  expect(result.stdout + result.stderr).toContain('build has controlling tty');
+  expect(result.status).toBe(0);
+  const lock = JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8'));
+  for (const dependency of lock.hostDependencies) snapshots.add(dirname(dependency.snapshot));
+});
+
+// Maintainer round 3: signals must reach cook alone, not its process group.
+for (const phase of ['fetch', 'build', 'stubborn build']) for (const signal of ['SIGINT', 'SIGTERM'] as const) test(`R3-1 PID-only ${signal} cancels hanging ${phase}`, async () => {
+  const marker = join(dir, 'child-pid');
+  const sockets = new Set<Socket>();
+  let accepted = false;
+  const server = createServer(socket => { accepted = true; sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as { port: number }).port;
+  if (phase !== 'fetch') writeFileSync(join(shim, 'bun'), `#!/bin/sh\n${phase === 'stubborn build' ? "trap '' INT TERM\n" : ''}echo $$ > '${marker}'\nexec sleep 30\n`);
+  else writeFileSync(join(shim, 'git'), `#!/bin/sh\ncase " $* " in *' fetch '*) echo $$ > '${marker}';; esac\nexec /usr/bin/git "$@"\n`, { mode: 0o755 });
+  const child = spawn(realBun, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', phase === 'fetch' ? `git://127.0.0.1:${port}/host` : repo, '--no-prompts', '--yes', '--host-dependency', option()], {
+    detached: true, stdio: 'ignore', env: { ...process.env, TMPDIR: join(dir, 'staging'), PATH: shim + ':' + process.env.PATH },
+  });
+  const exited = new Promise<string | null>(resolve => child.on('exit', (_code, signal) => resolve(signal)));
+  try {
+    const deadline = Date.now() + 4000;
+    while ((!existsSync(marker) || (phase === 'fetch' && !accepted)) && Date.now() < deadline) await Bun.sleep(20);
+    expect(existsSync(marker)).toBe(true);
+    if (phase === 'fetch') expect(accepted).toBe(true);
+    expect(readdirSync(join(dir, 'staging')).length).toBeGreaterThan(0);
+    const signalledAt = Date.now();
+    child.kill(signal); // Deliberately NOT process.kill(-child.pid, signal).
+    expect(await Promise.race([exited, Bun.sleep(2500).then(() => 'timed out')])).toBe(signal);
+    if (phase === 'stubborn build') expect(Date.now() - signalledAt).toBeGreaterThanOrEqual(900);
+    const pid = Number(readFileSync(marker, 'utf8'));
+    const deadlineForReap = Date.now() + 500;
+    const running = () => {
+      try { return readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ')[1]![0] !== 'Z'; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
+    };
+    while (running() && Date.now() < deadlineForReap) await Bun.sleep(10);
+    expect(running()).toBe(false);
+    expect(readdirSync(join(dir, 'staging'))).toEqual([]);
+    expect(existsSync(join(out, 'app'))).toBe(false);
+    expect(existsSync(join(out, 'host-inputs', digest + '.tgz'))).toBe(false);
+  } finally {
+    try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* already gone */ }
+    if (existsSync(marker)) { try { process.kill(Number(readFileSync(marker, 'utf8')), 'SIGKILL'); } catch { /* already gone */ } }
+    await exited;
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+}, 10000);
+
+for (const pins of [false, true]) test(`R3-2 conflict-marker manifest with lock pins=${pins}`, () => {
+  if (!pins) {
+    writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'synthetic-host' })); git(['commit', '-am', 'Flagless host']);
+  }
+  expect(install(pins ? undefined : []).status).toBe(0);
+  const manifest = join(out, 'app/package.json');
+  const broken = '<<<<<<< HEAD\n{"name":"left"}\n=======\n{"name":"right"}\n>>>>>>> topic\n';
+  writeFileSync(manifest, broken);
+  const r = install([]);
+  if (pins) {
+    expect(r.status).not.toBe(0); expect(r.stderr).toContain('E_HOST_DEPENDENCY_REINSTALL');
+  } else {
+    expect(r.status).toBe(0); expect(r.stdout).toContain('unchanged connectome-host — kept');
+    expect(r.stderr).toContain('cannot inspect retained checkout');
+    expect(r.stderr).not.toContain('E_HOST_DEPENDENCY');
+  }
+  expect(readFileSync(manifest, 'utf8')).toBe(broken);
+});
+
+test('R3-3 relative local --ch-repo resolves against process cwd', () => {
+  const r = spawnSync(realBun, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', 'host', '--no-prompts', '--yes', '--host-dependency', option()], {
+    cwd: dir, encoding: 'utf8', env: { ...process.env, TMPDIR: join(dir, 'staging'), PATH: shim + ':' + process.env.PATH },
+  });
+  expect(r.status).toBe(0);
+  expect(execFileSync('git', ['remote', 'get-url', 'origin'], { cwd: join(out, 'app'), encoding: 'utf8' }).trim()).toBe(repo);
+});
+
+
+for (const length of [4, 5, 6, 7, 39]) test(`R3-5/R3-10 ${length}-hex host ref refuses as usage without fallback wording`, () => {
+  const ref = 'a'.repeat(length);
+  rmSync(archive);
+  const r = install(['--host-dependency', option(), '--ch-ref', ref]);
+  expect(r.status).not.toBe(0);
+  expect(r.stderr).toContain(`'${ref}' looks like an abbreviated commit ID`);
+  expect(r.stderr).not.toContain('no registry fallback');
+  expect(readdirSync(join(dir, 'staging'))).toEqual([]);
+});
+for (const command of ['build', 'run', 'check']) test(`R3-6 --drop-host-dependencies refuses outside install (${command})`, () => {
+  const r = spawnSync(realBun, [resolve('bin/cook'), command, recipe, '--drop-host-dependencies'], { encoding: 'utf8' });
+  expect(r.status).not.toBe(0); expect(r.stderr).toContain('--drop-host-dependencies is only supported by install');
+});
+test('R3-9 announces exactly one fetch before the preview', () => {
+  const r = install();
+  expect(r.status).toBe(0);
+  expect(r.stdout.match(/-> fetching host /g)).toHaveLength(1);
+  expect(r.stdout.indexOf('-> fetching host ')).toBeLessThan(r.stdout.indexOf('Host install plan'));
+});
+
+for (const signal of ['SIGINT', 'SIGTERM'] as const) test(`R3-8 cleanup exceptions still re-raise ${signal}`, async () => {
+  const marker = join(dir, 'waiting'), preload = join(dir, 'throw-cleanup.ts');
+  writeFileSync(join(shim, 'bun'), `#!/bin/sh\ntouch '${marker}'\nexec sleep 30\n`);
+  writeFileSync(preload, `import { spyOn } from 'bun:test';
+import * as fs from 'node:fs';
+const original = fs.rmSync;
+spyOn(fs, 'rmSync').mockImplementation((path, opts) => {
+  if (String(path).includes('cook-host-dependency-') && fs.existsSync(${JSON.stringify(marker)})) throw new Error('injected cleanup failure');
+  return original(path, opts);
+});
+`);
+  const child = spawn(realBun, ['--preload', preload, resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, '--no-prompts', '--yes', '--host-dependency', option()], {
+    detached: true, stdio: 'ignore', env: { ...process.env, TMPDIR: join(dir, 'staging'), PATH: shim + ':' + process.env.PATH },
+  });
+  const exited = new Promise<string | null>(resolve => child.on('exit', (_code, signal) => resolve(signal)));
+  try {
+    const deadline = Date.now() + 4000;
+    while (!existsSync(marker) && Date.now() < deadline) await Bun.sleep(20);
+    expect(existsSync(marker)).toBe(true);
+    child.kill(signal);
+    expect(await Promise.race([exited, Bun.sleep(2500).then(() => 'timed out')])).toBe(signal);
+  } finally {
+    try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* already gone */ }
+    await exited;
+  }
+}, 10000);

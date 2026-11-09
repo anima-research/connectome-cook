@@ -40,7 +40,9 @@ resolves existing output ancestors with realpath and prints the canonical instal
 path in the preview. Root-owned and same-effective-user-owned symlinks are
 trusted (including layouts such as `/home` → `/var/home`); links owned by any
 other non-root user refuse, including links traversed by another link's target.
-Existing ancestors need not be private. Only `host-inputs` is created with
+Existing ancestors need not be private, but an ancestor writable by another
+user voids the path/storage guarantee: that user can replace the install tree.
+Cook does not check ancestor write permissions. Only `host-inputs` is created with
 private mode; missing install ancestors use ordinary umask defaults. Cook
 validates these restrictions read-only before confirmation or
 creation of a fresh output tree. Flagless fresh installs retain their existing
@@ -66,8 +68,15 @@ Plain GNU `tar czf` and `tar --format=pax` are not supported.
 
 Cook fetches the selected host once into temporary staging, with full history
 and tags (not a shallow fetch), and reads its manifest from Git objects. Like
-the flagless clone, this fetch has no fixed timeout; SIGINT/SIGTERM can cancel it.
-Abbreviated hex `--ch-ref` values refuse before staging; use a symbolic ref or
+the flagless clone, this fetch has no fixed timeout. Fetch and build commands
+run asynchronously in cook's process group and session, preserving `/dev/tty`.
+SIGINT/SIGTERM sent only to cook stop Git/the build by forwarding the same
+signal to the direct child PID only. Cook waits for that child, escalating to
+SIGKILL after a one-second grace period if needed, then cleans staging and
+re-raises the original signal. It never signals descendants or process groups:
+a helper that detaches itself and ignores signals can outlive cook. Ctrl-C
+is a group signal and reaches everything still in the terminal's process group.
+Abbreviated hex `--ch-ref` values (4–39 characters) refuse before staging; use a symbolic ref or
 the full commit ID (`git rev-parse <abbreviation>`). The preview names each dependency, original range,
 planned `file:` location, SHA-256 prefix and selected resolution-policy field.
 Only after confirmation does cook materialize verified snapshots under
@@ -75,7 +84,8 @@ Only after confirmation does cook materialize verified snapshots under
 and their directory entries are fsynced; sync failures refuse. An existing
 snapshot is reused only after checking ownership, mode, size and hash.
 Symlinks (including dangling ones) refuse without being removed.
-Cook transfers the fetched repository into app/, checks out the exact commit
+Cook transfers the fetched repository into app/ as a non-shallow, detached checkout
+(with the selected ref and tags; a plain `git fetch` brings other branches), checks out the exact commit
 and applies the planned edits before Bun runs, without a second host fetch.
 Staging is removed on completion, failure/cancellation, and SIGINT/SIGTERM.
 Signal cleanup also removes the partially rewritten host checkout and only this
@@ -124,7 +134,9 @@ To deliberately remove all pins and rebuild the unmodified host, pass
 Retained checkout edits are checked whenever app/package.json exists, even
 when an older cook has dropped the lock field and `host-inputs` is missing.
 A flagless reinstall refuses with "pinned checkout; snapshots missing" when
-those retained pins refer to lost snapshots. Dropping pins when neither the
+those retained pins refer to lost snapshots. If the retained manifest cannot be
+parsed and the lock records no pins, cook warns and preserves ordinary reinstall
+behavior; a lock recording pins still requires explicit recovery. Dropping pins when neither the
 lock nor the checkout records any is a no-op (an unchanged host is kept). Do not use older cooks for these installs: they do not enforce this
 contract, and lost lock records plus a lost checkout cannot be reconstructed.
 

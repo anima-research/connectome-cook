@@ -1,12 +1,13 @@
 /** Local host inputs: snapshot first, inspect without extraction, never execute. */
-import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fchmodSync, fstatSync, lstatSync, fsyncSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { satisfies, valid, validRange } from 'semver';
 import { provisionPrivateDirectory, resolvePrivateDirectoryPath } from './private-directory.js';
+import { log } from './log.js';
+import { PinnedCommands } from './pinned-commands.js';
 import { assertCredentialFreeSourceUrl } from './source-url.js';
 
 const MAX_ARCHIVE = 64 * 1024 * 1024, MAX_TAR = 128 * 1024 * 1024, MAX_JSON = 1024 * 1024, MAX_ENTRIES = 10000;
@@ -19,8 +20,8 @@ export interface LockedHostDependency {
   };
 }
 export interface HostDependencyInput { name: string; path: string; sha256: string }
-function refuse(code: string, detail = 'local host dependency refused'): never {
-  const usage = code === 'E_HOST_DEPENDENCY_OPTION' || code === 'E_HOST_DEPENDENCY_DUPLICATE';
+function refuse(code: string, detail = 'local host dependency refused', usageError = false): never {
+  const usage = usageError || code === 'E_HOST_DEPENDENCY_OPTION' || code === 'E_HOST_DEPENDENCY_DUPLICATE';
   throw new Error(`${code}: ${detail}${usage ? '' : '; no registry fallback'}`);
 }
 function resolutionSection(pkg: Record<string, unknown>): 'overrides' | 'resolutions' {
@@ -81,6 +82,10 @@ export function assertHostDependencyReinstall(installDir: string, records: Locke
     }
     catch {
       if (drop) return true; // explicit recovery must rebuild an uninspectable checkout
+      if (!names.size) {
+        log.warn(`cannot inspect retained checkout ${manifest}; lock records no host dependency pins — keeping existing reinstall behavior`);
+        return false;
+      }
       refuse('E_HOST_DEPENDENCY_REINSTALL', `cannot inspect retained checkout ${manifest}; repeat --host-dependency or pass --drop-host-dependencies`);
     }
     for (const section of ['dependencies', 'devDependencies', 'optionalDependencies', 'overrides', 'resolutions']) {
@@ -217,10 +222,10 @@ function snapshot(source: string, dest: string, onCreated?: () => void): Buffer 
   }
   finally { if (input !== undefined) closeSync(input); if (output !== undefined) closeSync(output); }
 }
-export function preflightHostDependencies(url: string, ref: string, inputs: HostDependencyInput[], installDir: string, onStaged?: (cleanup: () => void) => void): { installDir: string; commit: string; checkout: string; records: LockedHostDependency[]; materialize: () => void; cleanup: () => void; discardNew: () => void } {
+export async function preflightHostDependencies(url: string, ref: string, inputs: HostDependencyInput[], installDir: string, onStaged?: (cleanup: () => void) => void, commands = new PinnedCommands()): Promise<{ installDir: string; commit: string; checkout: string; records: LockedHostDependency[]; materialize: () => void; cleanup: () => void; discardNew: () => void }> {
   assertCredentialFreeSourceUrl(url);
-  if (/^[0-9a-f]{7,39}$/i.test(ref)) refuse('E_HOST_DEPENDENCY_SOURCE',
-    `'${ref}' looks like an abbreviated commit ID; --host-dependency needs the full 40-hex ID (git rev-parse ${ref}); no output written`);
+  if (/^[0-9a-f]{4,39}$/i.test(ref)) refuse('E_HOST_DEPENDENCY_SOURCE',
+    `'${ref}' looks like an abbreviated commit ID; --host-dependency needs the full 40-hex ID (git rev-parse ${ref}); no output written`, true);
   try { installDir = resolvePrivateDirectoryPath(installDir); }
   catch (error) { refuse('E_HOST_DEPENDENCY_STORAGE', `${installDir}: ${(error as Error).message}`); }
   const inputRoot = join(installDir, 'host-inputs');
@@ -238,19 +243,22 @@ export function preflightHostDependencies(url: string, ref: string, inputs: Host
       if (pkg.name !== input.name) refuse('E_HOST_DEPENDENCY_NAME', `${input.path}: expected name ${input.name}, observed ${JSON.stringify(pkg.name)}`);
       return { input, path, size: bytes.length, sha256, pkg };
     });
-    const git = (args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: MAX_JSON }).trim();
+    const git = (args: string[]) => commands.run('git', args, root);
     let commit: string, host: Partial<Record<Section | 'overrides' | 'resolutions', Record<string, unknown>>> & { trustedDependencies?: unknown };
     const checkout = join(root, 'source');
     let operation = 'init';
     try {
-      git(['init', checkout]);
+      await git(['init', checkout]);
       const base = ['-C', checkout];
-      git([...base, 'remote', 'add', 'origin', url]);
+      // Git interprets local relative remotes against -C; clone uses process cwd.
+      const remote = /^(?:[a-z][a-z0-9+.-]*:|[^/]+:)/i.test(url) ? url : resolve(url);
+      await git([...base, 'remote', 'add', 'origin', remote]);
       operation = 'fetch';
-      git([...base, 'fetch', '--tags', '--', 'origin', ref]);
-      commit = git([...base, 'rev-parse', 'FETCH_HEAD^{commit}']);
+      log.step(`fetching host ${log.dim(url)}@${ref} (full history and tags)`);
+      await git([...base, 'fetch', '--tags', '--', 'origin', ref]);
+      commit = await git([...base, 'rev-parse', 'FETCH_HEAD^{commit}']);
       operation = 'read package.json';
-      host = JSON.parse(git([...base, 'show', commit + ':package.json']));
+      host = JSON.parse(await git([...base, 'show', commit + ':package.json']));
       if (!host || typeof host !== 'object' || Array.isArray(host)) throw new Error('manifest must be an object');
     } catch (error) {
       // Never echo arbitrary Git/helper output: it can contain authentication material.
