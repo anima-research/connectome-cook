@@ -36,6 +36,7 @@ import { execFileSync, execSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
+import { repositoryIndependentGitEnv } from '../git-env.js';
 import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
 import { log } from '../log.js';
 import type { GeneratorInput, McpSource } from '../types.js';
@@ -253,7 +254,7 @@ export function isSatisfiedByLock(
   action: CloneAction,
   lock: Lockfile | null,
 ): boolean {
-  if (!lock || !existsSync(action.target)) return false;
+  if (!lock || lock.incomplete || !existsSync(action.target)) return false;
   if (action.role === 'connectome-host') {
     return lock.connectomeHost.url === action.url
       && lock.connectomeHost.ref === action.ref
@@ -284,29 +285,30 @@ function cloneUrlFor(action: CloneAction, values: Record<string, string>): strin
 
 /** Execute one clone+build action. Throws on failure; the caller removes
  *  the target on failure so no half-built checkout survives. */
-function executeClone(action: CloneAction, values: Record<string, string>, buildEnv: NodeJS.ProcessEnv, sourceDir?: string): { commit?: string } {
+function executeClone(action: CloneAction, values: Record<string, string>, buildEnv: NodeJS.ProcessEnv, sourceDir?: string, beforeBuild?: () => void): { commit?: string } {
   rmSync(action.target, { recursive: true, force: true });
   mkdirSync(resolve(action.target, '..'), { recursive: true });
 
+  const env = repositoryIndependentGitEnv();
   const sslArgs = action.sslBypass ? ['-c', 'http.sslVerify=false'] : [];
   log.step(`${sourceDir ? 'materializing inspected host from local scratch for' : 'cloning'} ${log.dim(action.url)}${action.ref !== 'main' ? `@${action.ref}` : ''} → ${log.dim(action.target)}`);
   if (sourceDir) {
     const localGit = (args: string[], step: string) => {
-      try { execFileSync('git', args, { stdio: ['ignore', 'pipe', 'pipe'] }); }
+      try { execFileSync('git', args, { env, stdio: ['ignore', 'pipe', 'pipe'] }); }
       catch { throw new Error(`E_HOST_ENGINE_CLONE: git ${step} failed`); }
     };
-    localGit(['clone', '--no-hardlinks', '--branch', 'cook-selected', '--', sourceDir, action.target], 'clone inspected source');
+    localGit(['clone', '--origin', 'origin', '--no-reject-shallow', '--no-hardlinks', '--branch', 'cook-selected', '--', sourceDir, action.target], 'clone inspected source');
     localGit(['-C', action.target, 'remote', 'set-url', 'origin', action.url], 'set-url origin');
   } else {
     execFileSync('git', [...sslArgs, 'clone', cloneUrlFor(action, values), action.target], {
-      stdio: ['ignore', 'inherit', 'inherit'],
+      env, stdio: ['ignore', 'inherit', 'inherit'],
     });
   }
   if (action.authSecret) {
     // Scrub the token from .git/config — the credentialed URL must not
     // persist on disk (backups, shared machines, later `git fetch`).
     execFileSync('git', ['remote', 'set-url', 'origin', action.url], {
-      cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
+      env, cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
     });
   }
   if (action.commit) {
@@ -316,12 +318,12 @@ function executeClone(action: CloneAction, values: Record<string, string>, build
     // clone — fetch the ref first so the SHA exists in the object store.
     if (!sourceDir && action.ref.startsWith('refs/')) {
       execFileSync('git', ['fetch', 'origin', action.ref], {
-        cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
+        env, cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
       });
     }
     try {
       execFileSync('git', ['checkout', action.commit], {
-        cwd: action.target, stdio: sourceDir ? ['ignore', 'pipe', 'pipe'] : ['ignore', 'inherit', 'inherit'],
+        env, cwd: action.target, stdio: sourceDir ? ['ignore', 'pipe', 'pipe'] : ['ignore', 'inherit', 'inherit'],
       });
     } catch (err) {
       if (sourceDir) throw new Error('E_HOST_ENGINE_CHECKOUT: git checkout inspected commit failed');
@@ -330,32 +332,33 @@ function executeClone(action: CloneAction, values: Record<string, string>, build
   } else if (action.ref && action.ref !== 'main') {
     if (action.ref.startsWith('refs/')) {
       execFileSync('git', ['fetch', 'origin', `${action.ref}:cook-install-checkout`], {
-        cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
+        env, cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
       });
       execFileSync('git', ['checkout', 'cook-install-checkout'], {
-        cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
+        env, cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
       });
     } else {
       execFileSync('git', ['checkout', action.ref], {
-        cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
+        env, cwd: action.target, stdio: ['ignore', 'inherit', 'inherit'],
       });
     }
   }
   if (sourceDir) {
     try {
-      execFileSync('git', ['branch', '-D', 'cook-selected'], { cwd: action.target, stdio: 'pipe' });
-      execFileSync('git', ['update-ref', '-d', 'refs/remotes/origin/cook-selected'], { cwd: action.target, stdio: 'pipe' });
+      execFileSync('git', ['branch', '-D', 'cook-selected'], { env, cwd: action.target, stdio: 'pipe' });
+      execFileSync('git', ['update-ref', '-d', 'refs/remotes/origin/cook-selected'], { env, cwd: action.target, stdio: 'pipe' });
     } catch { throw new Error('E_HOST_ENGINE_CLONE: removing synthetic refs failed'); }
   }
 
   let commit: string | undefined;
   try {
-    commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: action.target })
+    commit = execFileSync('git', ['rev-parse', 'HEAD'], { env, cwd: action.target })
       .toString().trim();
   } catch {
     // Non-fatal — lock entry just omits the commit.
   }
 
+  beforeBuild?.();
   if (action.buildCommand) {
     log.step(`building ${log.dim(action.target)}: ${action.buildCommand}`);
     execSync(action.buildCommand, {
@@ -524,7 +527,7 @@ async function materializeHost(
   checked?: HostEnginePreflight,
 ): Promise<BuildResult> {
   const installDir = options.installDir;
-  const engines = checked?.engines;
+  let engines = checked?.engines;
   const buildEnv = { ...process.env };
   const parent = plan.parentWalk.recipe;
   const hasSidecars = (parent.services ?? []).length > 0;
@@ -543,6 +546,18 @@ async function materializeHost(
   }
 
   const actions = planHostActions(plan, options);
+  const reserved = resolve(installDir, '.cook-engines');
+  const refuseReserved = (target: string) => {
+    const path = resolve(target);
+    if (path === reserved || path.startsWith(reserved + '/')) {
+      throw new Error('E_HOST_ENGINE_RESERVED: clone, copy and template targets must not use .cook-engines');
+    }
+  };
+  for (const action of [...actions.clones, ...actions.copies]) refuseReserved(action.target);
+  for (const file of runtimeFiles) {
+    refuseReserved(file.kind === 'sidecar-template'
+      ? join(installDir, file.relPath) : hostPathFor(installDir, file.inContainer!));
+  }
   if (engines) bindHostEngine(actions, engines.bun.path);
   let existingLock: Lockfile | null = null;
   try {
@@ -551,9 +566,10 @@ async function materializeHost(
     log.warn(`existing ${LOCKFILE_NAME} unreadable (${err instanceof Error ? err.message : String(err)}) — treating as fresh install`);
   }
 
+  const existingLockOnDisk = existingLock;
   const engineBindingChanged = JSON.stringify(existingLock?.engines) !== JSON.stringify(engines);
-  // Retire the disk lock before any destructive work if ANY clone cannot be
-  // reused. Otherwise an interrupted ref/build/engine change could leave an
+  // Mark the disk lock incomplete before destructive work if ANY clone
+  // cannot be reused. Otherwise an interrupted ref/build/engine change could leave an
   // old lock authorizing a newly built checkout on the next run.
   const invalidateLock = !existingLock || engineBindingChanged
     || actions.clones.some(action => !isSatisfiedByLock(action, existingLock));
@@ -579,7 +595,7 @@ async function materializeHost(
     }
   }
 
-  if (invalidateLock) rmSync(join(installDir, LOCKFILE_NAME), { force: true });
+  if (invalidateLock && existingLockOnDisk) writeLockfile(installDir, { ...existingLockOnDisk, incomplete: true });
 
   mkdirSync(installDir, { recursive: true });
   mkdirSync(join(installDir, 'recipes'), { recursive: true });
@@ -599,15 +615,25 @@ async function materializeHost(
   const lockedComponents: LockedComponent[] = [];
   let chCommit: string | undefined;
   for (const action of actions.clones) {
+    if (checked) await new Promise<void>(r => setImmediate(r));
+    const recheck = action.role === 'connectome-host' && checked
+      ? () => { engines = checked.recheck(action.target); } : undefined;
     let commit: string | undefined;
     if (isSatisfiedByLock(action, existingLock)) {
+      try { recheck?.(); }
+      catch (err) {
+        // A directory-sensitive shim can change even on a reusable checkout.
+        if (existingLockOnDisk) writeLockfile(installDir, { ...existingLockOnDisk, incomplete: true });
+        log.error(err instanceof Error ? err.message : String(err));
+        return { exitCode: 3, outDir: installDir };
+      }
       log.info(`unchanged ${log.dim(action.key)} — kept (${log.dim(action.target)})`);
       commit = action.role === 'connectome-host'
         ? existingLock!.connectomeHost.commit
         : existingLock!.components.find((c) => c.key === action.key)?.commit;
     } else {
       try {
-        commit = executeClone(action, plan.values, buildEnv, action.role === 'connectome-host' ? checked?.sourceDir : undefined).commit;
+        commit = executeClone(action, plan.values, buildEnv, action.role === 'connectome-host' ? checked?.sourceDir : undefined, recheck).commit;
       } catch (err) {
         log.error(
           `install of ${action.key} failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -632,6 +658,10 @@ async function materializeHost(
       });
     }
   }
+
+  // Also drain signals delivered during the final synchronous build before
+  // publishing launch files or a successful lock.
+  if (checked) await new Promise<void>(r => setImmediate(r));
 
   // ---- Sibling copies (docker's context-COPY equivalent). ----
   for (const copy of actions.copies) {

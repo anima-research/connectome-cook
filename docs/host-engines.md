@@ -38,23 +38,32 @@ Without engine flags, the existing clone/checkout ref behavior is unchanged.
 connectome.lock records each operator-supplied absolute `path`, canonical
 `realPath`, and observed `version`. --version, host dependency installation,
 run.sh and lowered stdio commands named exactly node or bun use the operator's
-path, preserving multi-call shim dispatch. Build PATH prepends only the
+path, preserving multi-call shim dispatch. After materializing the host,
+cook probes both paths again from the host directory before installing dependencies.
+A range failure or a version differing from preflight refuses the install; the
+lock records the versions and canonical paths observed in that directory. Build PATH prepends only the
 cook-owned `.cook-engines/bin` directory containing bun/node symlinks, not the
 engines' entire directories; unrelated executables keep their precedence.
 Empty inherited PATH segments are removed for selected-engine builds. The
 reserved `.cook-engines` directory is refreshed after confirmation and removed
-when returning to legacy engines. Git acquisition retains the operator's PATH.
+when returning to legacy engines. Clone, copy and template targets at or below `.cook-engines` are refused
+before confirmation. Git acquisition retains the operator's PATH, but removes
+repository-local Git environment variables from acquisition commands.
 Arbitrary custom commands, npx, scripts' shebangs, and connector-specific
 runtime requirements are not rewritten or independently qualified. No engines
 are downloaded. Host build commands remain trusted operator-side code.
 
 Refusals use distinct E_HOST_ENGINE_PATH, _EXEC, _VERSION, _REQUIREMENT and
 _RANGE errors (the latter reports engine, observed version and required range).
+_CHANGED means a directory-sensitive shim selected a different version in the
+host checkout, even if both versions satisfy the range.
 Git failures identify the step using _INIT, _FETCH, _COMMIT, _PACKAGE, _CLONE or
 _CHECKOUT. A signalled/timed-out git command reports _TIMEOUT; after a named-ref
 fetch failure, `git ls-remote --exit-code` distinguishes an unadvertised ref
 (_REF) from transport/repository failure (_FETCH). Full object-ID fetch failures
-remain _FETCH unless timed out. A source checkout missing preflight dependencies
+remain _FETCH unless timed out. Selected-engine acquisition currently supports
+SHA-1 host repositories only; SHA-256 hosts refuse with _OBJECT_FORMAT. Legacy
+installs without engine flags retain Git's native object-format support. A source checkout missing preflight dependencies
 reports _DEPENDENCY with a `run bun install` hint. Raw subprocess output, URLs
 and executable paths are not included in engine refusal diagnostics. Invalid output/requirements are not echoed.
 
@@ -62,9 +71,12 @@ Omitting both flags preserves legacy PATH-based behavior and does not load
 host-engines or semver, including for cook --version from a source checkout
 with pre-PR node_modules. Entering, changing, or leaving selected engines
 invalidates all clone/build reuse; legacy-to-legacy reuse is unchanged. After
-confirmation, any clone reuse mismatch (including ref/build changes) retires the
-on-disk lock before the first clone. A failed transition cannot authorize reuse
-on a retry; the next successful run writes a fresh lock. This is
+confirmation, any clone reuse mismatch (including ref/build changes) marks an
+existing on-disk lock `incomplete: true` before the first clone. A failed
+transition cannot authorize reuse on a retry; both `cook run <dir>` and
+`cook run <recipe> --out <dir>` refuse with "last install failed; re-run
+`cook install`" instead of launching or falling through to a Docker build.
+The next successful install rebuilds and writes a fresh, unmarked lock. This is
 not a frozen dependency closure or protection against replacing a binary or
 retargeting a shim after installation. This feature is based on main and has
 no held-candidate, private-file, manifest-export or env-allowlist dependency.
