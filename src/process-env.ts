@@ -108,18 +108,23 @@ export function sourceGitEnvironment(
   }
   const rawCount = env.GIT_CONFIG_COUNT ?? '0';
   const count = Number(rawCount);
-  if (!/^\d+$/.test(rawCount) || !Number.isSafeInteger(count) || count > Number.MAX_SAFE_INTEGER - 2) {
+  if (!/^\d+$/.test(rawCount) || !Number.isSafeInteger(count) || count > Number.MAX_SAFE_INTEGER - 4) {
     throw new Error(`${location}: authSecret requires a valid GIT_CONFIG_COUNT.`);
   }
   assertAuthGitVersion(env, location);
-  env.GIT_CONFIG_COUNT = String(count + 2);
+  env.GIT_CONFIG_COUNT = String(count + 4);
   env[`GIT_CONFIG_KEY_${count}`] = `http.${origin}/.extraHeader`;
   env[`GIT_CONFIG_VALUE_${count}`] = `Authorization: Basic ${Buffer.from(`oauth2:${token}`).toString('base64')}`;
-  // Git chooses URL specificity before config scope: an unkeyed setting
-  // loses to operator http.<url> config, even when injected here. Match the
-  // exact source URL, then command scope/order wins ties against user config.
-  env[`GIT_CONFIG_KEY_${count + 1}`] = `http.${url}.followRedirects`;
-  env[`GIT_CONFIG_VALUE_${count + 1}`] = 'false';
+  // Git matches HTTP config against the insteadOf-rewritten URL. Keep an
+  // unkeyed fallback, and cover the credential's entire origin for same-origin
+  // path rewrites. The exact key still beats more-specific operator path config
+  // for the recipe URL: URL specificity wins before command scope/order.
+  for (const [index, key] of [
+    'http.followRedirects', `http.${origin}/.followRedirects`, `http.${url}.followRedirects`,
+  ].entries()) {
+    env[`GIT_CONFIG_KEY_${count + 1 + index}`] = key;
+    env[`GIT_CONFIG_VALUE_${count + 1 + index}`] = 'false';
+  }
   return env;
 }
 

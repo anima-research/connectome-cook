@@ -100,10 +100,10 @@ test('R1-1: real Git sends the private header on loopback pin/clone/fetch, keeps
 
 // A smart-HTTP destination is essential: Git can strip Authorization on the
 // redirected GET, then leak it on subsequent upload-pack POSTs.
-test.each(['prefix', 'exact'] as const)('R1-1: cross-origin redirect fails closed with operator %s URL config; inspect EVERY destination request', async (scope) => {
+test.each(['prefix', 'exact', 'include', 'insteadOf', 'insteadOf-prefix'] as const)('R1-1: cross-origin redirect fails closed with operator %s URL config; inspect EVERY destination request', async (scope) => {
   const dir = mkdtempSync(join(tmpdir(), 'cook-redirect-'));
   const token = 'synthetic-redirect-token';
-  const requestsA: Array<{ method: string; auth: string | null }> = [];
+  const requestsA: Array<{ method: string; path: string; auth: string | null }> = [];
   const requestsB: Array<{ method: string; path: string; auth: string | null }> = [];
   const home = join(dir, 'home'); mkdirSync(home);
   const env = { PATH: process.env.PATH, HOME: home, GIT_CONFIG_NOSYSTEM: '1' };
@@ -141,8 +141,8 @@ test.each(['prefix', 'exact'] as const)('R1-1: cross-origin redirect fails close
     return new Response(output.subarray(split + 4), { status, headers });
   } });
   const origin = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
-    requestsA.push({ method: request.method, auth: request.headers.get('authorization') });
     const url = new URL(request.url);
+    requestsA.push({ method: request.method, path: url.pathname, auth: request.headers.get('authorization') });
     return Response.redirect(`http://127.0.0.1:${destination.port}${url.pathname}${url.search}`, 302);
   } });
   try {
@@ -153,11 +153,20 @@ test.each(['prefix', 'exact'] as const)('R1-1: cross-origin redirect fails close
     expect(await new Promise<number | null>((resolve, reject) => { control.on('error', reject); control.on('close', resolve); })).toBe(0);
     expect(requestsB.some(r => r.method === 'POST')).toBe(true);
     requestsB.length = 0;
-    const sourceUrl = `http://127.0.0.1:${origin.port}/repo.git`;
-    const operatorUrl = scope === 'exact' ? sourceUrl : `http://127.0.0.1:${origin.port}/`;
-    // URL-specific file config outranks an unkeyed command-scope setting.
-    // At equal URL specificity our injected command-scope setting must win.
-    writeFileSync(join(home, '.gitconfig'), `[http "${operatorUrl}"]\n\tfollowRedirects = true\n`);
+    const sourceOrigin = `http://127.0.0.1:${origin.port}/`;
+    const alias = scope.startsWith('insteadOf');
+    const sourceUrl = `${sourceOrigin}${alias ? 'alias.git' : 'repo.git'}`;
+    const operatorUrl = scope === 'prefix' || scope === 'insteadOf-prefix' ? sourceOrigin : sourceUrl;
+    // URL-specific file config (including includes) outranks unkeyed config.
+    // insteadOf makes Git match HTTP settings against /repo.git, not /alias.git.
+    const httpConfig = `[http "${operatorUrl}"]\n\tfollowRedirects = true\n`;
+    const rewriteConfig = alias ? `[url "${sourceOrigin}repo.git"]\n\tinsteadOf = ${sourceUrl}\n` : '';
+    if (scope === 'include') {
+      writeFileSync(join(home, 'redirects.gitconfig'), httpConfig);
+      writeFileSync(join(home, '.gitconfig'), '[include]\n\tpath = redirects.gitconfig\n');
+    } else {
+      writeFileSync(join(home, '.gitconfig'), httpConfig + rewriteConfig);
+    }
     expect(execFileSync('git', ['config', '--get-urlmatch', 'http.followRedirects', sourceUrl],
       { env, encoding: 'utf8' }).trim()).toBe('true');
     const recipe = join(dir, 'recipe.json');
@@ -176,6 +185,7 @@ test.each(['prefix', 'exact'] as const)('R1-1: cross-origin redirect fails close
     child.stderr.on('data', chunk => { output += chunk; });
     const status = await new Promise<number | null>((resolve, reject) => { child.on('error', reject); child.on('close', resolve); });
     expect(requestsA.length).toBeGreaterThan(0);
+    expect(requestsA.every(r => r.path === '/repo.git/info/refs')).toBe(true);
     expect(requestsA.every(r => r.auth === `Basic ${Buffer.from(`oauth2:${token}`).toString('base64')}`)).toBe(true);
     // Check all methods, not just curl's initially redirected GET.
     expect(requestsB.filter(r => r.auth !== null)).toEqual([]);

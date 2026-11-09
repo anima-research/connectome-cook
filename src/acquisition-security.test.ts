@@ -24,7 +24,7 @@ appendFileSync(${JSON.stringify(join(dir, 'git-argv'))}, JSON.stringify(args) + 
 appendFileSync(${JSON.stringify(join(dir, 'git-env'))}, JSON.stringify({ args, env: process.env }) + '\\n');
 const behavior = JSON.parse(readFileSync(${JSON.stringify(join(dir, 'git-behavior.json'))}, 'utf-8'));
 if (args[0] === '--version') { console.log('git version ' + (behavior.version ?? '2.53.0')); process.exit(0); }
-if (behavior.fail && args[0] === behavior.fail && (process.env.GIT_CONFIG_COUNT === '2' || behavior.publicFail)) {
+if (behavior.fail && args[0] === behavior.fail && (process.env.GIT_CONFIG_COUNT === '4' || behavior.publicFail)) {
   console.log(process.env.GIT_CONFIG_VALUE_0 ?? 'public stdout diagnostic');
   console.error('fatal: useful Git diagnostic');
   console.error(${JSON.stringify(SECRET)});
@@ -134,17 +134,19 @@ for (const pin of [false, true]) {
     const header = `Authorization: Basic ${Buffer.from(`oauth2:${SECRET}`).toString('base64')}`;
     const calls = gitEnvironments();
     for (const command of ['clone', 'fetch', 'checkout', 'rev-parse', ...(pin ? ['ls-remote'] : [])]) {
-      expect(calls.some(call => call.args[0] === command && call.env.GIT_CONFIG_COUNT === '3')).toBe(true);
+      expect(calls.some(call => call.args[0] === command && call.env.GIT_CONFIG_COUNT === '5')).toBe(true);
     }
     for (const call of calls) {
       expect(call.env.GIT_CONFIG_KEY_0).toBe('credential.helper');
       expect(call.env.GIT_CONFIG_VALUE_0).toBe('/synthetic/helper');
       expect(call.env.GIT_TOKEN).toBeUndefined();
-      if (call.env.GIT_CONFIG_COUNT === '3') {
+      if (call.env.GIT_CONFIG_COUNT === '5') {
         expect(call.env.GIT_CONFIG_KEY_1).toBe('http.https://example.invalid/.extraHeader');
         expect(call.env.GIT_CONFIG_VALUE_1).toBe(header);
-        expect(call.env.GIT_CONFIG_KEY_2).toBe('http.https://example.invalid/private.git.followRedirects');
-        expect(call.env.GIT_CONFIG_VALUE_2).toBe('false');
+        expect(call.env.GIT_CONFIG_KEY_2).toBe('http.followRedirects');
+        expect(call.env.GIT_CONFIG_KEY_3).toBe('http.https://example.invalid/.followRedirects');
+        expect(call.env.GIT_CONFIG_KEY_4).toBe('http.https://example.invalid/private.git.followRedirects');
+        for (const index of [2, 3, 4]) expect(call.env[`GIT_CONFIG_VALUE_${index}`]).toBe('false');
       } else {
         expect(call.env.GIT_CONFIG_VALUE_1).toBeUndefined();
       }
@@ -162,7 +164,7 @@ for (const pin of [false, true]) {
 test('R1-1: private symbolic Docker pins use the same environment-only channel', () => {
   const result = run('build', { url: 'https://example.invalid/private.git', authSecret: 'GIT_TOKEN' }, ['--pin-refs']);
   expect(result.status).toBe(0);
-  expect(gitEnvironments().find(call => call.args[1]?.includes('private.git'))?.env.GIT_CONFIG_COUNT).toBe('2');
+  expect(gitEnvironments().find(call => call.args[1]?.includes('private.git'))?.env.GIT_CONFIG_COUNT).toBe('4');
   expect(gitCalls() + result.stdout + result.stderr + readFileSync(join(dir, 'out/connectome.lock'), 'utf-8')).not.toContain(SECRET);
 });
 

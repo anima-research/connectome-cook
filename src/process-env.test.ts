@@ -20,12 +20,16 @@ test('R1-3: real Git retains injected COUNT/KEY/VALUE after repository stripping
     const token = 'synthetic-config-survival-token';
     const env = sourceGitEnvironment('https://example.invalid/repo.git', 'PRIVATE_TOKEN', { PRIVATE_TOKEN: token });
     expect(env.GIT_DIR).toBeUndefined();
-    expect(env.GIT_CONFIG_COUNT).toBe('3');
+    expect(env.GIT_CONFIG_COUNT).toBe('5');
     const config = (key: string) => execFileSync('git', ['config', '--get', key], { env, encoding: 'utf8' }).trim();
     expect(config('http.https://example.invalid/.extraHeader')).toBe(`Authorization: Basic ${Buffer.from(`oauth2:${token}`).toString('base64')}`);
+    expect(config('http.followRedirects')).toBe('false');
+    expect(config('http.https://example.invalid/.followRedirects')).toBe('false');
     expect(config('http.https://example.invalid/repo.git.followRedirects')).toBe('false');
-    expect(execFileSync('git', ['config', '--get-urlmatch', 'http.followRedirects', 'https://example.invalid/repo.git'],
-      { env, encoding: 'utf8' }).trim()).toBe('false');
+    for (const url of ['https://example.invalid/repo.git', 'https://example.invalid/rewritten.git', 'https://other.invalid/repo.git']) {
+      expect(execFileSync('git', ['config', '--get-urlmatch', 'http.followRedirects', url],
+        { env, encoding: 'utf8' }).trim()).toBe('false');
+    }
   });
 });
 
