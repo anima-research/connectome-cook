@@ -35,9 +35,9 @@ function host(range: unknown = '^1.0.0', section = 'dependencies') {
   git(['add', 'package.json']); git(['commit', '--allow-empty', '-m', 'Synthetic host']);
 }
 function option(name = 'fixture-local-input', path = archive, hash = digest) { return `${name}=${path}#sha256=${hash}`; }
-function install(extra: string[] = ['--host-dependency', option()]) {
+function install(extra: string[] = ['--host-dependency', option()], env: NodeJS.ProcessEnv = {}) {
   const result = spawnSync(realBun, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, ...(extra.includes('--ch-ref') ? [] : ['--ch-ref', 'main']), '--no-prompts', '--yes', ...extra], {
-    encoding: 'utf8', env: { ...process.env, TMPDIR: join(dir, 'staging'), PATH: shim + ':' + process.env.PATH },
+    encoding: 'utf8', env: { ...process.env, TMPDIR: join(dir, 'staging'), PATH: shim + ':' + process.env.PATH, ...env },
   });
   if (result.status === 0 && existsSync(join(out, 'connectome.lock'))) {
     const lock = JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8'));
@@ -810,3 +810,55 @@ spyOn(fs, 'rmSync').mockImplementation((path, opts) => {
     await exited;
   }
 }, 10000);
+
+// Selected engines and pinned inputs are independent opt-ins, so they must compose.
+function selectEngines(): string[] {
+  writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'synthetic-host', version: '1.0.0', engines: { bun: '>=1.0.0', node: '>=18.0.0' }, dependencies: { 'fixture-local-input': '^1.0.0' } }));
+  git(['add', 'package.json']); git(['commit', '-m', 'Declare engines']);
+  const bun = join(dir, 'selected-bun'), node = join(dir, 'selected-node');
+  writeFileSync(bun, `#!/bin/sh\nif [ "$1" = --version ]; then echo 1.4.4; exit 0; fi\necho "$0 $(pwd) \${PATH%%:*}" >> '${join(dir, 'selected-bun.log')}'\nexec '${join(shim, 'bun')}' "$@"\n`);
+  writeFileSync(node, '#!/bin/sh\necho v22.23.3\n');
+  chmodSync(bun, 0o755); chmodSync(node, 0o755);
+  return ['--bun-path', bun, '--node-path', node];
+}
+test('selected engines build a pinned host and the lock records both', () => {
+  const flags = selectEngines();
+  const r = install(['--host-dependency', option(), ...flags]);
+  if (r.status) console.error(r.stdout, r.stderr);
+  expect(r.status).toBe(0);
+  expect(readFileSync(join(dir, 'selected-bun.log'), 'utf8').trim()).toBe(`${flags[1]} ${join(out, 'app')} ${join(out, '.cook-engines/bin')}`);
+  expect(JSON.parse(readFileSync(join(out, 'app/node_modules/fixture-local-input/package.json'), 'utf8')).version).toBe('1.2.3');
+  const lock = JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8'));
+  expect(lock.engines.bun.path).toBe(flags[1]!);
+  expect(lock.hostDependencies[0].name).toBe('fixture-local-input');
+  expect(lock.connectomeHost.commit).toBe(git(['rev-parse', 'HEAD']));
+});
+test('the exported unit of a pinned install names the canonical directory', () => {
+  const flags = selectEngines();
+  const actual = join(dir, 'actual'); mkdirSync(actual);
+  const link = join(dir, 'linked'); symlinkSync(actual, link);
+  out = join(link, 'new-install');
+  const r = install(['--host-dependency', option(), ...flags, '--user-unit', 'cook-fixture.service']);
+  if (r.status) console.error(r.stdout, r.stderr);
+  expect(r.status).toBe(0);
+  expect(readFileSync(join(actual, 'new-install/cook-fixture.service'), 'utf8')).toContain('WorkingDirectory=' + join(actual, 'new-install') + '\n');
+});
+test('an exported GIT_DIR cannot redirect pinned acquisition into another repository', () => {
+  const unrelated = join(dir, 'unrelated'); mkdirSync(unrelated);
+  execFileSync('git', ['init', '-b', 'main', unrelated], { stdio: 'pipe' });
+  const config = join(unrelated, '.git/config'), before = readFileSync(config, 'utf8');
+  const r = install(['--host-dependency', option()], { GIT_DIR: join(unrelated, '.git') });
+  if (r.status) console.error(r.stdout, r.stderr);
+  expect(r.status).toBe(0);
+  expect(readFileSync(config, 'utf8')).toBe(before);
+  expect(JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8')).connectomeHost.commit).toBe(git(['rev-parse', 'HEAD']));
+});
+test('a failed rebuild of a pinned host marks the lock incomplete', () => {
+  expect(install().status).toBe(0);
+  writeFileSync(join(shim, 'bun'), '#!/bin/sh\nexit 7\n');
+  expect(install().status).not.toBe(0);
+  expect(JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8')).incomplete).toBe(true);
+  const run = spawnSync(realBun, [resolve('bin/cook'), 'run', out], { encoding: 'utf8' });
+  expect(run.status).not.toBe(0);
+  expect(run.stdout + run.stderr).toContain('last install failed');
+});

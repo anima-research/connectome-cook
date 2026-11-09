@@ -4,10 +4,10 @@ import { closeSync, constants, fchmodSync, fstatSync, lstatSync, fsyncSync, mkdt
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { gunzipSync } from 'node:zlib';
-import { satisfies, valid, validRange } from 'semver';
 import { provisionPrivateDirectory, resolvePrivateDirectoryPath } from './private-directory.js';
 import { log } from './log.js';
 import { PinnedCommands } from './pinned-commands.js';
+import { repositoryIndependentGitEnv } from './git-env.js';
 import { assertCredentialFreeSourceUrl } from './source-url.js';
 
 const MAX_ARCHIVE = 64 * 1024 * 1024, MAX_TAR = 128 * 1024 * 1024, MAX_JSON = 1024 * 1024, MAX_ENTRIES = 10000;
@@ -224,6 +224,9 @@ function snapshot(source: string, dest: string, onCreated?: () => void): Buffer 
 }
 export async function preflightHostDependencies(url: string, ref: string, inputs: HostDependencyInput[], installDir: string, onStaged?: (cleanup: () => void) => void, commands = new PinnedCommands()): Promise<{ installDir: string; commit: string; checkout: string; records: LockedHostDependency[]; materialize: () => void; cleanup: () => void; discardNew: () => void }> {
   assertCredentialFreeSourceUrl(url);
+  // Loaded here so commands that pin no input still run without semver installed.
+  const { satisfies, valid, validRange } = await import('semver').catch(() =>
+    refuse('E_HOST_DEPENDENCY_RUNTIME', 'cannot load semver; run bun install', true));
   if (/^[0-9a-f]{4,39}$/i.test(ref)) refuse('E_HOST_DEPENDENCY_SOURCE',
     `'${ref}' looks like an abbreviated commit ID; --host-dependency needs the full 40-hex ID (git rev-parse ${ref}); no output written`, true);
   try { installDir = resolvePrivateDirectoryPath(installDir); }
@@ -243,7 +246,7 @@ export async function preflightHostDependencies(url: string, ref: string, inputs
       if (pkg.name !== input.name) refuse('E_HOST_DEPENDENCY_NAME', `${input.path}: expected name ${input.name}, observed ${JSON.stringify(pkg.name)}`);
       return { input, path, size: bytes.length, sha256, pkg };
     });
-    const git = (args: string[]) => commands.run('git', args, root);
+    const git = (args: string[]) => commands.run('git', args, root, false, repositoryIndependentGitEnv());
     let commit: string, host: Partial<Record<Section | 'overrides' | 'resolutions', Record<string, unknown>>> & { trustedDependencies?: unknown };
     const checkout = join(root, 'source');
     let operation = 'init';

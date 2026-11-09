@@ -151,11 +151,15 @@ Mode bits do not protect against other code running as your user.
 Authenticate the artifact/hash through your own trusted process. This feature
 does not establish provenance, download engines, or authorize activation.
 
+With `--bun-path` and `--node-path`, engines are inspected first and the commit
+they were inspected against is the one pinned. The host install then runs with
+the selected Bun and the same build PATH as any other selected-engine install.
+
 Refusals use the E_HOST_DEPENDENCY_ prefix: OPTION, DUPLICATE, FILE, HASH,
 ARCHIVE, NAME, SOURCE, UNDECLARED, RANGE, VERSION, TRUSTED, STORAGE, REINSTALL,
-RESOLUTION, OVERLAP or POLICY_FIELDS. OVERLAP identifies a recipe write into
-host inputs; POLICY_FIELDS identifies both overrides and resolutions being
-present.
+RESOLUTION, OVERLAP, POLICY_FIELDS or RUNTIME. OVERLAP identifies a recipe
+write into host inputs; POLICY_FIELDS identifies both overrides and resolutions
+being present; RUNTIME means a source checkout has not installed semver yet.
 Input errors identify paths/reasons; hash mismatches give expected/observed
 digests and version mismatches give version/range. Source errors identify
 repository/ref/operation and a safe cause, never arbitrary Git/helper output.

@@ -6,11 +6,11 @@ export class PinnedCommands {
   private active = new Map<ChildProcess, Promise<void>>();
   private cancelled = false;
 
-  run(file: string, args: string[], cwd: string, inherit = false): Promise<string> {
+  run(file: string, args: string[], cwd: string, inherit = false, env: NodeJS.ProcessEnv = process.env): Promise<string> {
     if (this.cancelled) return Promise.reject(new Error('pinned install cancelled'));
     const child = spawn(file, args, {
       cwd, stdio: inherit ? ['ignore', 'inherit', 'inherit'] : ['ignore', 'pipe', 'pipe'],
-      env: process.env,
+      env,
     });
     // Wait for the child itself, not pipe closure: a detached helper may still
     // hold inherited descriptors open after the direct child exits.
