@@ -38,7 +38,7 @@ import { execFileSync, execSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
-import { repositoryIndependentGitEnv } from '../git-env.js';
+import { assertUnrewrittenSourceUrl, knownSecretEnvironmentNames, sourceGitEnvironment, processAllowlistEnv, gitEnvironment, gitFailureOutput, AUTH_REDIRECT_HINT } from '../process-env.js';
 import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
 import { log } from '../log.js';
 import type { GeneratorInput, McpSource } from '../types.js';
@@ -279,21 +279,6 @@ export function isSatisfiedByLock(
     && (action.commit === undefined || entry.commit === action.commit);
 }
 
-/** Clone URL with an optional token (resolved values > environment; never
- *  logged). The credentialed form is briefly visible in the process list
- *  during the clone; executeClone scrubs it from .git/config afterwards. */
-function cloneUrlFor(action: CloneAction, values: Record<string, string>): string {
-  if (!action.authSecret) return action.url;
-  const token = values[action.authSecret] ?? process.env[action.authSecret];
-  if (!token) {
-    throw new Error(
-      `clone of ${action.url} needs a value for ${action.authSecret} ` +
-      `(supply via prompt, --env-file, or the environment)`,
-    );
-  }
-  return action.url.replace(/^https?:\/\//, (m) => `${m}oauth2:${token}@`);
-}
-
 /** Opt-in inputs for one clone+build action. */
 interface CloneContext {
   /** Scratch store holding the commit engine preflight inspected. */
@@ -305,6 +290,7 @@ interface CloneContext {
   /** Checkout staged by dependency preflight; takes precedence over sourceDir. */
   preparedCheckout?: string | undefined;
   commands?: PinnedCommands | undefined;
+  excluded?: Iterable<string>;
   /** Operator-selected Bun for the host install; PATH lookup otherwise. */
   bun?: string | undefined;
 }
@@ -317,10 +303,25 @@ async function executeClone(
   const { beforeBuild, dependencies, onDependencyMutation, preparedCheckout, commands } = context;
   // A dependency preflight checkout already holds the inspected commit.
   const sourceDir = preparedCheckout ? undefined : context.sourceDir;
-  const env = repositoryIndependentGitEnv();
-  const git = (args: string[], cwd?: string) => commands
-    ? commands.run('git', args, cwd ?? process.cwd(), true, env)
-    : execFileSync('git', args, { env, cwd, stdio: ['ignore', 'inherit', 'inherit'] });
+  const env = sourceGitEnvironment(action.url, action.authSecret, values, action.key, buildEnv, context.excluded);
+  const git = async (args: string[], cwd?: string): Promise<string> => {
+    // Both network commands run in the target: include its local Git config.
+    if (action.authSecret && (args[0] === 'fetch' || args[0] === 'ls-remote')) {
+      assertUnrewrittenSourceUrl(action.url, env, action.key, values[action.authSecret], cwd, 'origin');
+      // No submodule network operations may inherit this source's credential,
+      // even when operator config enables recursive fetches.
+      if (args[0] === 'fetch') args = ['fetch', '--no-recurse-submodules', ...args.slice(1)];
+      if (action.sslBypass) args = ['-c', 'http.sslVerify=false', ...args];
+    }
+    try {
+      return commands ? await commands.run('git', args, cwd ?? process.cwd(), !action.authSecret, env)
+        : execFileSync('git', args, { env, cwd, encoding: 'utf8', stdio: action.authSecret ? ['ignore', 'pipe', 'pipe'] : ['ignore', 'inherit', 'inherit'] }) ?? '';
+    } catch (err) {
+      const { status, code } = err as { status?: number; code?: string };
+      const output = gitFailureOutput(err, action.authSecret ? values[action.authSecret] : undefined);
+      throw new Error(`${action.key}: git ${args[0]} failed (${status ?? code ?? 'unknown'}).${output ? '\n' + output : ''}${action.authSecret ? '\n' + AUTH_REDIRECT_HINT : ''}`);
+    }
+  };
   rmSync(action.target, { recursive: true, force: true });
   mkdirSync(resolve(action.target, '..'), { recursive: true });
 
@@ -339,13 +340,27 @@ async function executeClone(
       };
       localGit(['clone', '--origin', 'origin', '--no-reject-shallow', '--no-hardlinks', '--branch', 'cook-selected', '--', sourceDir, action.target], 'clone inspected source');
       localGit(['-C', action.target, 'remote', 'set-url', 'origin', action.url], 'set-url origin');
+    } else if (action.authSecret) {
+      // clone can load target-only conditional config after a cwd-only check.
+      // Initialize the real target and origin before ANY authenticated network.
+      await git(['init', action.target]);
+      await git(['remote', 'add', 'origin', action.url], action.target);
+      const head = await git(['ls-remote', '--symref', 'origin', 'HEAD'], action.target);
+      // remote add's refspec fetches all branches, including remote HEAD.
+      // Explicit --tags also brings in tags unreachable from any branch, as
+      // clone does, so subsequent branch/tag/SHA checkouts see the same objects.
+      await git(['fetch', '--tags', 'origin'], action.target);
+      const branch = /^ref: refs\/heads\/(.+)\tHEAD$/m.exec(head)?.[1];
+      if (branch) {
+        await git(['symbolic-ref', 'refs/remotes/origin/HEAD', `refs/remotes/origin/${branch}`], action.target);
+        await git(['checkout', '-b', branch, '--track', `refs/remotes/origin/${branch}`], action.target);
+      } else {
+        const sha = /^([0-9a-f]{40}|[0-9a-f]{64})\tHEAD$/mi.exec(head)?.[1];
+        if (sha) await git(['checkout', '--detach', sha], action.target);
+      }
     } else {
-      await git([...sslArgs, 'clone', cloneUrlFor(action, values), action.target]);
-    }
-    if (action.authSecret) {
-      // Scrub the token from .git/config — the credentialed URL must not
-      // persist on disk (backups, shared machines, later `git fetch`).
-      await git(['remote', 'set-url', 'origin', action.url], action.target);
+      // Public sources retain the existing clone path (including URL aliases).
+      await git([...sslArgs, 'clone', action.url, action.target]);
     }
     if (action.commit) {
       // Pinned build: check out the exact SHA the operator resolved at cook
@@ -379,8 +394,9 @@ async function executeClone(
 
   let commit: string | undefined;
   try {
-    commit = commands ? await commands.run('git', ['rev-parse', 'HEAD'], action.target, false, env)
-      : execFileSync('git', ['rev-parse', 'HEAD'], { env, cwd: action.target }).toString().trim();
+    const head = commands ? await commands.run('git', ['rev-parse', 'HEAD'], action.target, false, env)
+      : execFileSync('git', ['rev-parse', 'HEAD'], { env, cwd: action.target, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
+    if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(head)) commit = head;
   } catch {
     // Non-fatal — lock entry just omits the commit.
   }
@@ -394,13 +410,17 @@ async function executeClone(
     log.step(`building ${log.dim(action.target)}: ${action.buildCommand}`);
     // The fixed host build needs no shell: Bun itself must be the direct child
     // so PID-only cancellation stops it, without signaling any helpers.
-    if (commands && action.role === 'connectome-host') await commands.run(context.bun ?? 'bun', ['install'], action.target, true, buildEnv);
-    else if (commands) await commands.run('/bin/sh', ['-c', action.buildCommand], action.target, true, buildEnv);
-    else execSync(action.buildCommand, {
-      cwd: action.target,
-      stdio: ['ignore', 'inherit', 'inherit'],
-      env: buildEnv,
-    });
+    try {
+      if (commands && action.role === 'connectome-host') await commands.run(context.bun ?? 'bun', ['install'], action.target, true, buildEnv);
+      else if (commands) await commands.run('/bin/sh', ['-c', action.buildCommand], action.target, true, buildEnv);
+      else execSync(action.buildCommand, {
+        cwd: action.target,
+        stdio: ['ignore', 'inherit', 'inherit'],
+        env: buildEnv,
+      });
+    } catch {
+      throw new Error(`${action.key}: build failed; if an operator environment setting is needed, select its name with COOK_PASS_ENV.`);
+    }
   }
   if (dependencies?.length) verifyHostDependencyResolutions(action.target, dependencies);
   return { ...(commit !== undefined ? { commit } : {}) };
@@ -590,7 +610,7 @@ async function runWithSelectedEngines(
     const handlers = signals.map(signal => () => { cleanup(); process.kill(process.pid, signal); });
     signals.forEach((signal, i) => process.on(signal, handlers[i]!));
     try {
-      const checked = preflightHostEngines(options.chRepoUrl, options.chCommit ?? options.chRef, options.bunPath, options.nodePath, cleanup => { removeScratch = cleanup; });
+      const checked = preflightHostEngines(options.chRepoUrl, options.chCommit ?? options.chRef, options.bunPath, options.nodePath, cleanup => { removeScratch = cleanup; }, gitEnvironment(undefined, knownSecretEnvironmentNames(plan)));
       options = { ...options, chRepoUrl: checked.sourceUrl, chCommit: checked.commit };
       return await materializeHost(plan, options, checked, onStaged, commands);
     } finally {
@@ -614,7 +634,7 @@ async function materializeHost(
   let installDir = options.installDir;
   const dependencyInputs = parseHostDependencies(options.hostDependencies);
   let engines = checked?.engines;
-  const buildEnv = { ...process.env };
+  const buildEnv = processAllowlistEnv();
   let existingLock: Lockfile | null = null;
   try {
     existingLock = readLockfile(installDir);
@@ -623,7 +643,7 @@ async function materializeHost(
   }
 
   const hasRecordedPins = assertHostDependencyReinstall(installDir, existingLock?.hostDependencies, dependencyInputs, options.dropHostDependencies);
-  const dependencies = dependencyInputs.length ? await preflightHostDependencies(options.chRepoUrl, options.chCommit ?? options.chRef, dependencyInputs, installDir, onStaged, commands) : undefined;
+  const dependencies = dependencyInputs.length ? await preflightHostDependencies(options.chRepoUrl, options.chCommit ?? options.chRef, dependencyInputs, installDir, onStaged, commands, gitEnvironment(buildEnv, knownSecretEnvironmentNames(plan))) : undefined;
   if (dependencies) {
     installDir = dependencies.installDir;
     options = { ...options, installDir, chCommit: dependencies.commit };
@@ -703,6 +723,14 @@ async function materializeHost(
   const invalidateLock = !existingLock || engineBindingChanged
     || actions.clones.some(action => !canReuse(action));
   if (engineBindingChanged) existingLock = null;
+  // Only actions that will acquire a checkout need credentials. Validate all
+  // of those before confirmation/destructive work, not unchanged private ones.
+  for (const action of actions.clones) {
+    if (!canReuse(action)) {
+      const source = plan.sources.find(source => source.key === action.key);
+      sourceGitEnvironment(action.url, action.authSecret, plan.values, source ? sourceLocation(source) : action.key, buildEnv, knownSecretEnvironmentNames(plan));
+    }
+  }
 
   // ---- Confirm gate: commands run on the operator's machine. ----
   process.stdout.write(renderActionPreview(actions, options, dependencies?.records) + '\n\n');
@@ -771,6 +799,7 @@ async function materializeHost(
           onDependencyMutation: () => { keepSnapshots = true; },
           preparedCheckout: isHost ? dependencies?.checkout : undefined,
           commands,
+          excluded: knownSecretEnvironmentNames(plan),
           bun: engines?.bun.path,
         })).commit;
       } catch (err) {
