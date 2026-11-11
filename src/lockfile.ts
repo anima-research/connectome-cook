@@ -41,6 +41,8 @@ export interface LockedRequirement {
 
 export interface Lockfile {
   version: 1;
+  /** Explicit roots and connector-state bindings for a split host install. */
+  layout?: import('./host-layout.js').HostLayout;
   /** Hash-pinned local inputs and explicit pre-install package.json edits. */
   hostDependencies?: import('./host-dependency.js').LockedHostDependency[];
   /** A confirmed reinstall started but has not completed successfully. */

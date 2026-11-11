@@ -296,3 +296,20 @@ for (const kind of ['clone', 'copy', 'sidecar-template'] as const) for (const pa
   await expect(runHostBackend(plan, { ...OPTIONS, installDir, yes: false })).rejects.toThrow('E_HOST_ENGINE_RESERVED:');
   expect(existsSync(installDir)).toBe(false);
 });
+
+test('R4-5d mixed recipe preview names only recipes using default mounts', () => {
+  const walks = [undefined, true, false, { mounts: [{ name: 'custom', path: './custom' }] }].map((workspace, index) => ({
+    path: `/recipe-${index}.json`,
+    recipe: { name: 'Test', agent: { systemPrompt: 'Test' }, modules: { workspace } } as Recipe,
+  }));
+  const plan = minimalPlan({ walks });
+  const options: HostBackendOptions = { ...OPTIONS, layout: {
+    schema: 'connectome.host-layout/v1', config: '/config', runtime: OPTIONS.installDir,
+    state: '/state', workspace: '/workspace', credentials: '/credentials', connectorState: {},
+  } };
+  const preview = renderActionPreview(planHostActions(plan, options), options, [], plan);
+  expect(preview).toContain('Default mounts for /recipe-0.json:');
+  expect(preview).toContain('Default mounts for /recipe-1.json:');
+  expect(preview).not.toContain('Default mounts for /recipe-2.json:');
+  expect(preview).not.toContain('Default mounts for /recipe-3.json:');
+});

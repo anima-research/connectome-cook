@@ -163,3 +163,21 @@ being present; RUNTIME means a source checkout has not installed semver yet.
 Input errors identify paths/reasons; hash mismatches give expected/observed
 digests and version mismatches give version/range. Source errors identify
 repository/ref/operation and a safe cause, never arbitrary Git/helper output.
+
+
+## Split host layout
+
+`--host-dependency` also works with `--layout` and its required selected engines.
+The immutable archives stay under the **runtime** root's `host-inputs/`, never
+in the state, workspace or configuration root. Split roots are provisioned
+with their stricter no-symlink/ancestor ownership policy before archive storage
+is materialized. The default dependency-storage policy (including trusted
+symlink canonicalization) is unchanged; it is implemented separately so it
+cannot weaken split-root checks.
+
+Split recipes cannot clone or copy into `host-inputs/`, even after an explicit
+drop or when no new pins are supplied: retained archives remain cook-owned.
+The lock records layout, engines, dependency deltas and exported-unit hints
+together. Pin reinstalls and explicit drops still rebuild the host. A failed
+reinstall atomically marks the private lock incomplete; retry with the same
+layout and explicit pins (or drop) rather than reusing interrupted work.

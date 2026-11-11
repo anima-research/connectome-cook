@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, lstatSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { chmodSync, lstatSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
+import { layoutTestDirectory } from './test-layout-directory.js';
 import { createServer, type Socket } from 'node:net';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
@@ -51,7 +51,7 @@ function refused(code: string, extra?: string[]) {
 }
 beforeEach(() => {
   snapshots = new Set();
-  dir = mkdtempSync(join(tmpdir(), 'cook-local-input-test-')); repo = join(dir, 'host'); mkdirSync(repo);
+  dir = layoutTestDirectory('cook-local-input-test-'); repo = join(dir, 'host'); mkdirSync(repo);
   git(['init', '-b', 'main']); git(['config', 'user.name', 'Fixture']); git(['config', 'user.email', 'fixture@example.org']); host();
   out = join(dir, 'install'); recipe = join(dir, 'recipe.json'); archive = join(dir, 'input.tgz');
   writeFileSync(recipe, JSON.stringify({ name: 'Synthetic', agent: { systemPrompt: 'Test only' } }));
@@ -861,4 +861,74 @@ test('a failed rebuild of a pinned host marks the lock incomplete', () => {
   const run = spawnSync(realBun, [resolve('bin/cook'), 'run', out], { encoding: 'utf8' });
   expect(run.status).not.toBe(0);
   expect(run.stdout + run.stderr).toContain('last install failed');
+});
+
+function splitDependencyOptions() {
+  const pkg = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8'));
+  pkg.engines = { bun: '>=1.4.0', node: '>=20' };
+  writeFileSync(join(repo, 'package.json'), JSON.stringify(pkg)); git(['commit', '-am', 'Selected engines']);
+  const layout = { schema: 'connectome.host-layout/v1', runtime: out,
+    config: join(dir, 'config'), state: join(dir, 'state'), workspace: join(dir, 'workspace'),
+    credentials: join(dir, 'credentials'), connectorState: {} };
+  const file = join(dir, 'layout.json'); writeFileSync(file, JSON.stringify(layout));
+  const bun = join(shim, 'bun');
+  const resetBun = () => writeFileSync(bun, `#!/bin/sh\nif [ "$1" = --version ]; then exec '${realBun}' --version; fi\nexec env BUN_INSTALL_CACHE_DIR='${join(dir, 'cache')}' '${realBun}' "$@" --offline\n`);
+  resetBun();
+  const node = execFileSync('node', ['-p', 'process.execPath'], { encoding: 'utf8' }).trim();
+  return { layout, bun, resetBun, args: ['--layout', file, '--bun-path', bun, '--node-path', node] };
+}
+
+test('merge dependency interaction: split roots keep pinned snapshots and all lock fields in private runtime, always rebuild, explicit drop', () => {
+  const { layout, bun, args } = splitDependencyOptions();
+  const pinned = ['--host-dependency', option(), ...args, '--user-unit', 'example.service'];
+  const first = install(pinned); if (first.status) console.error(first.stdout, first.stderr);
+  expect(first.status).toBe(0);
+  expect(first.stdout).toContain(join(out, 'host-inputs') + '/');
+  const lockPath = join(out, 'connectome.lock');
+  const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+  expect(lock.layout).toEqual(layout);
+  expect(lock.engines.bun.path).toBe(bun);
+  expect(lock.launch.userUnit).toBe(join(out, 'example.service'));
+  expect(lock.hostDependencies[0].snapshot).toBe(join(out, 'host-inputs', digest + '.tgz'));
+  expect(statSync(out).mode & 0o7777).toBe(0o700);
+  expect(statSync(join(out, 'host-inputs')).mode & 0o7777).toBe(0o700);
+  expect(statSync(lock.hostDependencies[0].snapshot).mode & 0o7777).toBe(0o400);
+  expect(statSync(lockPath).mode & 0o7777).toBe(0o600);
+  expect(existsSync(join(layout.config, 'recipes/recipe.json'))).toBe(true);
+  expect(existsSync(join(out, 'recipes'))).toBe(false);
+  expect(existsSync(join(layout.state, 'host-inputs'))).toBe(false);
+  const canary = join(out, 'app/must-rebuild'); writeFileSync(canary, 'stale');
+  expect(install(pinned).status).toBe(0); expect(existsSync(canary)).toBe(false);
+  const before = readFileSync(lockPath, 'utf8');
+  const omitted = install(args);
+  expect(omitted.status).not.toBe(0); expect(omitted.stderr).toContain('E_HOST_DEPENDENCY_REINSTALL');
+  expect(readFileSync(lockPath, 'utf8')).toBe(before);
+  // Drop restores upstream ranges; a local no-op build avoids any registry I/O.
+  writeFileSync(bun, `#!/bin/sh\nif [ "$1" = --version ]; then exec '${realBun}' --version; fi\nexit 0\n`);
+  expect(install([...args, '--drop-host-dependencies']).status).toBe(0);
+  const dropped = JSON.parse(readFileSync(lockPath, 'utf8'));
+  expect(dropped.hostDependencies).toBeUndefined(); expect(dropped.layout).toEqual(layout);
+  expect(dropped.launch.userUnit).toBe(join(out, 'example.service'));
+  const restored = JSON.parse(readFileSync(join(out, 'app/package.json'), 'utf8'));
+  expect(restored.dependencies['fixture-local-input']).toBe('^1.0.0'); expect(restored.overrides).toBeUndefined();
+});
+
+test('merge dependency interaction: failed split pin reinstall retains incomplete private metadata and retries offline', () => {
+  const { layout, bun, resetBun, args } = splitDependencyOptions();
+  const pinned = ['--host-dependency', option(), ...args];
+  expect(install([...pinned, '--user-unit', 'example.service']).status).toBe(0);
+  writeFileSync(bun, `#!/bin/sh\nif [ "$1" = --version ]; then exec '${realBun}' --version; fi\nexit 42\n`);
+  expect(install(pinned).status).toBe(3);
+  const lockPath = join(out, 'connectome.lock');
+  const failed = JSON.parse(readFileSync(lockPath, 'utf8'));
+  expect(failed.incomplete).toBe(true); expect(failed.layout).toEqual(layout);
+  expect(failed.hostDependencies[0].sha256).toBe(digest);
+  expect(failed.launch.userUnit).toBe(join(out, 'example.service'));
+  expect(statSync(lockPath).mode & 0o7777).toBe(0o600);
+  expect(existsSync(join(out, 'app'))).toBe(false);
+  expect(JSON.parse(readFileSync(join(out, '.cook-layout.json'), 'utf8')).phase).toBe('installing');
+  const run = spawnSync(realBun, [resolve('bin/cook'), 'run', out], { encoding: 'utf8' });
+  expect(run.status).toBe(1); expect(run.stderr).toContain('last install failed');
+  resetBun(); expect(install(pinned).status).toBe(0);
+  expect(JSON.parse(readFileSync(lockPath, 'utf8')).incomplete).toBeUndefined();
 });
