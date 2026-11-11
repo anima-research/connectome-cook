@@ -181,7 +181,7 @@ ${log.bold('Flags:')}
                          Write templated config files even when \${VAR}
                          references render as empty (default: refuse)
   --env-file <path>      Read variable values from this file before prompting
-  --layout <local-json>  Opt-in split roots and explicit connector-state mappings
+  --layout <local-json>  Opt-in split roots (requires --out and selected engines)
   --ch-repo <url>        connectome-host repo (default: ${DEFAULT_CH_REPO_URL})
   --ch-ref <ref>         connectome-host ref (default: ${DEFAULT_CH_REF})
   --bun-path <absolute>  Validate host engines (requires --node-path)
@@ -214,23 +214,24 @@ async function handleInstall(argv: string[]): Promise<number> {
     return 1;
   }
 
+  // Unit syntax errors retain their own diagnostic, even with --layout.
+  if (flags['user-unit'] !== undefined) validateUserUnit(flags['user-unit']);
+
   let layout: HostLayout | undefined;
   // Layout flag shape errors must not trigger recipe prompts or source fetches.
   if (flags.layout !== undefined) {
     if (typeof flags.layout !== 'string' || !flags.layout.trim()) throw new Error('E_HOST_LAYOUT: --layout requires a nonempty local JSON path');
     if (!flags['bun-path'] || !flags['node-path']) throw new Error('E_HOST_LAYOUT: --layout requires both --bun-path and --node-path');
+    if (typeof flags.out !== 'string' || !flags.out.trim()) throw new Error('E_HOST_LAYOUT: --layout requires --out');
     try {
       const value = JSON.parse(readFileSync(flags.layout, 'utf8'));
-      // With no --out, the recipe-derived default is checked after resolution.
-      layout = hostLayout(value, flags.out !== undefined ? resolve(flags.out) : value?.runtime);
-      if (flags['user-unit'] !== undefined) renderUserUnit(layout.runtime, flags['user-unit'], layout.state);
+      layout = hostLayout(value, resolve(flags.out));
     } catch (error) {
       throw new Error(`E_HOST_LAYOUT: --layout ${flags.layout}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   // Refuse unit options before recipe resolution can fetch or prompt.
   if (flags['user-unit'] !== undefined) {
-    validateUserUnit(flags['user-unit']);
     if (!flags['bun-path'] || !flags['node-path']) {
       throw new Error('E_HOST_UNIT: --user-unit requires both --bun-path and --node-path');
     }
@@ -644,9 +645,9 @@ export async function main(argv: string[]): Promise<void> {
   }
 
   const commandArgs = argv.slice(1, argv.indexOf('--') === -1 ? undefined : argv.indexOf('--'));
-  for (const flag of ['--host-dependency', '--drop-host-dependencies']) {
+  for (const flag of ['--host-dependency', '--drop-host-dependencies', '--layout']) {
     if (first !== 'install' && commandArgs.some(arg => arg === flag || arg.startsWith(flag + '='))) {
-      throw new Error(`${flag} is only supported by install`);
+      throw new Error(`${flag === '--layout' ? 'E_HOST_LAYOUT: ' : ''}${flag} is only supported by install`);
     }
   }
   const handler = SUBCOMMANDS[first];

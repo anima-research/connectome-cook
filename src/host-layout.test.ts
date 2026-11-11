@@ -10,7 +10,7 @@ import { lowerToConfiguration } from './configuration.js';
 import { detectSources } from './source-detector.js';
 import type { Recipe } from './vendor/recipe.js';
 import { hostLayout, provisionLayout, validateLayoutConsumers, type HostLayout } from './host-layout.js';
-import { provisionPrivateDirectory, writePrivateLayoutFile } from './private-directory.js';
+import { provisionLayoutDirectory, writePrivateLayoutFile } from './layout-directory.js';
 
 let dir: string;
 beforeEach(() => { dir = layoutTestDirectory('cook-layout-'); });
@@ -44,14 +44,14 @@ test('provisioning refuses unsafe existing modes, symlinks, files and wrong owne
   expect(lstatSync(c.state).mode & 0o777).toBe(0o755);
   expect(existsSync(c.runtime)).toBe(false);
   symlinkSync(c.state, c.config);
-  expect(() => provisionPrivateDirectory(c.config)).toThrow();
-  expect(() => provisionPrivateDirectory(c.config + '/nested')).toThrow();
+  expect(() => provisionLayoutDirectory(c.config)).toThrow();
+  expect(() => provisionLayoutDirectory(c.config + '/nested')).toThrow();
   writeFileSync(c.workspace, 'not a directory');
-  expect(() => provisionPrivateDirectory(c.workspace)).toThrow();
-  for (const path of ['relative', '/', dir + '/../bad']) expect(() => provisionPrivateDirectory(path)).toThrow();
+  expect(() => provisionLayoutDirectory(c.workspace)).toThrow();
+  for (const path of ['relative', '/', dir + '/../bad']) expect(() => provisionLayoutDirectory(path)).toThrow();
   if (process.geteuid!() === 0) {
     chmodSync(c.state, 0o700); chownSync(c.state, 1, 1);
-    expect(() => provisionPrivateDirectory(c.state)).toThrow('E_PRIVATE_OWNER');
+    expect(() => provisionLayoutDirectory(c.state)).toThrow('E_PRIVATE_OWNER');
   }
 });
 
@@ -77,10 +77,10 @@ test('connector file and parent mappings refuse in either order', () => {
 
 test('non-sticky writable ancestors refuse; shell-created sticky ancestors remain supported', () => {
   const parent = join(dir, 'shared'); mkdirSync(parent, { mode: 0o777 }); chmodSync(parent, 0o777);
-  expect(() => provisionPrivateDirectory(join(parent, 'private'))).toThrow('E_PRIVATE_ANCESTOR');
+  expect(() => provisionLayoutDirectory(join(parent, 'private'))).toThrow('E_PRIVATE_ANCESTOR');
   expect(existsSync(join(parent, 'private'))).toBe(false);
   execFileSync('chmod', ['1777', parent]);
-  expect(() => provisionPrivateDirectory(join(parent, 'private'))).not.toThrow();
+  expect(() => provisionLayoutDirectory(join(parent, 'private'))).not.toThrow();
 });
 
 test('layout root distinctness includes opened device/inode identities', () => {
@@ -164,7 +164,7 @@ for (const [owner, mode, allowed] of [
         ? Object.assign(stat, { uid: owner, mode: (stat.mode & ~0o7777) | mode }) : stat;
     }) as typeof fs.fstatSync);
     try {
-      const provision = () => provisionPrivateDirectory(join(parent, 'private'));
+      const provision = () => provisionLayoutDirectory(join(parent, 'private'));
       if (allowed) expect(provision).not.toThrow();
       else { expect(provision).toThrow('E_PRIVATE_ANCESTOR'); expect(existsSync(join(parent, 'private'))).toBe(false); }
     } finally { mocked.mockRestore(); }
@@ -177,4 +177,61 @@ test('R3-9 malformed workspace errors and missing consumers are named', () => {
     expect(() => applyWorkspaceMounts(configuration, layout())).toThrow('E_HOST_LAYOUT: modules.workspace');
   }
   expect(() => validateLayoutConsumers(layout(), [])).toThrow('state consumer local');
+});
+
+for (const [command, args] of [
+  ['bin/tool', []], ['node_modules/.bin/tool', []], ['.', []], ['..', []],
+  ['${TOOLS}/tool', []], ['node', ['${TOOLS}/x.js']],
+  ['node', ['${TOOL_HELPER:-./helper.js}']], ['node', ['prefix${TOOLS}suffix']],
+  ['node', ['--config=./cfg.json']], ['node', ['--config=../cfg.json']],
+  ['node', ['--root', '.']], ['node', ['..']],
+] as const) {
+  test(`R4-1 refuses stdio ${command} ${args.join(' ')}`, () => {
+    const configuration: Recipe = { name: 'Test', agent: { systemPrompt: 'Test' }, mcpServers: { tool: { command, args: [...args] } } };
+    expect(() => validateLayoutStdio(configuration)).toThrow(/E_HOST_LAYOUT:.*tool/);
+    expect(() => validateLayoutStdio(configuration)).toThrow(JSON.stringify(command === 'node' ? args.at(-1) : command));
+  });
+}
+test('R4-1 preserves PATH commands, absolute paths, package specs and ambiguous relative args', () => {
+  const configuration: Recipe = { name: 'Test', agent: { systemPrompt: 'Test' }, mcpServers: {
+    tool: { command: '/opt/bin/tool', args: ['/opt/tool.js', '--config=/opt/cfg.json'] },
+    package: { command: 'npx', args: ['@scope/package', 'dist/index.js'] },
+  } };
+  expect(() => validateLayoutStdio(configuration)).not.toThrow();
+});
+
+for (const suffix of ['config/recipes', 'state/connectors', 'state/connectors/local', 'state/connectors/local/settings']) {
+  test(`R4-2 prechecks private sub-root ${suffix} before provisioning`, () => {
+    const c = layout(), path = join(dir, suffix);
+    mkdirSync(path, { recursive: true, mode: 0o700 }); chmodSync(path, 0o755);
+    expect(() => hostLayout(c, c.runtime)).toThrow(path);
+    expect(() => hostLayout(c, c.runtime)).toThrow('E_PRIVATE_MODE');
+    expect(existsSync(c.runtime)).toBe(false);
+    expect(lstatSync(path).mode & 0o777).toBe(0o755);
+  });
+}
+test('R4-2 late provisioning and private file errors identify the destination', () => {
+  const c = hostLayout(layout(), join(dir, 'runtime'));
+  mkdirSync(c.state, { mode: 0o755 });
+  expect(() => provisionLayout(c)).toThrow(c.state);
+  const file = join(dir, 'control.json'); writeFileSync(file, 'original');
+  fs.linkSync(file, join(dir, 'alias'));
+  expect(() => writePrivateLayoutFile(file, 'replacement', 0o600)).toThrow(file);
+  expect(fs.readFileSync(file, 'utf8')).toBe('original');
+});
+
+test('R4-2 private file validation and IO errors name the file', () => {
+  const file = join(dir, 'control.json'); writeFileSync(file, 'original');
+  fs.linkSync(file, join(dir, 'alias'));
+  expect(() => writePrivateLayoutFile(file, 'replacement', 0o600)).toThrow(file);
+  rmSync(join(dir, 'alias'));
+  const sync = fs.fsyncSync;
+  const mocked = spyOn(fs, 'fsyncSync').mockImplementation(fd => {
+    if (fs.fstatSync(fd).isFile()) throw new Error('injected IO failure');
+    sync(fd);
+  });
+  try {
+    expect(() => writePrivateLayoutFile(file, 'replacement', 0o600)).toThrow(file);
+    expect(() => writePrivateLayoutFile(file, 'replacement', 0o600)).toThrow('injected IO failure');
+  } finally { mocked.mockRestore(); }
 });

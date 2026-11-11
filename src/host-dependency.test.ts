@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, lstatSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { chmodSync, lstatSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
+import { layoutTestDirectory } from './test-layout-directory.js';
 import { createServer, type Socket } from 'node:net';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
@@ -51,7 +51,7 @@ function refused(code: string, extra?: string[]) {
 }
 beforeEach(() => {
   snapshots = new Set();
-  dir = mkdtempSync(join(tmpdir(), 'cook-local-input-test-')); repo = join(dir, 'host'); mkdirSync(repo);
+  dir = layoutTestDirectory('cook-local-input-test-'); repo = join(dir, 'host'); mkdirSync(repo);
   git(['init', '-b', 'main']); git(['config', 'user.name', 'Fixture']); git(['config', 'user.email', 'fixture@example.org']); host();
   out = join(dir, 'install'); recipe = join(dir, 'recipe.json'); archive = join(dir, 'input.tgz');
   writeFileSync(recipe, JSON.stringify({ name: 'Synthetic', agent: { systemPrompt: 'Test only' } }));
@@ -883,6 +883,7 @@ test('merge dependency interaction: split roots keep pinned snapshots and all lo
   const pinned = ['--host-dependency', option(), ...args, '--user-unit', 'example.service'];
   const first = install(pinned); if (first.status) console.error(first.stdout, first.stderr);
   expect(first.status).toBe(0);
+  expect(first.stdout).toContain(join(out, 'host-inputs') + '/');
   const lockPath = join(out, 'connectome.lock');
   const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
   expect(lock.layout).toEqual(layout);

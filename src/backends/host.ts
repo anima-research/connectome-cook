@@ -62,7 +62,7 @@ import {
   type LockedComponent,
 } from '../lockfile.js';
 import { applyConnectorState, applyWorkspaceMounts, provisionLayout, type HostLayout, validateLayoutStdio, validateLayoutConsumers } from '../host-layout.js';
-import { writePrivateLayoutFile } from '../private-directory.js';
+import { writePrivateLayoutFile } from '../layout-directory.js';
 import { isPathWithin } from '../path-containment.js';
 import { renderUserUnit, validateUserUnit } from '../host-unit.js';
 import { assertHostEnginePath } from '../host-engine-path.js';
@@ -227,7 +227,7 @@ export function bindHostEngine(actions: HostActions, bunPath: string): void {
 }
 
 /** Render the confirm-gate preview. Pure (string). */
-export function renderActionPreview(actions: HostActions, options: HostBackendOptions, dependencies: LockedHostDependency[] = []): string {
+export function renderActionPreview(actions: HostActions, options: HostBackendOptions, dependencies: LockedHostDependency[] = [], plan?: Pick<InstallPlan, 'values' | 'walks'>): string {
   const lines: string[] = [];
   lines.push(`Host install plan → ${options.installDir}`);
   lines.push('');
@@ -255,11 +255,15 @@ export function renderActionPreview(actions: HostActions, options: HostBackendOp
   lines.push('');
   if (options.layout) {
     const c = options.layout;
-    lines.push(`Also writes: ${join(c.config, 'recipes')}/, ${join(c.config, '.env')}`);
-    lines.push(`Runtime controls: ${['run.sh', LOCKFILE_NAME, 'bunfig.toml', '.cook-layout.json', ...(options.userUnit ? [options.userUnit] : [])].map(name => join(c.runtime, name)).join(', ')}`);
+    lines.push(`Also writes: ${join(c.config, 'recipes')}/${plan && Object.keys(plan.values).length ? ', ' + join(c.config, '.env') : ''}`);
+    lines.push(`Runtime controls: ${['run.sh', LOCKFILE_NAME, 'bunfig.toml', '.cook-layout.json', '.cook-engines/', ...(dependencies.length ? ['host-inputs/'] : []), ...(options.userUnit ? [options.userUnit] : [])].map(name => join(c.runtime, name)).join(', ')}`);
     lines.push(`Host CWD / DATA_DIR: ${c.state}`);
     lines.push(`Agent workspace (relative/default mounts rebased; WORKSPACE_DIR exported): ${c.workspace}`);
-    lines.push(`Default mounts (only when workspace is unset/true): input=${join(c.workspace, 'input')} (read-only), products=${join(c.workspace, 'output')} (read-write); "." maps to ${c.workspace}`);
+    for (const walk of plan?.walks ?? []) {
+      if (walk.recipe.modules?.workspace === undefined || walk.recipe.modules.workspace === true) {
+        lines.push(`Default mounts for ${walk.path}: input=${join(c.workspace, 'input')} (read-only), products=${join(c.workspace, 'output')} (read-write)`);
+      }
+    }
     lines.push(`Reserved credentials (no consumer yet): ${c.credentials}`);
   } else lines.push(`Also writes: recipes/, .env, run.sh, ${LOCKFILE_NAME} under the install dir.`);
   return lines.join('\n');
@@ -576,7 +580,7 @@ function assertRecordedLayout(installDir: string, requested?: HostLayout): void 
     throw new Error('E_HOST_LAYOUT: no in-place adoption of default launcher, recipes/ or data/; use fresh roots');
   }
   if (marker) {
-    // Only our durable installing phase authorizes retry after lock retirement.
+    // A durable installing phase without a lock permits retry of a failed first install.
     // A completed marker must never bless a missing/corrupted/downgraded lock.
     if (installing && !pathPresent(join(installDir, LOCKFILE_NAME))) return;
     let lock: Lockfile | null;
@@ -720,7 +724,7 @@ function runtimeControlCollision(installDir: string, target: string, unitPaths: 
     || /^(?:run\.sh|bunfig\.toml|connectome\.lock|\.cook-layout\.json|\.cook-engines|host-inputs)(?:\/|$)/.test(rel);
 }
 
-/** R3-8: do not follow checkout-provided aliases into runtime controls (or
+/** Do not follow checkout-provided aliases into runtime controls (or
  * outside runtime). Re-run at the action boundary: an earlier clone/copy/build
  * can introduce ancestors that did not exist during preflight. This is not a
  * sandbox for build commands, nor protection against concurrent path swaps. */
@@ -895,7 +899,7 @@ async function materializeHost(
   if (engineBindingChanged) existingLock = null;
 
   // ---- Confirm gate: commands run on the operator's machine. ----
-  process.stdout.write(renderActionPreview(actions, options, dependencies?.records) + '\n\n');
+  process.stdout.write(renderActionPreview(actions, options, dependencies?.records, plan) + '\n\n');
   if (options.noPrompts) {
     if (!options.yes) {
       log.error('host install runs commands on this machine; non-interactive mode requires --yes');
@@ -916,7 +920,7 @@ async function materializeHost(
 
   if (layout) {
     provisionLayout(layout);
-    // Make resumption durable before retiring the reuse lock.
+    // Make resumption durable before marking any existing reuse lock incomplete.
     writeOutput(join(installDir, LAYOUT_MARKER), JSON.stringify({ phase: 'installing', layout }, null, 2) + '\n');
     writeOutput(join(installDir, 'bunfig.toml'), '# Runtime-owned: no preloads.\n');
   }

@@ -1,8 +1,8 @@
 # Opt-in split host layout
 
 A standalone host installation can use `--layout layout.json` with selected
-absolute engines (`--bun-path` and `--node-path`, both required). An empty
-`--layout` is an error. Build and run reject `--layout`; use install.
+absolute engines (`--bun-path` and `--node-path`, both required), plus an
+explicit `--out` runtime directory. An empty `--layout` is an error. Other subcommands reject `--layout`; use install.
 The runtime root must equal --out; all five roots must be absolute, distinct (including device/inode identity) and non-overlapping. Example (nonsecret declarations only):
 
     {
@@ -28,9 +28,10 @@ The launcher sets DATA_DIR to state, WORKSPACE_DIR to workspace, and runs with
 as a bare WorkingDirectory, using the user-unit renderer's percent escaping
 and terminal-backslash/trailing-whitespace refusal.
 
-State is intentional: connectome-host (reviewed at commit 1526663c) resolves
+State is intentional: connectome-host 0.25.0 resolves
 fleet child stores (`child.dataDir` or `data/NAME`), `mcpl-servers.agent.json`,
-`mcpl-servers.json`, `sleep-privileged.json`, `logs/failures.log` and lessons
+`mcpl-servers.json`, `sleep-privileged.json`, `logs/failures.log`,
+`modules.heartbeat.statePath` and `modules.heartbeat.importFrom`, and lessons
 exports (`output/`, on `/export`, quit and session switch) against
 process.cwd(). Host-owned relative state paths therefore stay in state, not
 the agent workspace or code checkout.
@@ -86,16 +87,22 @@ mapped file for the same consumer. Unknown/WebSocket consumers, traversal, unsaf
 roots and layout-owned DATA_DIR/WORKSPACE_DIR value overrides refuse.
 Other connector-specific paths are not guessed or automatically rebased: declare
 each state-file env binding explicitly and audit remaining paths.
-After lowering, stdio commands and args still starting with `./` or `../` refuse
-with the server name and value. Source-backed plain relative first args that
-lower to absolute paths remain supported. Use absolute executable/script paths
-for other cases. Relative environment values (e.g. `CFG_PATH=./cfg.json`) also
+After lowering, stdio commands and args equal to `.` or `..`, starting with
+`./` or `../`, or containing `${` refuse with the server name and value.
+Non-absolute commands containing `/` and flag args with `=./` or `=../` also
+refuse. Source-backed plain relative first args that lower to absolute paths
+remain supported. Use literal absolute executable/script paths for other cases.
+Bare relative args such as `dist/index.js` cannot be distinguished from package
+specs and remain the operator's responsibility to audit for the changed CWD.
+Relative environment values (e.g. `CFG_PATH=./cfg.json`) also
 change base from runtime/app to state; Cook cannot safely classify or rebase
 those values. Audit every consumer's relative env paths explicitly.
 
 Linux provisioning creates 0700 roots and state-file parent directories owned
-by the effective user. Existing roots with other ownership/modes, symlink
-ancestors and non-directories refuse. Every ancestor must be owned by root or
+by the effective user. Root and sub-root checks (including config/recipes and
+state/connectors parents) run before confirmation without creating directories.
+Provisioning and private-file errors name the destination path. Existing roots
+with other ownership/modes, symlink ancestors and non-directories refuse. Every ancestor must be owned by root or
 the effective user. Group/other-writable ancestors additionally require the
 sticky bit (even if root-owned); foreign non-root owners refuse even with the
 sticky bit. Backslashes in path components remain accepted; Cook never
@@ -158,6 +165,7 @@ backups. There is no importer or in-place adoption; use fresh roots for changes.
    | Other top-level DATA_DIR contents under `<install>/data/` | Same paths directly under `<state>/` |
    | `<install>/app/data/NAME` or relative `child.dataDir` | `<state>/data/NAME` or same relative child path |
    | `<install>/app/mcpl-servers.agent.json`, `mcpl-servers.json`, `sleep-privileged.json` | Same filenames under `<state>/` |
+   | Relative `modules.heartbeat.statePath` / `modules.heartbeat.importFrom` under `<install>/app/` | Same relative paths under `<state>/` |
    | `<install>/app/logs/failures.log` | `<state>/logs/failures.log` |
    | `<install>/app/input`, `<install>/app/output` workspace contents | `<workspace>/input`, `<workspace>/output` |
    | Future lessons exports formerly in `<install>/app/output` | `<state>/output` (not the products mount; agent cannot see it by default) |

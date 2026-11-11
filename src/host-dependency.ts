@@ -4,7 +4,7 @@ import { closeSync, constants, fchmodSync, fstatSync, lstatSync, fsyncSync, mkdt
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { gunzipSync } from 'node:zlib';
-import { provisionPrivateDirectory, resolvePrivateDirectoryPath } from './host-dependency-directory.js';
+import { provisionPrivateDirectory, resolvePrivateDirectoryPath } from './private-directory.js';
 import { log } from './log.js';
 import { PinnedCommands } from './pinned-commands.js';
 import { repositoryIndependentGitEnv } from './git-env.js';

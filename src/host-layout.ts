@@ -1,6 +1,6 @@
 /** Explicit, opt-in standalone legacy layout. No data discovery or migration. */
 import { dirname, join, resolve, isAbsolute } from 'node:path';
-import { privatePathParts, provisionPrivateDirectory } from './private-directory.js';
+import { layoutPathParts, provisionLayoutDirectory } from './layout-directory.js';
 import { isPathWithin } from './path-containment.js';
 import type { Recipe } from './vendor/recipe.js';
 
@@ -24,7 +24,7 @@ export function hostLayout(value: unknown, installDir: string): HostLayout {
   for (const role of roles) {
     const path = c[role];
     if (typeof path !== 'string' || !path.startsWith('/') || /[\0-\x1f\x7f]/.test(path)) fail(role, `expected an absolute control-free path: ${JSON.stringify(path)}`);
-    try { privatePathParts(path.slice(1)); }
+    try { layoutPathParts(path.slice(1)); }
     catch { fail(role, `${path}: noncanonical path (empty, dot or traversal component)`); }
     const overlap = paths.find(p => isPathWithin(path, p.path) || isPathWithin(p.path, path));
     if (overlap) fail(role, `${path}: overlaps ${overlap.role} ${overlap.path}`);
@@ -38,7 +38,7 @@ export function hostLayout(value: unknown, installDir: string): HostLayout {
     if (files.some(file => typeof file === 'string' && files.some(other => typeof other === 'string' && other !== file && isPathWithin(file, other)))) fail(`connectorState.${consumer}`, 'a file cannot also be a parent directory');
     for (const [name, path] of Object.entries(env)) {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || typeof path !== 'string') fail(`connectorState.${consumer}.${name}`, 'expected an env name and relative file path');
-      try { privatePathParts(path); }
+      try { layoutPathParts(path); }
       catch { fail(`connectorState.${consumer}.${name}`, `${path}: unsafe relative path`); }
     }
   }
@@ -46,13 +46,17 @@ export function hostLayout(value: unknown, installDir: string): HostLayout {
   const identities = new Set<string>();
   for (const { role, path } of paths) {
     let stat;
-    try { stat = provisionPrivateDirectory(path, false); }
-    catch (err) { fail(role, `${path}: ${err instanceof Error ? err.message : String(err)}`); }
+    try { stat = provisionLayoutDirectory(path, false); }
+    catch (err) { fail(role, err instanceof Error ? err.message : String(err)); }
     if (stat) {
       const identity = `${stat.dev}:${stat.ino}`;
       if (identities.has(identity)) fail(role, `${path}: root aliases another root (device/inode)`);
       identities.add(identity);
     }
+  }
+  for (const path of layoutSubdirectories(c)) {
+    try { provisionLayoutDirectory(path, false); }
+    catch (err) { fail('sub-root', err instanceof Error ? err.message : String(err)); }
   }
   return c;
 }
@@ -63,20 +67,25 @@ export function validateLayoutConsumers(layout: HostLayout, recipes: Recipe[]): 
     if (!matches.length || matches.some(s => !s.command || s.url)) throw new Error(`E_HOST_LAYOUT: state consumer ${consumer} must be declared stdio`);
   }
 }
-export function provisionLayout(layout: HostLayout): void {
-  for (const role of roles) provisionPrivateDirectory(layout[role]);
-  provisionPrivateDirectory(join(layout.config, 'recipes'));
+/** Enumerate every directory whose private mode is part of the layout contract. */
+function layoutSubdirectories(layout: HostLayout): Set<string> {
+  const paths = new Set([join(layout.config, 'recipes')]);
   for (const [consumer, env] of Object.entries(layout.connectorState)) {
     const root = join(layout.state, 'connectors', consumer);
-    provisionPrivateDirectory(join(layout.state, 'connectors'));
-    provisionPrivateDirectory(root);
+    paths.add(join(layout.state, 'connectors'));
+    paths.add(root);
     for (const path of Object.values(env)) {
       let current = root;
       for (const part of dirname(path).split('/').filter(p => p !== '.')) {
-        current = join(current, part); provisionPrivateDirectory(current);
+        current = join(current, part); paths.add(current);
       }
     }
   }
+  return paths;
+}
+export function provisionLayout(layout: HostLayout): void {
+  for (const role of roles) provisionLayoutDirectory(layout[role]);
+  for (const path of layoutSubdirectories(layout)) provisionLayoutDirectory(path);
 }
 export function applyConnectorState(configuration: Recipe, layout: HostLayout): void {
   for (const [consumer, mapping] of Object.entries(layout.connectorState)) {
@@ -119,9 +128,13 @@ export function applyWorkspaceMounts(configuration: Recipe, layout: HostLayout):
 export function validateLayoutStdio(configuration: Recipe): void {
   for (const [name, server] of Object.entries(configuration.mcpServers ?? {})) {
     if (!server.command || server.url) continue;
-    for (const value of [server.command, ...(server.args ?? [])]) {
-      if (value.startsWith('./') || value.startsWith('../')) {
-        throw new Error(`E_HOST_LAYOUT: stdio server ${name}: CWD-relative executable/arg ${JSON.stringify(value)}`);
+    for (const [index, value] of [server.command, ...(server.args ?? [])].entries()) {
+      const variable = value.includes('${');
+      const relative = value === '.' || value === '..' || value.startsWith('./') || value.startsWith('../')
+        || (index === 0 && !isAbsolute(value) && value.includes('/'))
+        || /^--?[^=]+=\.\.?\//.test(value);
+      if (variable || relative) {
+        throw new Error(`E_HOST_LAYOUT: stdio server ${name}: ${variable ? 'variable' : 'CWD-relative'} executable/arg ${JSON.stringify(value)}`);
       }
     }
   }

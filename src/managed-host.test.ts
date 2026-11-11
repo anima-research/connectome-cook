@@ -346,7 +346,7 @@ test('layout R1 preview: confirms actual config, runtime and reserved roots', ()
   const c = splitLayout();
   const result = install(['--layout', layoutFile(), '--bun-path', bun, '--node-path', node]);
   expect(result.status).toBe(0);
-  for (const path of [join(c.config, 'recipes'), join(c.config, '.env'), join(c.runtime, 'run.sh'), join(c.runtime, 'bunfig.toml'), c.state, c.workspace, c.credentials]) expect(result.stdout).toContain(path);
+  for (const path of [join(c.config, 'recipes'), join(c.runtime, 'run.sh'), join(c.runtime, 'bunfig.toml'), c.state, c.workspace, c.credentials]) expect(result.stdout).toContain(path);
   expect(result.stdout).not.toContain('under the install dir');
 });
 
@@ -519,7 +519,7 @@ test('layout parse, IO, overlap and state-unit errors precede recipe resolution'
     writeFileSync(file, content);
     const result = install(['--layout', file, '--bun-path', bun, '--node-path', node, '--user-unit', 'example.service', '--pin-refs']);
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain('E_HOST_LAYOUT: --layout ' + file + ':');
+    expect(result.stderr).toContain(content.includes('bad') ? 'E_HOST_UNIT:' : 'E_HOST_LAYOUT: --layout ' + file + ':');
     expect(result.stdout).not.toContain('walking recipe');
     expect(existsSync(out)).toBe(false);
   }
@@ -689,14 +689,14 @@ test('R3-3 build and run reject layout before resolving or launching a target', 
   expect(help.stdout).not.toContain('--layout');
 });
 
-test('R3-9 preview labels defaults conditionally for disabled and explicit workspaces', () => {
+test('R4-5d preview omits defaults for disabled and explicit workspaces', () => {
   for (const workspace of [false, { mounts: [{ name: 'custom', path: './custom' }] }]) {
     const original = JSON.parse(readFileSync(recipe, 'utf8'));
     writeFileSync(recipe, JSON.stringify({ ...original, modules: { workspace } }));
     const result = install(['--layout', layoutFile(), '--bun-path', bun, '--node-path', node]);
     expect(result.status).toBe(0);
     expect(result.stdout).not.toContain('Implicit mounts:');
-    expect(result.stdout).toContain('Default mounts (only when workspace is unset/true)');
+    expect(result.stdout).not.toContain('Default mounts');
   }
 });
 
@@ -796,4 +796,71 @@ for (const target of ['host-inputs', 'host-inputs/nested']) test(`merge dependen
   const result = install(['--layout', layoutFile(), '--bun-path', bun, '--node-path', node]);
   expect(result.status).toBe(1); expect(result.stderr).toContain('E_HOST_LAYOUT');
   expect(result.stdout).not.toContain('Host install plan'); expect(existsSync(out)).toBe(false);
+});
+
+for (const [command, args] of [
+  ['bin/tool', []], ['node_modules/.bin/tool', []], ['${TOOLS}/tool', []],
+  ['node', ['${TOOLS}/x.js']], ['node', ['${TOOL_HELPER:-./helper.js}']],
+  ['node', ['--config=./cfg.json']], ['node', ['--config=../cfg.json']],
+  ['node', ['--root', '.']], ['npx', ['..']], ['npx', ['.']],
+] as const) {
+  test(`R4-1 CLI refuses CWD-dependent stdio ${command} ${args.join(' ')}`, () => {
+    const original = JSON.parse(readFileSync(recipe, 'utf8'));
+    original.mcpServers.local = { command, args };
+    writeFileSync(recipe, JSON.stringify(original));
+    const result = install(['--layout', layoutFile(), '--bun-path', bun, '--node-path', node]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('E_HOST_LAYOUT: stdio server local:');
+    expect(result.stdout).not.toContain('Host install plan');
+    expect(existsSync(out)).toBe(false);
+  });
+}
+test('R4-2 CLI refuses unsafe connector parents before the preview and confirmation', () => {
+  const c = splitLayout(), path = join(c.state, 'connectors');
+  mkdirSync(c.state, { mode: 0o700 }); mkdirSync(path, { mode: 0o755 });
+  const result = install(['--layout', layoutFile(), '--bun-path', bun, '--node-path', node]);
+  expect(result.status).toBe(1); expect(result.stderr).toContain(path);
+  expect(result.stdout).not.toContain('Host install plan');
+  expect(existsSync(out)).toBe(false);
+});
+test('R4-5c invalid unit names keep unit diagnostics with layout', () => {
+  rmSync(recipe);
+  const result = install(['--layout', layoutFile(), '--bun-path', bun, '--node-path', node, '--user-unit', 'bad name']);
+  expect(result.status).toBe(1); expect(result.stderr).toContain('E_HOST_UNIT');
+  expect(result.stderr).not.toContain('E_HOST_LAYOUT');
+  expect(result.stderr).not.toContain('ENOENT');
+});
+test('R4-5c layout requires explicit out before recipe resolution or prompts', () => {
+  rmSync(recipe);
+  const result = spawnSync(process.execPath, [resolve('bin/cook'), 'install', recipe,
+    '--layout', layoutFile(), '--bun-path', bun, '--node-path', node], { encoding: 'utf8', timeout: 5000 });
+  expect(result.error).toBeUndefined(); expect(result.status).toBe(1);
+  expect(result.stderr).toContain('E_HOST_LAYOUT: --layout requires --out');
+  expect(result.stderr).not.toContain('ENOENT');
+});
+test('R4-5c all other subcommands reject layout before loading the recipe', () => {
+  rmSync(recipe);
+  for (const command of ['check', 'init', 'cook', 'build', 'run']) {
+    const result = spawnSync(process.execPath, [resolve('bin/cook'), command, recipe, '--layout=missing'], { encoding: 'utf8' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('E_HOST_LAYOUT: --layout is only supported by install');
+    expect(result.stdout).not.toContain('walking recipe');
+  }
+});
+test('R4-5d preview lists only written env and includes runtime engine controls', () => {
+  const c = splitLayout(), args = ['--layout', layoutFile(), '--bun-path', bun, '--node-path', node];
+  const first = install(args);
+  expect(first.status).toBe(0);
+  expect(first.stdout).not.toContain(join(c.config, '.env'));
+  expect(first.stdout).toContain(join(c.runtime, '.cook-engines') + '/\n');
+  expect(first.stdout).not.toContain(join(c.runtime, 'host-inputs') + '/');
+  expect(first.stdout).toContain('Default mounts');
+  expect(existsSync(join(c.config, '.env'))).toBe(false);
+  const original = JSON.parse(readFileSync(recipe, 'utf8'));
+  original.mcpServers.local.env = { VALUE: '${COOK_R4_VALUE}' };
+  writeFileSync(recipe, JSON.stringify(original));
+  const envFile = join(dir, 'values.env'); writeFileSync(envFile, 'COOK_R4_VALUE=fixture\n');
+  const second = install([...args, '--env-file', envFile]);
+  expect(second.status).toBe(0); expect(second.stdout).toContain(join(c.config, '.env'));
+  expect(existsSync(join(c.config, '.env'))).toBe(true);
 });
