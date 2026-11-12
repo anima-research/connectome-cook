@@ -119,75 +119,28 @@ export async function resolvePlan(
     return { ok: false, exitCode: 2 };
   }
 
-  if (walks.some((walk) => walk.recipe.agent.provider === 'openai-codex')) {
-    log.warn(
-      'Codex inference requires a codex executable on PATH, writable persistent CODEX_HOME, ' +
-      'and codex login in the runtime environment. Cook does not supply these prerequisites.',
-    );
-  }
-
-  // Every backend copies walked recipes flat into <out>/recipes/, so two
-  // sources sharing a shipped filename would silently overwrite each other
-  // (and the rewritten fleet child refs would point both children at the
-  // same file). Fail fast instead.
-  const collisions = detectRecipeFilenameCollisions(walks.map((w) => w.path));
-  if (collisions.size > 0) {
-    for (const [filename, paths] of collisions) {
-      log.error(
-        `recipe filename collision: ${paths.join(' and ')} would both be shipped ` +
-        `as recipes/${filename}.  Rename one of the files — walked recipes are ` +
-        `copied into a single flat directory.`,
-      );
-    }
-    return { ok: false, exitCode: 2 };
-  }
-
-  // Reject `services` / `containerTemplateFiles` on non-parent (child)
-  // recipes.  Cook only reads them from walks[0], so silently dropping
-  // them would deploy a stack missing its sidecars with no warning.
-  // Better to fail-fast and tell the operator to move them up.
-  for (let i = 1; i < walks.length; i++) {
-    const child = walks[i]!;
-    if (child.recipe.services && child.recipe.services.length > 0) {
-      log.error(
-        `child recipe ${child.path} declares services (sidecars), but only the ` +
-        `parent recipe's services are deployed.  Move the services declaration ` +
-        `to the parent recipe (${parentWalk.path}).`,
-      );
-      return { ok: false, exitCode: 2 };
-    }
-    if (child.recipe.containerTemplateFiles && child.recipe.containerTemplateFiles.length > 0) {
-      log.error(
-        `child recipe ${child.path} declares containerTemplateFiles, but only the ` +
-        `parent recipe's are rendered.  Move them to the parent recipe (${parentWalk.path}).`,
-      );
-      return { ok: false, exitCode: 2 };
-    }
-  }
-
-  let sources: McpSource[];
-  let localExtensions: LocalExtension[];
-  let envVars: EnvVar[];
+  let inspection: Omit<PlanInspection, 'warnings'>;
   try {
+    // Preserve legacy ordering: structural failures precede detection progress.
+    // Codex prerequisites precede structural validation in the legacy CLI.
+    warnCodexPrerequisites(walks, message => log.warn(message));
+    validatePlanWalks(walks);
     log.step(`detecting MCP sources (${opts.strict ? 'strict' : 'non-strict'})`);
-    sources = detectSources(walks, { strict: opts.strict });
-    // Extensions: git-sourced ones join the sources list (builder stages,
-    // secrets, systemPackages all reuse the MCP machinery); local bundles
-    // are copied from the operator's disk by the backend.
-    const detectedExts = detectExtensions(walks, { strict: opts.strict });
-    sources = [...sources, ...detectedExts.gitExtensions];
-    localExtensions = detectedExts.localExtensions;
-    envVars = collectEnvVars(walks);
-    const extCount = detectedExts.gitExtensions.length + localExtensions.length;
+    inspection = detectPlanDeclarations(walks, opts.strict, message => { process.stderr.write(message); });
+    const extCount = inspection.sources.filter(s => s.role === 'extension').length
+      + inspection.localExtensions.length;
     log.success(
-      `detected ${sources.length} source${sources.length === 1 ? '' : 's'}` +
+      `detected ${inspection.sources.length} source${inspection.sources.length === 1 ? '' : 's'}` +
       `${extCount > 0 ? ` (incl. ${extCount} extension${extCount === 1 ? '' : 's'})` : ''}, ` +
-      `${envVars.length} env var${envVars.length === 1 ? '' : 's'}`,
+      `${inspection.envVars.length} env var${inspection.envVars.length === 1 ? '' : 's'}`,
     );
   } catch (err) {
-    log.error(err instanceof Error ? err.message : String(err));
+    const messages = err instanceof PlanInspectionError ? err.messages
+      : [err instanceof Error ? err.message : String(err)];
+    for (const message of messages) log.error(message);
     return { ok: false, exitCode: 2 };
   }
+  const { sources, localExtensions, envVars } = inspection;
 
   // Resolve required env values.  Precedence: --env-file > process.env > prompts.
   // (Single source-of-truth — see prompts.ts::resolveValue.)
@@ -319,4 +272,106 @@ export async function resolvePlan(
       options: opts,
     },
   };
+}
+
+/** Structured inspection errors keep logging out of the shared inspector. */
+export class PlanInspectionError extends Error {
+  constructor(public readonly messages: string[], public readonly warnings: string[] = []) {
+    super(messages.join('\n'));
+    this.name = 'PlanInspectionError';
+  }
+}
+
+/** Backends ship recipes flat and only deploy parent sidecars/templates.
+ * Reject collisions first, then the first child-only declaration in walk order.
+ */
+export function validatePlanWalks(walks: WalkResult[]): void {
+  const parentWalk = walks[0];
+  if (!parentWalk) throw new PlanInspectionError(['walker returned no recipes — internal error']);
+  const collisions = detectRecipeFilenameCollisions(walks.map(w => w.path));
+  if (collisions.size) throw new PlanInspectionError(
+    Array.from(collisions, ([filename, paths]) =>
+      `recipe filename collision: ${paths.join(' and ')} would both be shipped ` +
+      `as recipes/${filename}.  Rename one of the files — walked recipes are ` +
+      `copied into a single flat directory.`,
+    ),
+  );
+  for (const child of walks.slice(1)) {
+    if (child.recipe.services?.length) throw new PlanInspectionError([
+      `child recipe ${child.path} declares services (sidecars), but only the ` +
+      `parent recipe's services are deployed.  Move the services declaration ` +
+      `to the parent recipe (${parentWalk.path}).`,
+    ]);
+    if (child.recipe.containerTemplateFiles?.length) throw new PlanInspectionError([
+      `child recipe ${child.path} declares containerTemplateFiles, but only the ` +
+      `parent recipe's are rendered.  Move them to the parent recipe (${parentWalk.path}).`,
+    ]);
+  }
+}
+
+/**
+ * Results of quiet declaration inspection.
+ *
+ * Warnings retain CLI order and stderr-shaped text: detector prefixes and trailing
+ * newlines are preserved; Codex prerequisites use the CLI's "! " prefix. Write
+ * warnings directly rather than passing them to console.warn (which adds a newline).
+ * PlanInspectionError.messages retains legacy diagnostic groups: a strict-mode
+ * aggregate is one multiline entry, whereas filename collisions are separate
+ * entries. Its warnings include everything emitted before the failure.
+ *
+ * inspectPlan takes a positional strict boolean, matching resolvePlan's strict
+ * semantics; it has no output sink and always collects warnings.
+ */
+export interface PlanInspection {
+  sources: McpSource[];
+  localExtensions: LocalExtension[];
+  envVars: EnvVar[];
+  warnings: string[];
+}
+
+/** Validate and detect declarations without logging, prompts or value resolution.
+ * Local extension detection checks entry-file existence; recipes are already loaded.
+ * Detection failures, like structural failures, throw PlanInspectionError.
+ */
+export function inspectPlan(walks: WalkResult[], strict: boolean): PlanInspection {
+  const warnings: string[] = [];
+  const warn = (message: string) => { warnings.push(message); };
+  try {
+    warnCodexPrerequisites(walks, message => warn(`! ${message}\n`));
+    validatePlanWalks(walks);
+    return { ...detectPlanDeclarations(walks, strict, warn), warnings };
+  } catch (err) {
+    const messages = err instanceof PlanInspectionError ? err.messages
+      : [err instanceof Error ? err.message : String(err)];
+    throw new PlanInspectionError(messages, warnings);
+  }
+}
+
+function warnCodexPrerequisites(walks: WalkResult[], warn: (message: string) => void): void {
+  if (walks.some(walk => walk.recipe.agent.provider === 'openai-codex')) {
+    warn(
+      'Codex inference requires a codex executable on PATH, writable persistent CODEX_HOME, ' +
+      'and codex login in the runtime environment. Cook does not supply these prerequisites.',
+    );
+  }
+}
+
+// Detection only: both callers have validated walks already. The CLI emits
+// warnings immediately, including those preceding a later detection failure.
+function detectPlanDeclarations(
+  walks: WalkResult[],
+  strict: boolean,
+  warn: (message: string) => void,
+): Omit<PlanInspection, 'warnings'> {
+  try {
+    const sources = detectSources(walks, { strict, warn });
+    const extensions = detectExtensions(walks, { strict, warn });
+    return {
+      sources: [...sources, ...extensions.gitExtensions],
+      localExtensions: extensions.localExtensions,
+      envVars: collectEnvVars(walks),
+    };
+  } catch (err) {
+    throw new PlanInspectionError([err instanceof Error ? err.message : String(err)]);
+  }
 }

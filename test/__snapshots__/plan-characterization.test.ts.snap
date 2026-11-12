@@ -1,0 +1,1323 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`resolvePlan main characterization: examples/triumvirate/recipes/clerk.json, mode=loose 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate/recipes/clerk.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 1 recipe\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (non-strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 1 source, 1 env var\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 2 required values still missing — operator must supply them before the deployment can run\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 3 credential-file fields unset — files will be skipped (operator must hand-place them before the deployment can run)\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [
+      {
+        "key": "https://github.com/antra-tess/zulip_mcp@main",
+        "url": "https://github.com/antra-tess/zulip_mcp.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "npm"
+      }
+    ],
+    "localExtensions": [],
+    "envVars": [
+      "ZULIP_CHANNEL"
+    ],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [
+      "./.zuliprc"
+    ],
+    "values": [],
+    "credentialValues": {
+      "./.zuliprc": []
+    }
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate/recipes/clerk.json, mode=strict 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate/recipes/clerk.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 1 recipe\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 1 source, 1 env var\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 2 required values still missing — operator must supply them before the deployment can run\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 3 credential-file fields unset — files will be skipped (operator must hand-place them before the deployment can run)\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [
+      {
+        "key": "https://github.com/antra-tess/zulip_mcp@main",
+        "url": "https://github.com/antra-tess/zulip_mcp.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "npm"
+      }
+    ],
+    "localExtensions": [],
+    "envVars": [
+      "ZULIP_CHANNEL"
+    ],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [
+      "./.zuliprc"
+    ],
+    "values": [],
+    "credentialValues": {
+      "./.zuliprc": []
+    }
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate/recipes/clerk.json, mode=missing-env 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate/recipes/clerk.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 1 recipe\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (non-strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 1 source, 1 env var\\n"
+    ],
+    [
+      "stderr",
+      "ERR env-file not found: <repo>/missing-values.env\\n"
+    ]
+  ],
+  "exitCode": 1
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate/recipes/encyclopedist.json, mode=loose 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate/recipes/encyclopedist.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 1 recipe\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (non-strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 0 sources, 0 env vars\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 1 required value still missing — operator must supply them before the deployment can run\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [],
+    "localExtensions": [],
+    "envVars": [],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [],
+    "values": [],
+    "credentialValues": {}
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate/recipes/encyclopedist.json, mode=strict 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate/recipes/encyclopedist.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 1 recipe\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 0 sources, 0 env vars\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 1 required value still missing — operator must supply them before the deployment can run\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [],
+    "localExtensions": [],
+    "envVars": [],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [],
+    "values": [],
+    "credentialValues": {}
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate/recipes/knowledge-miner.json, mode=loose 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate/recipes/knowledge-miner.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 1 recipe\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (non-strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 2 sources, 2 env vars\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 3 required values still missing — operator must supply them before the deployment can run\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [
+      {
+        "key": "https://github.com/antra-tess/zulip_mcp@main",
+        "url": "https://github.com/antra-tess/zulip_mcp.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "npm"
+      },
+      {
+        "key": "https://github.com/nickclyde/duckduckgo-mcp-server@main",
+        "url": "https://github.com/nickclyde/duckduckgo-mcp-server.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "pip-editable"
+      }
+    ],
+    "localExtensions": [],
+    "envVars": [
+      "GITLAB_API_URL",
+      "GITLAB_TOKEN"
+    ],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [],
+    "values": [],
+    "credentialValues": {}
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate/recipes/knowledge-miner.json, mode=strict 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate/recipes/knowledge-miner.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 1 recipe\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 2 sources, 2 env vars\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 3 required values still missing — operator must supply them before the deployment can run\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [
+      {
+        "key": "https://github.com/antra-tess/zulip_mcp@main",
+        "url": "https://github.com/antra-tess/zulip_mcp.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "npm"
+      },
+      {
+        "key": "https://github.com/nickclyde/duckduckgo-mcp-server@main",
+        "url": "https://github.com/nickclyde/duckduckgo-mcp-server.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "pip-editable"
+      }
+    ],
+    "localExtensions": [],
+    "envVars": [
+      "GITLAB_API_URL",
+      "GITLAB_TOKEN"
+    ],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [],
+    "values": [],
+    "credentialValues": {}
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate/recipes/knowledge-reviewer.json, mode=loose 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate/recipes/knowledge-reviewer.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 1 recipe\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (non-strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 0 sources, 0 env vars\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 1 required value still missing — operator must supply them before the deployment can run\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [],
+    "localExtensions": [],
+    "envVars": [],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [],
+    "values": [],
+    "credentialValues": {}
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate/recipes/knowledge-reviewer.json, mode=strict 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate/recipes/knowledge-reviewer.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 1 recipe\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 0 sources, 0 env vars\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 1 required value still missing — operator must supply them before the deployment can run\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [],
+    "localExtensions": [],
+    "envVars": [],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [],
+    "values": [],
+    "credentialValues": {}
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate/recipes/triumvirate.json, mode=loose 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate/recipes/triumvirate.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 5 recipes\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (non-strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 2 sources, 11 env vars\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 14 required values still missing — operator must supply them before the deployment can run\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 3 credential-file fields unset — files will be skipped (operator must hand-place them before the deployment can run)\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [
+      {
+        "key": "https://github.com/antra-tess/zulip_mcp@main",
+        "url": "https://github.com/antra-tess/zulip_mcp.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "npm"
+      },
+      {
+        "key": "https://github.com/nickclyde/duckduckgo-mcp-server@main",
+        "url": "https://github.com/nickclyde/duckduckgo-mcp-server.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "pip-editable"
+      }
+    ],
+    "localExtensions": [],
+    "envVars": [
+      "GITLAB_API_URL",
+      "GITLAB_TOKEN",
+      "MEDIAWIKI_BIND",
+      "WIKI_BOT_PASSWORD",
+      "WIKI_BOT_USERNAME",
+      "WIKI_INTERNAL_URL",
+      "WIKI_SECRET_KEY",
+      "WIKI_SERVER_URL",
+      "WIKI_SITENAME",
+      "WIKI_UPGRADE_KEY",
+      "ZULIP_CHANNEL"
+    ],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [
+      "./.zuliprc"
+    ],
+    "values": [],
+    "credentialValues": {
+      "./.zuliprc": []
+    }
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate/recipes/triumvirate.json, mode=strict 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate/recipes/triumvirate.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 5 recipes\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 2 sources, 11 env vars\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 14 required values still missing — operator must supply them before the deployment can run\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 3 credential-file fields unset — files will be skipped (operator must hand-place them before the deployment can run)\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [
+      {
+        "key": "https://github.com/antra-tess/zulip_mcp@main",
+        "url": "https://github.com/antra-tess/zulip_mcp.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "npm"
+      },
+      {
+        "key": "https://github.com/nickclyde/duckduckgo-mcp-server@main",
+        "url": "https://github.com/nickclyde/duckduckgo-mcp-server.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "pip-editable"
+      }
+    ],
+    "localExtensions": [],
+    "envVars": [
+      "GITLAB_API_URL",
+      "GITLAB_TOKEN",
+      "MEDIAWIKI_BIND",
+      "WIKI_BOT_PASSWORD",
+      "WIKI_BOT_USERNAME",
+      "WIKI_INTERNAL_URL",
+      "WIKI_SECRET_KEY",
+      "WIKI_SERVER_URL",
+      "WIKI_SITENAME",
+      "WIKI_UPGRADE_KEY",
+      "ZULIP_CHANNEL"
+    ],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [
+      "./.zuliprc"
+    ],
+    "values": [],
+    "credentialValues": {
+      "./.zuliprc": []
+    }
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate-mid/recipes/clerk.json, mode=loose 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate-mid/recipes/clerk.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 1 recipe\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (non-strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 1 source, 1 env var\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 2 required values still missing — operator must supply them before the deployment can run\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 3 credential-file fields unset — files will be skipped (operator must hand-place them before the deployment can run)\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [
+      {
+        "key": "https://github.com/antra-tess/zulip_mcp@main",
+        "url": "https://github.com/antra-tess/zulip_mcp.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "npm"
+      }
+    ],
+    "localExtensions": [],
+    "envVars": [
+      "ZULIP_CHANNEL"
+    ],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [
+      "./.zuliprc"
+    ],
+    "values": [],
+    "credentialValues": {
+      "./.zuliprc": []
+    }
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate-mid/recipes/clerk.json, mode=strict 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate-mid/recipes/clerk.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 1 recipe\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 1 source, 1 env var\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 2 required values still missing — operator must supply them before the deployment can run\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 3 credential-file fields unset — files will be skipped (operator must hand-place them before the deployment can run)\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [
+      {
+        "key": "https://github.com/antra-tess/zulip_mcp@main",
+        "url": "https://github.com/antra-tess/zulip_mcp.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "npm"
+      }
+    ],
+    "localExtensions": [],
+    "envVars": [
+      "ZULIP_CHANNEL"
+    ],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [
+      "./.zuliprc"
+    ],
+    "values": [],
+    "credentialValues": {
+      "./.zuliprc": []
+    }
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate-mid/recipes/knowledge-miner.json, mode=loose 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate-mid/recipes/knowledge-miner.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 1 recipe\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (non-strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 2 sources, 0 env vars\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 1 required value still missing — operator must supply them before the deployment can run\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [
+      {
+        "key": "https://github.com/antra-tess/zulip_mcp@main",
+        "url": "https://github.com/antra-tess/zulip_mcp.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "npm"
+      },
+      {
+        "key": "https://github.com/nickclyde/duckduckgo-mcp-server@main",
+        "url": "https://github.com/nickclyde/duckduckgo-mcp-server.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "pip-editable"
+      }
+    ],
+    "localExtensions": [],
+    "envVars": [],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [],
+    "values": [],
+    "credentialValues": {}
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate-mid/recipes/knowledge-miner.json, mode=strict 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate-mid/recipes/knowledge-miner.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 1 recipe\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 2 sources, 0 env vars\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 1 required value still missing — operator must supply them before the deployment can run\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [
+      {
+        "key": "https://github.com/antra-tess/zulip_mcp@main",
+        "url": "https://github.com/antra-tess/zulip_mcp.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "npm"
+      },
+      {
+        "key": "https://github.com/nickclyde/duckduckgo-mcp-server@main",
+        "url": "https://github.com/nickclyde/duckduckgo-mcp-server.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "pip-editable"
+      }
+    ],
+    "localExtensions": [],
+    "envVars": [],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [],
+    "values": [],
+    "credentialValues": {}
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate-mid/recipes/knowledge-reviewer.json, mode=loose 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate-mid/recipes/knowledge-reviewer.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 1 recipe\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (non-strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 0 sources, 0 env vars\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 1 required value still missing — operator must supply them before the deployment can run\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [],
+    "localExtensions": [],
+    "envVars": [],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [],
+    "values": [],
+    "credentialValues": {}
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate-mid/recipes/knowledge-reviewer.json, mode=strict 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate-mid/recipes/knowledge-reviewer.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 1 recipe\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 0 sources, 0 env vars\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 1 required value still missing — operator must supply them before the deployment can run\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [],
+    "localExtensions": [],
+    "envVars": [],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [],
+    "values": [],
+    "credentialValues": {}
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate-mid/recipes/triumvirate-mid.json, mode=loose 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate-mid/recipes/triumvirate-mid.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 4 recipes\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (non-strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 2 sources, 3 env vars\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 4 required values still missing — operator must supply them before the deployment can run\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 3 credential-file fields unset — files will be skipped (operator must hand-place them before the deployment can run)\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [
+      {
+        "key": "https://github.com/antra-tess/zulip_mcp@main",
+        "url": "https://github.com/antra-tess/zulip_mcp.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "npm"
+      },
+      {
+        "key": "https://github.com/nickclyde/duckduckgo-mcp-server@main",
+        "url": "https://github.com/nickclyde/duckduckgo-mcp-server.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "pip-editable"
+      }
+    ],
+    "localExtensions": [],
+    "envVars": [
+      "CADDY_BIND",
+      "WEBUI_PASSWORD",
+      "ZULIP_CHANNEL"
+    ],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [
+      "./.zuliprc"
+    ],
+    "values": [],
+    "credentialValues": {
+      "./.zuliprc": []
+    }
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: examples/triumvirate-mid/recipes/triumvirate-mid.json, mode=strict 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe examples/triumvirate-mid/recipes/triumvirate-mid.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 4 recipes\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (strict)\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 2 sources, 3 env vars\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 4 required values still missing — operator must supply them before the deployment can run\\n"
+    ],
+    [
+      "stderr",
+      "! --no-prompts: 3 credential-file fields unset — files will be skipped (operator must hand-place them before the deployment can run)\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [
+      {
+        "key": "https://github.com/antra-tess/zulip_mcp@main",
+        "url": "https://github.com/antra-tess/zulip_mcp.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "npm"
+      },
+      {
+        "key": "https://github.com/nickclyde/duckduckgo-mcp-server@main",
+        "url": "https://github.com/nickclyde/duckduckgo-mcp-server.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "pip-editable"
+      }
+    ],
+    "localExtensions": [],
+    "envVars": [
+      "CADDY_BIND",
+      "WEBUI_PASSWORD",
+      "ZULIP_CHANNEL"
+    ],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [
+      "./.zuliprc"
+    ],
+    "values": [],
+    "credentialValues": {
+      "./.zuliprc": []
+    }
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: missing-recipe.json, mode=loose 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe missing-recipe.json\\n"
+    ],
+    [
+      "stderr",
+      "ERR failed to load recipe: Recipe file not found: <repo>/missing-recipe.json\\n"
+    ]
+  ],
+  "exitCode": 2
+}"
+`;
+
+exports[`resolvePlan main characterization: missing-recipe.json, mode=strict 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe missing-recipe.json\\n"
+    ],
+    [
+      "stderr",
+      "ERR failed to load recipe: Recipe file not found: <repo>/missing-recipe.json\\n"
+    ]
+  ],
+  "exitCode": 2
+}"
+`;
+
+exports[`resolvePlan main characterization: .cache/plan-characterization/collisions.json, mode=loose 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe .cache/plan-characterization/collisions.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 5 recipes\\n"
+    ],
+    [
+      "stderr",
+      "! Codex inference requires a codex executable on PATH, writable persistent CODEX_HOME, and codex login in the runtime environment. Cook does not supply these prerequisites.\\n"
+    ],
+    [
+      "stderr",
+      "ERR recipe filename collision: <repo>/.cache/plan-characterization/a/same.json and <repo>/.cache/plan-characterization/b/same.json would both be shipped as recipes/same.json.  Rename one of the files — walked recipes are copied into a single flat directory.\\n"
+    ],
+    [
+      "stderr",
+      "ERR recipe filename collision: <repo>/.cache/plan-characterization/a/other.json and <repo>/.cache/plan-characterization/b/other.json would both be shipped as recipes/other.json.  Rename one of the files — walked recipes are copied into a single flat directory.\\n"
+    ]
+  ],
+  "exitCode": 2
+}"
+`;
+
+exports[`resolvePlan main characterization: .cache/plan-characterization/collisions.json, mode=strict 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe .cache/plan-characterization/collisions.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 5 recipes\\n"
+    ],
+    [
+      "stderr",
+      "! Codex inference requires a codex executable on PATH, writable persistent CODEX_HOME, and codex login in the runtime environment. Cook does not supply these prerequisites.\\n"
+    ],
+    [
+      "stderr",
+      "ERR recipe filename collision: <repo>/.cache/plan-characterization/a/same.json and <repo>/.cache/plan-characterization/b/same.json would both be shipped as recipes/same.json.  Rename one of the files — walked recipes are copied into a single flat directory.\\n"
+    ],
+    [
+      "stderr",
+      "ERR recipe filename collision: <repo>/.cache/plan-characterization/a/other.json and <repo>/.cache/plan-characterization/b/other.json would both be shipped as recipes/other.json.  Rename one of the files — walked recipes are copied into a single flat directory.\\n"
+    ]
+  ],
+  "exitCode": 2
+}"
+`;
+
+exports[`resolvePlan main characterization: .cache/plan-characterization/services.json, mode=loose 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe .cache/plan-characterization/services.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 2 recipes\\n"
+    ],
+    [
+      "stderr",
+      "! Codex inference requires a codex executable on PATH, writable persistent CODEX_HOME, and codex login in the runtime environment. Cook does not supply these prerequisites.\\n"
+    ],
+    [
+      "stderr",
+      "ERR child recipe <repo>/.cache/plan-characterization/services-child.json declares services (sidecars), but only the parent recipe's services are deployed.  Move the services declaration to the parent recipe (<repo>/.cache/plan-characterization/services.json).\\n"
+    ]
+  ],
+  "exitCode": 2
+}"
+`;
+
+exports[`resolvePlan main characterization: .cache/plan-characterization/services.json, mode=strict 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe .cache/plan-characterization/services.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 2 recipes\\n"
+    ],
+    [
+      "stderr",
+      "! Codex inference requires a codex executable on PATH, writable persistent CODEX_HOME, and codex login in the runtime environment. Cook does not supply these prerequisites.\\n"
+    ],
+    [
+      "stderr",
+      "ERR child recipe <repo>/.cache/plan-characterization/services-child.json declares services (sidecars), but only the parent recipe's services are deployed.  Move the services declaration to the parent recipe (<repo>/.cache/plan-characterization/services.json).\\n"
+    ]
+  ],
+  "exitCode": 2
+}"
+`;
+
+exports[`resolvePlan main characterization: .cache/plan-characterization/templates.json, mode=loose 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe .cache/plan-characterization/templates.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 2 recipes\\n"
+    ],
+    [
+      "stderr",
+      "! Codex inference requires a codex executable on PATH, writable persistent CODEX_HOME, and codex login in the runtime environment. Cook does not supply these prerequisites.\\n"
+    ],
+    [
+      "stderr",
+      "ERR child recipe <repo>/.cache/plan-characterization/templates-child.json declares containerTemplateFiles, but only the parent recipe's are rendered.  Move them to the parent recipe (<repo>/.cache/plan-characterization/templates.json).\\n"
+    ]
+  ],
+  "exitCode": 2
+}"
+`;
+
+exports[`resolvePlan main characterization: .cache/plan-characterization/templates.json, mode=strict 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe .cache/plan-characterization/templates.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 2 recipes\\n"
+    ],
+    [
+      "stderr",
+      "! Codex inference requires a codex executable on PATH, writable persistent CODEX_HOME, and codex login in the runtime environment. Cook does not supply these prerequisites.\\n"
+    ],
+    [
+      "stderr",
+      "ERR child recipe <repo>/.cache/plan-characterization/templates-child.json declares containerTemplateFiles, but only the parent recipe's are rendered.  Move them to the parent recipe (<repo>/.cache/plan-characterization/templates.json).\\n"
+    ]
+  ],
+  "exitCode": 2
+}"
+`;
+
+exports[`resolvePlan main characterization: .cache/plan-characterization/warnings.json, mode=loose 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe .cache/plan-characterization/warnings.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 1 recipe\\n"
+    ],
+    [
+      "stderr",
+      "! Codex inference requires a codex executable on PATH, writable persistent CODEX_HOME, and codex login in the runtime environment. Cook does not supply these prerequisites.\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (non-strict)\\n"
+    ],
+    [
+      "stderr",
+      "[extension-detector] WARN: <repo>/.cache/plan-characterization/warnings.json :: extensions.external has absolute path /external.ts and no source — not baked; the operator must bind-mount the code at that path.\\n"
+    ],
+    [
+      "stderr",
+      "ERR <repo>/.cache/plan-characterization/warnings.json :: extensions.missing: entry file not found at <repo>/.cache/plan-characterization/missing.ts — cook bundles the containing directory from your disk, so the file must exist at build time.\\n"
+    ]
+  ],
+  "exitCode": 2
+}"
+`;
+
+exports[`resolvePlan main characterization: .cache/plan-characterization/warnings.json, mode=strict 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe .cache/plan-characterization/warnings.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 1 recipe\\n"
+    ],
+    [
+      "stderr",
+      "! Codex inference requires a codex executable on PATH, writable persistent CODEX_HOME, and codex login in the runtime environment. Cook does not supply these prerequisites.\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (strict)\\n"
+    ],
+    [
+      "stderr",
+      "ERR <repo>/.cache/plan-characterization/warnings.json :: extensions.missing: entry file not found at <repo>/.cache/plan-characterization/missing.ts — cook bundles the containing directory from your disk, so the file must exist at build time.\\nExtension(s) with absolute paths and no 'source' block cannot be baked into the image (strict mode):\\n  - <repo>/.cache/plan-characterization/warnings.json :: extensions.external (path /external.ts)\\nAdd a 'source' block, switch to a recipe-relative path, or rerun without --strict (and bind-mount the code).\\n"
+    ]
+  ],
+  "exitCode": 2
+}"
+`;
+
+exports[`resolvePlan main characterization: .cache/plan-characterization/warning-success.json, mode=loose 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe .cache/plan-characterization/warning-success.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 2 recipes\\n"
+    ],
+    [
+      "stderr",
+      "! Codex inference requires a codex executable on PATH, writable persistent CODEX_HOME, and codex login in the runtime environment. Cook does not supply these prerequisites.\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (non-strict)\\n"
+    ],
+    [
+      "stderr",
+      "[source-detector] WARN: source https://example.test/tool@main has divergent install — <repo>/.cache/plan-characterization/warning-success.json#tool says npm, <repo>/.cache/plan-characterization/warning-success-child.json#tool says pip-editable; keeping the first.\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 2 sources (incl. 2 extensions), 0 env vars\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [
+      {
+        "key": "https://example.test/tool@main",
+        "url": "https://example.test/tool.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "npm"
+      },
+      {
+        "key": "ext:git",
+        "url": "https://example.test/ext.git",
+        "ref": "main",
+        "role": "extension",
+        "installKind": "custom"
+      }
+    ],
+    "localExtensions": [
+      {
+        "name": "local",
+        "entryBasename": "entry.ts"
+      }
+    ],
+    "envVars": [],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [],
+    "values": [],
+    "credentialValues": {}
+  }
+}"
+`;
+
+exports[`resolvePlan main characterization: .cache/plan-characterization/warning-success.json, mode=strict 1`] = `
+"{
+  "events": [
+    [
+      "stdout",
+      "-> walking recipe .cache/plan-characterization/warning-success.json\\n"
+    ],
+    [
+      "stdout",
+      "OK loaded 2 recipes\\n"
+    ],
+    [
+      "stderr",
+      "! Codex inference requires a codex executable on PATH, writable persistent CODEX_HOME, and codex login in the runtime environment. Cook does not supply these prerequisites.\\n"
+    ],
+    [
+      "stdout",
+      "-> detecting MCP sources (strict)\\n"
+    ],
+    [
+      "stderr",
+      "[source-detector] WARN: source https://example.test/tool@main has divergent install — <repo>/.cache/plan-characterization/warning-success.json#tool says npm, <repo>/.cache/plan-characterization/warning-success-child.json#tool says pip-editable; keeping the first.\\n"
+    ],
+    [
+      "stdout",
+      "OK detected 2 sources (incl. 2 extensions), 0 env vars\\n"
+    ]
+  ],
+  "exitCode": 0,
+  "plan": {
+    "sources": [
+      {
+        "key": "https://example.test/tool@main",
+        "url": "https://example.test/tool.git",
+        "ref": "main",
+        "role": "mcp",
+        "installKind": "npm"
+      },
+      {
+        "key": "ext:git",
+        "url": "https://example.test/ext.git",
+        "ref": "main",
+        "role": "extension",
+        "installKind": "custom"
+      }
+    ],
+    "localExtensions": [
+      {
+        "name": "local",
+        "entryBasename": "entry.ts"
+      }
+    ],
+    "envVars": [],
+    "runtimeOnlyVars": [],
+    "credentialFiles": [],
+    "values": [],
+    "credentialValues": {}
+  }
+}"
+`;
