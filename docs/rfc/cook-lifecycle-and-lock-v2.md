@@ -46,4 +46,4 @@ A v1 lock is still read. The first reconcile after the upgrade rewrites it as v2
 - The split: cook materialises and records; holding, activation, health, rollback and secrets live in the deployment layer.
 - Lock v2 fields: the tables above, extended as the deployment needs more.
 - Credential files: they stay with the deployment layer (for example systemd `LoadCredential` or an env file rendered from a secret store). cook only refuses credentials in argv and URLs. #9 and #4 are closed.
-- The two standalone refactors from #3 (`inspectPlan`/`validatePlanWalks` in `plan.ts`, parent-recipe reuse in `walkRecipe`) are in #13.
+- The standalone refactor from #3 (`inspectPlan`/`validatePlanWalks` in `plan.ts`) is in #13. Parent-recipe reuse in `walkRecipe` was dropped in #13's review (R1-2).
