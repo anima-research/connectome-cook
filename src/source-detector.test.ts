@@ -6,7 +6,7 @@
  * constructs WalkResult objects manually).
  */
 
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { detectSources } from './source-detector.js';
@@ -476,4 +476,19 @@ describe('detectSources — npm-registry source', () => {
     ];
     expect(detectSources(walks, { strict: true })).toEqual([]);
   });
+});
+
+test('default warning sink writes source divergence to stderr', () => {
+  const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true);
+  try {
+    const walks: WalkResult[] = (['npm', 'pip-editable'] as const).map((install, i) => ({
+      path: `/recipes/${i}.json`,
+      recipe: { name: 'T', agent: { systemPrompt: 'test' },
+        mcpServers: { tool: { source: { url: 'https://example.test/tool.git', install } } } },
+    }));
+    detectSources(walks, { strict: false });
+    expect(stderr).toHaveBeenCalledTimes(1);
+    expect(String(stderr.mock.calls[0]![0])).toContain('[source-detector] WARN:');
+    expect(String(stderr.mock.calls[0]![0])).toContain('divergent install');
+  } finally { stderr.mockRestore(); }
 });

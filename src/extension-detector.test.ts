@@ -4,7 +4,7 @@
  * relative paths become LocalExtension bundles; absolute source-less paths
  * warn (non-strict) or error (strict); URL recipes reject local extensions.
  */
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -167,4 +167,16 @@ describe('detectExtensions — absolute source-less paths', () => {
       walk(join(dir, 'b.json'), { x: { kind: 'module', path: 'i.ts', source: { url: 'https://g/x.git' } } }),
     ], { strict: false })).toThrow(/absolute unbaked path in one recipe and a baked/);
   });
+});
+
+test('default warning sink writes bind-mount warning to stderr', () => {
+  const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true);
+  try {
+    detectExtensions([walk(join(dir, 'recipe.json'), {
+      external: { kind: 'module', path: '/external.ts' },
+    })], { strict: false });
+    expect(stderr).toHaveBeenCalledTimes(1);
+    expect(String(stderr.mock.calls[0]![0])).toContain('[extension-detector] WARN:');
+    expect(String(stderr.mock.calls[0]![0])).toContain('must bind-mount');
+  } finally { stderr.mockRestore(); }
 });

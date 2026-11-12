@@ -59,7 +59,6 @@ function getFleetChildren(recipe: Recipe): RecipeFleetChild[] {
  * skipping already-visited entries (no error, no infinite loop).
  */
 export async function walkRecipe(rootPath: string): Promise<WalkResult[]> {
-  const normalizedRoot = normalizeRoot(rootPath);
   const results: WalkResult[] = [];
   const visited = new Set<string>();
 
@@ -77,6 +76,6 @@ export async function walkRecipe(rootPath: string): Promise<WalkResult[]> {
     }
   }
 
-  await visit(normalizedRoot);
+  await visit(normalizeRoot(rootPath));
   return results;
 }

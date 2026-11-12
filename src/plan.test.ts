@@ -14,7 +14,8 @@ const service = { name: 'db', image: 'db:1' };
 const template = { hostPath: 'config.json', inContainer: '/config.json', template: '${TOKEN}' };
 
 function failure(walks: WalkResult[], text: string) {
-  for (const inspect of [validatePlanWalks, (w: WalkResult[]) => inspectPlan(w, true)]) {
+  for (const inspect of [validatePlanWalks, (w: WalkResult[]) => inspectPlan(w, true),
+    (w: WalkResult[]) => inspectPlan(w, false)]) {
     expect(() => inspect(walks)).toThrow(PlanInspectionError);
     expect(() => inspect(walks)).toThrow(text);
   }
@@ -37,6 +38,7 @@ describe('quiet plan inspection', () => {
       walk('/a/other.json'), walk('/b/other.json')];
     walks[1]!.recipe.services = [service];
     failure(walks, 'recipe filename collision');
+    expect(() => inspectPlan(walks, false)).toThrow(PlanInspectionError);
     try { inspectPlan(walks, false); } catch (err) {
       expect((err as PlanInspectionError).messages).toHaveLength(2);
       expect((err as Error).message).not.toContain('declares services');
@@ -93,6 +95,58 @@ describe('quiet plan inspection', () => {
     expect(result.warnings[0]).toContain('divergent install');
     expect(result.warnings[3]).toContain('must bind-mount');
     expect(stdout).not.toHaveBeenCalled(); expect(stderr).not.toHaveBeenCalled();
+  });
+  test('Codex prerequisite warning is returned before detector warnings', () => {
+    const p = parent(), c = child();
+    p.recipe.agent.provider = 'openai-codex';
+    p.recipe.mcpServers = { a: { source: { url: 'https://example.test/tool.git', install: 'npm' } } };
+    c.recipe.mcpServers = { b: { source: { url: 'https://example.test/tool.git', install: 'pip-editable' } } };
+    const result = inspectPlan([p, c], false);
+    expect(result.warnings).toHaveLength(2);
+    expect(result.warnings[0]).toBe(
+      '! Codex inference requires a codex executable on PATH, writable persistent CODEX_HOME, ' +
+      'and codex login in the runtime environment. Cook does not supply these prerequisites.\n',
+    );
+    expect(result.warnings[1]).toContain('divergent install');
+  });
+  test('detection failure carries preceding Codex and detector warnings', () => {
+    const p = parent(), c = child();
+    p.recipe.agent.provider = 'openai-codex';
+    p.recipe.mcpServers = { a: { source: { url: 'https://example.test/tool.git', install: 'npm' } } };
+    c.recipe.mcpServers = { b: { source: { url: 'https://example.test/tool.git', install: 'pip-editable' } } };
+    p.recipe.extensions = { missing: { kind: 'module', path: './missing.ts' } };
+    expect(() => inspectPlan([p, c], false)).toThrow(PlanInspectionError);
+    try { inspectPlan([p, c], false); } catch (err) {
+      const failure = err as PlanInspectionError;
+      expect(failure.messages).toHaveLength(1);
+      expect(failure.messages[0]).toContain('missing');
+      expect(failure.warnings).toHaveLength(2);
+      expect(failure.warnings[0]).toContain('Codex inference requires');
+      expect(failure.warnings[1]).toContain('divergent install');
+    }
+  });
+  test('structural failure carries the earlier Codex prerequisite warning', () => {
+    const p = parent(), c = child();
+    p.recipe.agent.provider = 'openai-codex';
+    c.recipe.services = [service];
+    expect(() => inspectPlan([p, c], false)).toThrow(PlanInspectionError);
+    try { inspectPlan([p, c], false); } catch (err) {
+      expect((err as PlanInspectionError).warnings).toHaveLength(1);
+      expect((err as PlanInspectionError).warnings[0]).toContain('Codex inference requires');
+    }
+  });
+  test('strict unresolved diagnostics retain the complete legacy aggregate', () => {
+    const p = parent();
+    p.recipe.mcpServers = { first: { command: 'node' }, second: { command: 'node' } };
+    expect(() => inspectPlan([p], true)).toThrow(PlanInspectionError);
+    try { inspectPlan([p], true); } catch (err) {
+      expect((err as PlanInspectionError).messages).toEqual([
+        "Recipe(s) reference MCP servers without a 'source' block (strict mode):\n" +
+        "  - /recipes/parent.json :: first\n  - /recipes/parent.json :: second\n" +
+        "Either add a 'source' block, change the command to 'npx'/'uvx', or rerun without --strict.",
+      ]);
+      expect((err as PlanInspectionError).warnings).toEqual([]);
+    }
   });
   test('strict detection failures are typed, quiet and preserve messages', () => {
     for (const kind of ['source', 'extension']) {

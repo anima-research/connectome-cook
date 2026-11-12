@@ -119,20 +119,14 @@ export async function resolvePlan(
     return { ok: false, exitCode: 2 };
   }
 
-  if (walks.some((walk) => walk.recipe.agent.provider === 'openai-codex')) {
-    log.warn(
-      'Codex inference requires a codex executable on PATH, writable persistent CODEX_HOME, ' +
-      'and codex login in the runtime environment. Cook does not supply these prerequisites.',
-    );
-  }
-
   let inspection: Omit<PlanInspection, 'warnings'>;
   try {
     // Preserve legacy ordering: structural failures precede detection progress.
-    // inspectPlan also validates for independent, offline callers.
+    // Codex prerequisites precede structural validation in the legacy CLI.
+    warnCodexPrerequisites(walks, message => log.warn(message));
     validatePlanWalks(walks);
     log.step(`detecting MCP sources (${opts.strict ? 'strict' : 'non-strict'})`);
-    inspection = inspectPlanWithWarnings(walks, opts.strict, message => { process.stderr.write(message); });
+    inspection = detectPlanDeclarations(walks, opts.strict, message => { process.stderr.write(message); });
     const extCount = inspection.sources.filter(s => s.role === 'extension').length
       + inspection.localExtensions.length;
     log.success(
@@ -282,7 +276,7 @@ export async function resolvePlan(
 
 /** Structured inspection errors keep logging out of the shared inspector. */
 export class PlanInspectionError extends Error {
-  constructor(public readonly messages: string[]) {
+  constructor(public readonly messages: string[], public readonly warnings: string[] = []) {
     super(messages.join('\n'));
     this.name = 'PlanInspectionError';
   }
@@ -315,7 +309,19 @@ export function validatePlanWalks(walks: WalkResult[]): void {
   }
 }
 
-/** Results of quiet declaration inspection; warnings retain detector order and text. */
+/**
+ * Results of quiet declaration inspection.
+ *
+ * Warnings retain CLI order and stderr-shaped text: detector prefixes and trailing
+ * newlines are preserved; Codex prerequisites use the CLI's "! " prefix. Write
+ * warnings directly rather than passing them to console.warn (which adds a newline).
+ * PlanInspectionError.messages retains legacy diagnostic groups: a strict-mode
+ * aggregate is one multiline entry, whereas filename collisions are separate
+ * entries. Its warnings include everything emitted before the failure.
+ *
+ * inspectPlan takes a positional strict boolean, matching resolvePlan's strict
+ * semantics; it has no output sink and always collects warnings.
+ */
 export interface PlanInspection {
   sources: McpSource[];
   localExtensions: LocalExtension[];
@@ -329,18 +335,34 @@ export interface PlanInspection {
  */
 export function inspectPlan(walks: WalkResult[], strict: boolean): PlanInspection {
   const warnings: string[] = [];
-  const result = inspectPlanWithWarnings(walks, strict, message => { warnings.push(message); });
-  return { ...result, warnings };
+  const warn = (message: string) => { warnings.push(message); };
+  try {
+    warnCodexPrerequisites(walks, message => warn(`! ${message}\n`));
+    validatePlanWalks(walks);
+    return { ...detectPlanDeclarations(walks, strict, warn), warnings };
+  } catch (err) {
+    const messages = err instanceof PlanInspectionError ? err.messages
+      : [err instanceof Error ? err.message : String(err)];
+    throw new PlanInspectionError(messages, warnings);
+  }
 }
 
-// The CLI uses the same inspection but emits warnings at their original sites,
-// including warnings preceding a later detection failure.
-function inspectPlanWithWarnings(
+function warnCodexPrerequisites(walks: WalkResult[], warn: (message: string) => void): void {
+  if (walks.some(walk => walk.recipe.agent.provider === 'openai-codex')) {
+    warn(
+      'Codex inference requires a codex executable on PATH, writable persistent CODEX_HOME, ' +
+      'and codex login in the runtime environment. Cook does not supply these prerequisites.',
+    );
+  }
+}
+
+// Detection only: both callers have validated walks already. The CLI emits
+// warnings immediately, including those preceding a later detection failure.
+function detectPlanDeclarations(
   walks: WalkResult[],
   strict: boolean,
   warn: (message: string) => void,
 ): Omit<PlanInspection, 'warnings'> {
-  validatePlanWalks(walks);
   try {
     const sources = detectSources(walks, { strict, warn });
     const extensions = detectExtensions(walks, { strict, warn });
