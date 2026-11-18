@@ -52,7 +52,8 @@ The bin is also installed as **`connectome`** — `connectome cook <recipe>`,
 
 Recipes can carry deployment-specific code — custom context-manager
 strategies and agent-framework modules — via the `extensions` block
-(connectome-host ≥ the `feat/recipe-extensions` seam):
+(connectome-host ≥ the `feat/recipe-extensions` seam; promptless recipes require
+connectome-host v0.8.0+):
 
 ```jsonc
 {
