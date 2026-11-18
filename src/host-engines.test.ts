@@ -449,7 +449,7 @@ test('R3-7 failed component build change marks the lock and retry rebuilds the p
   expect(readFileSync(join(out, 'repo', 'built'), 'utf8').trim()).toBe('new');
 });
 
-test('R1-3: engine preflight and every materialization Git call use the environment model', () => {
+test('R2-3: engine preflight and materialization Git ignore build selections', () => {
   const tools = join(dir, 'tools'); mkdirSync(tools);
   const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
   const record = join(dir, 'git-environments');
@@ -469,7 +469,7 @@ process.exit(child.status ?? 1);
   const calls = readFileSync(record, 'utf8').trim().split('\n').map(line => JSON.parse(line));
   for (const call of calls) {
     expect(call.env.COOK_TEST_UNSELECTED).toBeUndefined();
-    expect(call.env.COOK_TEST_SELECTED).toBe('operator-tool-setting');
+    expect(call.env.COOK_TEST_SELECTED).toBeUndefined();
     expect(call.env.GIT_DIR).toBeUndefined();
     expect(call.env.GIT_CONFIG_COUNT).toBe('1');
     expect(call.env.GIT_CONFIG_VALUE_0).toBe('forwarded');

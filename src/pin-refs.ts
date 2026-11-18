@@ -11,7 +11,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { assertUnrewrittenSourceUrl, sourceGitEnvironment, gitFailureOutput, AUTH_REDIRECT_HINT } from './process-env.js';
+import { assertUnrewrittenSourceUrl, sourceGitEnvironment, privateGitFailureOutput } from './process-env.js';
 import { assertCredentialFreeSourceUrl, sourceLocation } from './source-url.js';
 import { log } from './log.js';
 import type { McpSource } from './types.js';
@@ -33,11 +33,11 @@ export function candidateRefNames(ref: string): string[] {
  */
 export function resolveRemoteRef(
   url: string, ref: string, sslBypass = false, location = 'Source URL',
-  authSecret?: string, values?: NodeJS.ProcessEnv, excluded?: Iterable<string>,
+  authSecret?: string, values?: NodeJS.ProcessEnv,
 ): string | null {
   assertCredentialFreeSourceUrl(url, location);
   if (looksLikeSha(ref)) return ref.toLowerCase();
-  const env = sourceGitEnvironment(url, authSecret, values, location, undefined, excluded);
+  const env = sourceGitEnvironment(url, authSecret, values, location);
   for (const candidate of candidateRefNames(ref)) {
     if (authSecret) assertUnrewrittenSourceUrl(url, env, location, (values ?? process.env)[authSecret]);
     const args = [...(sslBypass ? ['-c', 'http.sslVerify=false'] : []), 'ls-remote', url, candidate];
@@ -61,8 +61,9 @@ export function resolveRemoteRef(
       // copied literally. The URL has already passed credential validation.
       const command = ['git', ...args].map(arg => /^[a-z0-9_./:@=+-]+$/i.test(arg)
         ? arg : "'" + arg.replaceAll("'", "'\\''") + "'").join(' ');
-      const output = authSecret ? gitFailureOutput(err, (values ?? process.env)[authSecret]) : '';
-      throw new Error(`--pin-refs: ${location}: could not resolve ${url}@${ref}: remote unreachable or refused (${outcome}); no output written. run \`${command}\` to see Git's diagnostics.${output ? '\n' + output : ''}${authSecret ? '\n' + AUTH_REDIRECT_HINT : ''}`);
+      const output = authSecret ? privateGitFailureOutput(err, (values ?? process.env)[authSecret]) : '';
+      const guidance = authSecret ? 'no artifacts written. Check the authSecret token and source URL.' : `no output written. run \`${command}\` to see Git's diagnostics.`;
+      throw new Error(`--pin-refs: ${location}: could not resolve ${url}@${ref}: remote unreachable or refused (${outcome}); ${guidance}${output ? '\n' + output : ''}`);
     }
     const sha = output.split('\n')[0]?.split('\t')[0]?.trim();
     if (sha && looksLikeSha(sha)) return sha;
@@ -80,7 +81,6 @@ export function resolveRemoteRef(
  */
 export function pinSources(
   sources: McpSource[], values?: NodeJS.ProcessEnv,
-  excluded: Iterable<string> = sources.flatMap(source => source.authSecret ? [source.authSecret] : []),
 ): void {
   for (const source of sources) {
     const location = sourceLocation(source);
@@ -91,7 +91,7 @@ export function pinSources(
       source.commit = source.ref.toLowerCase();
       continue;
     }
-    const sha = resolveRemoteRef(source.url, source.ref, source.sslBypass, location, source.authSecret, values, excluded);
+    const sha = resolveRemoteRef(source.url, source.ref, source.sslBypass, location, source.authSecret, values);
     if (sha) {
       source.commit = sha;
       log.info(`--pin-refs: ${log.dim(source.url)}@${source.ref} → ${sha.slice(0, 12)}`);

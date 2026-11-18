@@ -21,7 +21,6 @@ import {
   DEFAULT_CH_REPO_URL,
   runHostBackend,
 } from './backends/host.js';
-import { knownSecretEnvironmentNames } from './process-env.js';
 import { renderUserUnit, validateUserUnit } from './host-unit.js';
 import { pinSources, resolveRemoteRef } from './pin-refs.js';
 import { listTemplates, scaffoldRecipe, type TemplateName } from './init.js';
@@ -127,10 +126,9 @@ async function runBuildPipeline(argv: string[]): Promise<BuildResult> {
   let pinnedChRef: string | undefined;
   if (flags['pin-refs']) {
     log.step('pinning refs (git ls-remote)');
-    const excluded = knownSecretEnvironmentNames(planResult.plan);
-    pinSources(planResult.plan.sources, planResult.plan.values, excluded);
+    pinSources(planResult.plan.sources, planResult.plan.values);
     const chLocation = `connectome-host (${DEFAULT_CH_REPO_URL})`;
-    const chSha = resolveRemoteRef(DEFAULT_CH_REPO_URL, DEFAULT_CH_REF, false, chLocation, undefined, undefined, excluded);
+    const chSha = resolveRemoteRef(DEFAULT_CH_REPO_URL, DEFAULT_CH_REF, false, chLocation);
     if (chSha) {
       pinnedChRef = chSha;
       log.info(`--pin-refs: ${chLocation}@${DEFAULT_CH_REF} → ${chSha.slice(0, 12)}`);
@@ -240,12 +238,11 @@ async function handleInstall(argv: string[]): Promise<number> {
     log.step(flags['bun-path'] !== undefined || flags['node-path'] !== undefined
       ? 'pinning component refs (git ls-remote); host bound by engine preflight'
       : 'pinning refs (git ls-remote)');
-    const excluded = knownSecretEnvironmentNames(planResult.plan);
-    pinSources(planResult.plan.sources, planResult.plan.values, excluded);
+    pinSources(planResult.plan.sources, planResult.plan.values);
     // Engine preflight fetches and binds the host itself; avoid ls-remote too.
     if (flags['bun-path'] === undefined && flags['node-path'] === undefined) {
       const chLocation = `connectome-host (${chRepoUrl})`;
-      const chSha = resolveRemoteRef(chRepoUrl, chRef, false, chLocation, undefined, undefined, excluded);
+      const chSha = resolveRemoteRef(chRepoUrl, chRef, false, chLocation);
       if (chSha) {
         chCommit = chSha;
         log.info(`--pin-refs: ${chLocation}@${chRef} → ${chSha.slice(0, 12)}`);

@@ -38,7 +38,7 @@ import { execFileSync, execSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
-import { assertUnrewrittenSourceUrl, knownSecretEnvironmentNames, sourceGitEnvironment, processAllowlistEnv, gitEnvironment, gitFailureOutput, AUTH_REDIRECT_HINT } from '../process-env.js';
+import { assertUnrewrittenSourceUrl, sourceGitEnvironment, processAllowlistEnv, gitEnvironment, gitFailureOutput, privateGitFailureOutput } from '../process-env.js';
 import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
 import { log } from '../log.js';
 import type { GeneratorInput, McpSource } from '../types.js';
@@ -290,7 +290,6 @@ interface CloneContext {
   /** Checkout staged by dependency preflight; takes precedence over sourceDir. */
   preparedCheckout?: string | undefined;
   commands?: PinnedCommands | undefined;
-  excluded?: Iterable<string>;
   /** Operator-selected Bun for the host install; PATH lookup otherwise. */
   bun?: string | undefined;
 }
@@ -303,8 +302,10 @@ async function executeClone(
   const { beforeBuild, dependencies, onDependencyMutation, preparedCheckout, commands } = context;
   // A dependency preflight checkout already holds the inspected commit.
   const sourceDir = preparedCheckout ? undefined : context.sourceDir;
-  const env = sourceGitEnvironment(action.url, action.authSecret, values, action.key, buildEnv, context.excluded);
+  const env = sourceGitEnvironment(action.url, action.authSecret, values, action.key);
   const git = async (args: string[], cwd?: string): Promise<string> => {
+    const command = args[0] === '-c' ? args[2] : args[0];
+    if (action.authSecret && (command === 'fetch' || command === 'checkout')) args = [command, '--quiet', ...args.slice(1)];
     // Both network commands run in the target: include its local Git config.
     if (action.authSecret && (args[0] === 'fetch' || args[0] === 'ls-remote')) {
       assertUnrewrittenSourceUrl(action.url, env, action.key, values[action.authSecret], cwd, 'origin');
@@ -318,8 +319,8 @@ async function executeClone(
         : execFileSync('git', args, { env, cwd, encoding: 'utf8', stdio: action.authSecret ? ['ignore', 'pipe', 'pipe'] : ['ignore', 'inherit', 'inherit'] }) ?? '';
     } catch (err) {
       const { status, code } = err as { status?: number; code?: string };
-      const output = gitFailureOutput(err, action.authSecret ? values[action.authSecret] : undefined);
-      throw new Error(`${action.key}: git ${args[0]} failed (${status ?? code ?? 'unknown'}).${output ? '\n' + output : ''}${action.authSecret ? '\n' + AUTH_REDIRECT_HINT : ''}`);
+      const output = action.authSecret ? privateGitFailureOutput(err, values[action.authSecret]) : gitFailureOutput(err);
+      throw new Error(`${action.key}: git ${command} failed (${status ?? code ?? 'unknown'}).${output ? '\n' + output : ''}`);
     }
   };
   rmSync(action.target, { recursive: true, force: true });
@@ -345,18 +346,47 @@ async function executeClone(
       // Initialize the real target and origin before ANY authenticated network.
       await git(['init', action.target]);
       await git(['remote', 'add', 'origin', action.url], action.target);
-      const head = await git(['ls-remote', '--symref', 'origin', 'HEAD'], action.target);
+      // A dangling default HEAD can coexist with a usable requested branch/tag.
+      // Include that ref, not the entire advertisement (which may exceed the
+      // output buffer for large remotes), when discovering the object format.
+      const head = await git(['ls-remote', '--symref', 'origin', 'HEAD', action.ref], action.target);
+      const sha = /^([0-9a-f]{40}|[0-9a-f]{64})\tHEAD$/mi.exec(head)?.[1];
+      const advertised = /^([0-9a-f]{40}|[0-9a-f]{64})\t/m.exec(head)?.[1];
+      // A full object ID need not itself be advertised (e.g. a pinned ancestor).
+      const oid = advertised ?? /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.exec(action.commit ?? action.ref)?.[0];
+      const format = oid?.length === 64 ? 'sha256' : oid ? 'sha1' : undefined;
+      if (format && (await git(['rev-parse', '--show-object-format'], action.target)).trim() !== format) {
+        // No objects have been fetched yet. Git refuses an in-place hash change.
+        rmSync(join(action.target, '.git'), { recursive: true, force: true });
+        await git(['init', `--object-format=${format}`, action.target]);
+        await git(['remote', 'add', 'origin', action.url], action.target);
+        // The fetch wrapper repeats the target-local rewrite check after re-init.
+      }
       // remote add's refspec fetches all branches, including remote HEAD.
       // Explicit --tags also brings in tags unreachable from any branch, as
       // clone does, so subsequent branch/tag/SHA checkouts see the same objects.
       await git(['fetch', '--tags', 'origin'], action.target);
-      const branch = /^ref: refs\/heads\/(.+)\tHEAD$/m.exec(head)?.[1];
+      let branch = /^ref: refs\/heads\/(.+)\tHEAD$/m.exec(head)?.[1];
+      if (!branch && sha) {
+        const matches = (await git(['for-each-ref', `--points-at=${sha}`, '--format=%(refname:strip=3)',
+          'refs/remotes/origin/'], action.target)).trim().split('\n').filter(Boolean);
+        const preferred = (await git(['symbolic-ref', '--short', 'HEAD'], action.target)).trim();
+        branch = matches.find(name => name === preferred) ?? matches.find(name => name === 'master') ?? matches[0];
+      }
       if (branch) {
         await git(['symbolic-ref', 'refs/remotes/origin/HEAD', `refs/remotes/origin/${branch}`], action.target);
         await git(['checkout', '-b', branch, '--track', `refs/remotes/origin/${branch}`], action.target);
+      } else if (sha) {
+        await git(['checkout', '--detach', sha], action.target);
       } else {
-        const sha = /^([0-9a-f]{40}|[0-9a-f]{64})\tHEAD$/mi.exec(head)?.[1];
-        if (sha) await git(['checkout', '--detach', sha], action.target);
+        // With no remote HEAD, clone retains tracking for the local initial
+        // branch and checks it out if it exists remotely (without origin/HEAD).
+        const initial = (await git(['symbolic-ref', '--short', 'HEAD'], action.target)).trim();
+        const remoteBranch = `refs/remotes/origin/${initial}`;
+        await git(['config', `branch.${initial}.remote`, 'origin'], action.target);
+        await git(['config', `branch.${initial}.merge`, `refs/heads/${initial}`], action.target);
+        const refs = (await git(['for-each-ref', '--format=%(refname)', remoteBranch], action.target)).trim().split('\n');
+        if (refs.includes(remoteBranch)) await git(['checkout', '-b', initial, '--track', remoteBranch], action.target);
       }
     } else {
       // Public sources retain the existing clone path (including URL aliases).
@@ -418,8 +448,9 @@ async function executeClone(
         stdio: ['ignore', 'inherit', 'inherit'],
         env: buildEnv,
       });
-    } catch {
-      throw new Error(`${action.key}: build failed; if an operator environment setting is needed, select its name with COOK_PASS_ENV.`);
+    } catch (error) {
+      const failure = error as Error & { status?: number; signal?: string; code?: string };
+      throw new Error(`${action.key}: build failed: ${failure.message ?? String(error)} (${failure.status ?? failure.signal ?? failure.code ?? 'unknown'}); if an operator environment setting is needed, select its name with COOK_PASS_ENV.`, { cause: error });
     }
   }
   if (dependencies?.length) verifyHostDependencyResolutions(action.target, dependencies);
@@ -610,7 +641,7 @@ async function runWithSelectedEngines(
     const handlers = signals.map(signal => () => { cleanup(); process.kill(process.pid, signal); });
     signals.forEach((signal, i) => process.on(signal, handlers[i]!));
     try {
-      const checked = preflightHostEngines(options.chRepoUrl, options.chCommit ?? options.chRef, options.bunPath, options.nodePath, cleanup => { removeScratch = cleanup; }, gitEnvironment(undefined, knownSecretEnvironmentNames(plan)));
+      const checked = preflightHostEngines(options.chRepoUrl, options.chCommit ?? options.chRef, options.bunPath, options.nodePath, cleanup => { removeScratch = cleanup; }, gitEnvironment());
       options = { ...options, chRepoUrl: checked.sourceUrl, chCommit: checked.commit };
       return await materializeHost(plan, options, checked, onStaged, commands);
     } finally {
@@ -643,7 +674,7 @@ async function materializeHost(
   }
 
   const hasRecordedPins = assertHostDependencyReinstall(installDir, existingLock?.hostDependencies, dependencyInputs, options.dropHostDependencies);
-  const dependencies = dependencyInputs.length ? await preflightHostDependencies(options.chRepoUrl, options.chCommit ?? options.chRef, dependencyInputs, installDir, onStaged, commands, gitEnvironment(buildEnv, knownSecretEnvironmentNames(plan))) : undefined;
+  const dependencies = dependencyInputs.length ? await preflightHostDependencies(options.chRepoUrl, options.chCommit ?? options.chRef, dependencyInputs, installDir, onStaged, commands, gitEnvironment()) : undefined;
   if (dependencies) {
     installDir = dependencies.installDir;
     options = { ...options, installDir, chCommit: dependencies.commit };
@@ -728,7 +759,7 @@ async function materializeHost(
   for (const action of actions.clones) {
     if (!canReuse(action)) {
       const source = plan.sources.find(source => source.key === action.key);
-      sourceGitEnvironment(action.url, action.authSecret, plan.values, source ? sourceLocation(source) : action.key, buildEnv, knownSecretEnvironmentNames(plan));
+      sourceGitEnvironment(action.url, action.authSecret, plan.values, source ? sourceLocation(source) : action.key);
     }
   }
 
@@ -799,7 +830,6 @@ async function materializeHost(
           onDependencyMutation: () => { keepSnapshots = true; },
           preparedCheckout: isHost ? dependencies?.checkout : undefined,
           commands,
-          excluded: knownSecretEnvironmentNames(plan),
           bun: engines?.bun.path,
         })).commit;
       } catch (err) {

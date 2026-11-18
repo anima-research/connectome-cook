@@ -28,7 +28,9 @@ if (args[0] === 'ls-remote' && args[1] === '--get-url') {
   if (behavior.getUrlFail) { console.error(${JSON.stringify(SECRET)}); process.exit(128); }
   console.log(args[2] === 'origin' ? JSON.parse(readFileSync('.git/fixture-url', 'utf-8')) : args[2]); process.exit(0);
 }
-if (behavior.fail && args[0] === behavior.fail && (process.env.GIT_CONFIG_COUNT === '4' || behavior.publicFail)) {
+const sslBypass = args[0] === '-c' && args[1] === 'http.sslVerify=false';
+if (sslBypass) args.splice(0, 2);
+if (behavior.fail && args[0] === behavior.fail && (process.env.GIT_CONFIG_COUNT === '6' || behavior.publicFail)) {
   console.log(process.env.GIT_CONFIG_VALUE_0 ?? 'public stdout diagnostic');
   console.error('fatal: useful Git diagnostic');
   console.error(${JSON.stringify(SECRET)});
@@ -36,8 +38,6 @@ if (behavior.fail && args[0] === behavior.fail && (process.env.GIT_CONFIG_COUNT 
   console.error(process.env.GIT_CONFIG_VALUE_0 ?? 'public stderr diagnostic');
   process.exit(128);
 }
-const sslBypass = args[0] === '-c' && args[1] === 'http.sslVerify=false';
-if (sslBypass) args.splice(0, 2);
 if (args[0] === 'ls-remote') {
   if (behavior.requireSsl && args[1] === behavior.requireSsl && !sslBypass) process.exit(1);
   if (args[1] === behavior.missing) { console.error('old diagnostic 1\\nold diagnostic 2\\nfatal: TLS handshake failed\\ncheck the custom CA\\nremote unavailable'); process.exit(1); }
@@ -56,7 +56,7 @@ if (args[0] === 'ls-remote') {
     writeFileSync('.git/config', '[remote "origin"]\\nurl = ' + args[3]);
   }
 } else if (args[0] === 'rev-parse') {
-  console.log('${SHA}');
+  console.log(args[1] === '--show-object-format' ? 'sha1' : '${SHA}');
 }
 `, { mode: 0o755 });
   writeFileSync(join(bin, 'bun'), '#!/bin/sh\n/usr/bin/env > install-env.txt\n', { mode: 0o755 });
@@ -147,13 +147,13 @@ for (const pin of [false, true]) {
     const header = `Authorization: Basic ${Buffer.from(`oauth2:${SECRET}`).toString('base64')}`;
     const calls = gitEnvironments();
     for (const command of ['init', 'remote', 'fetch', 'checkout', 'rev-parse', ...(pin ? ['ls-remote'] : [])]) {
-      expect(calls.some(call => call.args[0] === command && call.env.GIT_CONFIG_COUNT === '5')).toBe(true);
+      expect(calls.some(call => call.args[0] === command && call.env.GIT_CONFIG_COUNT === '7')).toBe(true);
     }
     for (const call of calls) {
       expect(call.env.GIT_CONFIG_KEY_0).toBe('credential.helper');
       expect(call.env.GIT_CONFIG_VALUE_0).toBe('/synthetic/helper');
       expect(call.env.GIT_TOKEN).toBeUndefined();
-      if (call.env.GIT_CONFIG_COUNT === '5') {
+      if (call.env.GIT_CONFIG_COUNT === '7') {
         expect(call.env.GIT_CONFIG_KEY_1).toBe('http.https://example.invalid/.extraHeader');
         expect(call.env.GIT_CONFIG_VALUE_1).toBe(header);
         expect(call.env.GIT_CONFIG_KEY_2).toBe('http.followRedirects');
@@ -177,7 +177,7 @@ for (const pin of [false, true]) {
 test('R1-1: private symbolic Docker pins use the same environment-only channel', () => {
   const result = run('build', { url: 'https://example.invalid/private.git', authSecret: 'GIT_TOKEN' }, ['--pin-refs']);
   expect(result.status).toBe(0);
-  expect(gitEnvironments().find(call => call.args[1]?.includes('private.git'))?.env.GIT_CONFIG_COUNT).toBe('4');
+  expect(gitEnvironments().find(call => call.args[1]?.includes('private.git'))?.env.GIT_CONFIG_COUNT).toBe('6');
   expect(gitCalls() + result.stdout + result.stderr + readFileSync(join(dir, 'out/connectome.lock'), 'utf-8')).not.toContain(SECRET);
 });
 
@@ -925,10 +925,11 @@ test('R5: selecting Git controls affects builds, not acquisition repository rout
   }
 });
 
-test('R1-2: public Git stderr remains visible', () => {
+test.each([false, true])('R1-2/R2-6: public Git stderr and command remain visible (sslBypass=%s)', (sslBypass) => {
   env.FAKE_FAIL_GIT = 'clone'; env.FAKE_PUBLIC_FAIL = '1';
-  const result = run('install', { url: 'https://example.invalid/public.git' });
+  const result = run('install', { url: 'https://example.invalid/public.git', sslBypass });
   expect(result.status).not.toBe(0);
+  expect(result.stdout + result.stderr).toContain('git clone failed (128)');
   expect(result.stdout + result.stderr).toContain('fatal: useful Git diagnostic');
   expect(result.stdout + result.stderr).toContain('public stderr diagnostic');
   expect(result.stdout + result.stderr).not.toContain('withheld');
@@ -946,17 +947,41 @@ test('R1-4: unchanged private checkout needs no token or Git requests', () => {
 });
 
 for (const name of ['GH_TOKEN', 'GITHUB_TOKEN']) {
-  test(`R1-5: recipe secret ${name} helper collision is explicit`, () => {
+  test(`R2-3: recipe authSecret ${name} works without leaking it to builds`, () => {
     env[name] = SECRET;
-    const result = run('install', { url: 'https://example.invalid/private.git', authSecret: name });
-    expect(result.status).not.toBe(0);
-    expect(result.stdout + result.stderr).toContain(name);
-    expect(result.stdout + result.stderr).toContain('COOK_PASS_ENV');
-    expect(result.stdout + result.stderr).toContain('rename');
+    const result = run('install', { url: 'https://example.invalid/private.git', authSecret: name,
+      install: { run: '/usr/bin/env > custom-env.txt', runtime: 'custom' } }, ['--pin-refs']);
+    expect(result.status).toBe(0);
     expect(result.stdout + result.stderr).not.toContain(SECRET);
-    expect(gitCalls()).not.toContain('clone');
+    for (const path of ['app/install-env.txt', 'private/custom-env.txt']) {
+      expect(buildEnvFile(join(dir, 'out', path))[name]).toBeUndefined();
+    }
+    const calls = gitEnvironments();
+    expect(calls.some(call => call.env[name] === SECRET)).toBe(true); // public helper channel
+    expect(calls.filter(call => call.env.GIT_CONFIG_COUNT === '6').every(call => call.env[name] === undefined)).toBe(true);
   });
 }
+
+for (const command of ['install', 'build']) test(`R2-3: ${command} recipe names preserve Git base and helper channels`, () => {
+  Object.assign(env, { GITHUB_TOKEN: SECRET, SSH_AUTH_SOCK: '/operator/ssh.sock',
+    XDG_RUNTIME_DIR: '/operator/runtime', HTTP_PROXY: 'http://proxy.invalid' });
+  const recipe = join(dir, 'channels.json');
+  writeFileSync(join(dir, 'git-behavior.json'), '{}');
+  writeFileSync(recipe, JSON.stringify({ name: 'Git channels', agent: { systemPrompt: 'test' },
+    mcpServers: { github: { command: 'node', env: { GITHUB_TOKEN: '${GITHUB_TOKEN}' },
+      args: ['${HOME}/notes', '${PATH}', '${SSH_AUTH_SOCK}', '${XDG_RUNTIME_DIR}', '${HTTP_PROXY}'],
+      source: { url: 'https://example.invalid/public.git' } } },
+  }));
+  const result = spawnSync(process.execPath, [CLI, command, recipe, '--out', join(dir, 'out'),
+    '--yes', '--no-prompts', '--pin-refs'], { env, encoding: 'utf8' });
+  expect(result.status).toBe(0);
+  for (const call of gitEnvironments()) {
+    for (const name of ['HOME', 'PATH', 'SSH_AUTH_SOCK', 'XDG_RUNTIME_DIR', 'HTTP_PROXY', 'GITHUB_TOKEN']) {
+      expect(call.env[name]).toBe(env[name]!);
+    }
+  }
+  if (command === 'install') expect(buildEnvFile(join(dir, 'out/app/install-env.txt')).GITHUB_TOKEN).toBeUndefined();
+});
 
 for (const version of ['2.30.9', '1.99.0', 'not-a-version']) test(`R1-6: authSecret refuses Git ${version} before cloning`, () => {
   env.FAKE_GIT_VERSION = version;
@@ -971,6 +996,15 @@ test('R1-8: build failures explain the environment migration', () => {
   const result = run('install', { url: 'https://example.invalid/public.git', install: { run: 'exit 7', runtime: 'custom' } });
   expect(result.status).not.toBe(0);
   expect(result.stdout + result.stderr).toContain('build failed');
+  expect(result.stdout + result.stderr).toContain('COOK_PASS_ENV');
+  expect(result.stdout + result.stderr).toContain('(7)');
+});
+
+test('R2-6: build termination retains the original signal before the environment hint', () => {
+  const result = run('install', { url: 'https://example.invalid/public.git', install: { run: 'kill -TERM $$', runtime: 'custom' } });
+  expect(result.status).not.toBe(0);
+  expect(result.stdout + result.stderr).toContain('(SIGTERM)');
+  expect(result.stdout + result.stderr).toContain('Command failed: kill -TERM $$');
   expect(result.stdout + result.stderr).toContain('COOK_PASS_ENV');
 });
 

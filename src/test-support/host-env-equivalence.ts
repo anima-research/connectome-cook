@@ -33,7 +33,7 @@ if (args[0] === '--version') { console.log('git version 2.53.0');
 } else if (args[0] === 'remote') {
   writeFileSync('.git/fixture-url', args[3]);
   writeFileSync(join(process.cwd(), '.git/config'), '[remote "origin"]\\nurl = ' + args[3]);
-} else if (args[0] === 'rev-parse') console.log('${'a'.repeat(40)}');
+} else if (args[0] === 'rev-parse') console.log(args[1] === '--show-object-format' ? 'sha1' : '${'a'.repeat(40)}');
 `, { mode: 0o755 });
     writeFileSync(join(bin, 'bun'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     const tokenName = scenario === 'authSecret-default-provider' ? 'ANTHROPIC_API_KEY' : 'SOURCE_TOKEN';

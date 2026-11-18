@@ -863,7 +863,7 @@ test('a failed rebuild of a pinned host marks the lock incomplete', () => {
   expect(run.stdout + run.stderr).toContain('last install failed');
 });
 
-test('R1-3: dependency preflight Git and pinned builds share the curated environments', () => {
+test('R2-3: dependency preflight Git ignores selections that pinned builds receive', () => {
   const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
   const record = join(dir, 'git-environments');
   writeFileSync(join(shim, 'git'), `#!${process.execPath}
@@ -881,7 +881,7 @@ process.exit(child.status ?? 1);
   const calls = readFileSync(record, 'utf8').trim().split('\n').map(line => JSON.parse(line));
   for (const call of calls) {
     expect(call.env.COOK_TEST_UNSELECTED).toBeUndefined();
-    expect(call.env.COOK_TEST_SELECTED).toBe('operator-tool-setting');
+    expect(call.env.COOK_TEST_SELECTED).toBeUndefined();
     expect(call.env.GIT_DIR).toBeUndefined();
     expect(call.env.GIT_CONFIG_COUNT).toBe('1');
     expect(call.env.GIT_CONFIG_VALUE_0).toBe('forwarded');

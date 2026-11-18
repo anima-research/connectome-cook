@@ -301,19 +301,30 @@ test.each(['prefix', 'exact', 'include', 'insteadOf', 'insteadOf-prefix', 'inste
   }
 }, 15000);
 
-test.each(['default-master', 'default-main', 'branch', 'tag', 'lightweight-tag', 'sha'] as const)(
+test.each([
+  'default-master', 'default-main', 'branch', 'tag', 'lightweight-tag', 'sha', 'sha256', 'default-sha256',
+  'sha256-missing-head', 'default-sha256-missing-head', 'sha256-master-missing-head', 'sha256-tag-missing-head', 'default-sha256-tag-missing-head',
+  'sha256-sha-missing-head', 'default-sha256-sha-missing-head', 'detached-head', 'many-tags',
+] as const)(
   'authenticated checkout matches a real clone: %s', async (scenario) => {
     const dir = mkdtempSync(join(tmpdir(), 'cook-clone-equivalence-'));
     const home = join(dir, 'home'); mkdirSync(home);
+    const missingHead = scenario.endsWith('-missing-head');
+    const remoteSha256 = scenario.startsWith('sha256');
+    const defaultSha256 = scenario.startsWith('default-sha256');
     const env = {
+      // GIT_DEFAULT_HASH also exercises older Git that predates init.defaultObjectFormat.
+      ...(defaultSha256 ? { GIT_DEFAULT_HASH: 'sha256' } : {}),
       PATH: process.env.PATH, HOME: home, GIT_CONFIG_NOSYSTEM: '1',
       GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@example.invalid',
       GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 'test@example.invalid',
     };
-    const git = (args: string[]) => execFileSync('git', args, { env, encoding: 'utf8', stdio: 'pipe' }).trim();
-    const branch = scenario === 'default-main' ? 'main' : 'master';
+    const git = (args: string[]) => execFileSync('git', args, { env, encoding: 'utf8', stdio: 'pipe', maxBuffer: 16 * 1024 * 1024 }).trim();
+    // Also cover clone's fallback when its local initial branch exists remotely.
+    const branch = scenario.includes('-master-') ? 'master'
+      : remoteSha256 || defaultSha256 || ['default-main', 'detached-head'].includes(scenario) ? 'main' : 'master';
     const source = join(dir, 'source');
-    git(['init', '-b', branch, source]);
+    git(['init', '--object-format=' + (remoteSha256 ? 'sha256' : 'sha1'), '-b', branch, source]);
     writeFileSync(join(source, 'index.js'), 'first');
     git(['-C', source, 'add', '.']);
     git(['-C', source, 'commit', '-m', 'first']);
@@ -332,6 +343,17 @@ test.each(['default-master', 'default-main', 'branch', 'tag', 'lightweight-tag',
     git(['-C', source, 'branch', '-D', 'tag-only']);
     git(['clone', '--bare', source, join(dir, 'private.git')]);
     expect(git(['-C', source, 'branch', '--contains', 'release'])).toBe('');
+    if (defaultSha256) writeFileSync(join(home, '.gitconfig'), '[init]\n defaultObjectFormat = sha256\n');
+    if (missingHead) git(['--git-dir', join(dir, 'private.git'), 'symbolic-ref', 'HEAD', 'refs/heads/deleted']);
+    if (scenario === 'detached-head') {
+      git(['--git-dir', join(dir, 'private.git'), 'update-ref', '--no-deref', 'HEAD', `refs/heads/${branch}`]);
+    }
+    if (scenario === 'many-tags') {
+      const tip = git(['-C', source, 'rev-parse', 'HEAD']);
+      const tags = Array.from({ length: 40_000 }, (_, index) => `${tip} refs/tags/large-tag-${String(index).padStart(5, '0')}`);
+      const refs = git(['--git-dir', join(dir, 'private.git'), 'show-ref']).split('\n');
+      writeFileSync(join(dir, 'private.git/packed-refs'), refs.concat(tags).sort((a, b) => a.slice(a.indexOf(' ') + 1).localeCompare(b.slice(b.indexOf(' ') + 1), 'en')).join('\n') + '\n');
+    }
     const token = 'synthetic-clone-equivalence-token';
     const header = `Basic ${Buffer.from(`oauth2:${token}`).toString('base64')}`;
     const requests: Array<string | null> = [];
@@ -355,8 +377,10 @@ test.each(['default-master', 'default-main', 'branch', 'tag', 'lightweight-tag',
       const control = join(dir, 'control');
       await run('git', ['clone', url, control], { ...env,
         GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `http.${url}.extraHeader`, GIT_CONFIG_VALUE_0: `Authorization: ${header}` });
-      const ref = scenario === 'branch' ? 'feature' : scenario === 'tag' ? 'release'
-        : scenario === 'lightweight-tag' ? 'lightweight' : scenario === 'sha' ? sha : undefined;
+      const ref = scenario === 'tag' || scenario.includes('-tag-') ? 'release'
+        : scenario === 'sha' || scenario.includes('-sha-') ? sha
+        : scenario === 'branch' || missingHead ? 'feature'
+        : scenario === 'lightweight-tag' ? 'lightweight' : undefined;
       // The public path clones first, then checks out a requested non-main ref.
       if (ref) git(['-C', control, 'checkout', ref]);
       const recipe = join(dir, 'recipe.json');
@@ -374,7 +398,8 @@ test.each(['default-master', 'default-main', 'branch', 'tag', 'lightweight-tag',
       const snapshot = (repo: string) => ({
         commit: git(['-C', repo, 'rev-parse', 'HEAD']),
         head: readFileSync(join(repo, '.git/HEAD'), 'utf8'),
-        remoteHead: git(['-C', repo, 'symbolic-ref', 'refs/remotes/origin/HEAD']),
+        remoteHead: missingHead ? existsSync(join(repo, '.git/refs/remotes/origin/HEAD'))
+          : git(['-C', repo, 'symbolic-ref', 'refs/remotes/origin/HEAD']),
         refs: git(['-C', repo, 'show-ref']),
         config: git(['-C', repo, 'config', '--get-regexp', '^(remote\\.origin\\.|branch\\.)']).split('\n').sort(),
         contents: readFileSync(join(repo, 'index.js'), 'utf8'),
@@ -384,8 +409,15 @@ test.each(['default-master', 'default-main', 'branch', 'tag', 'lightweight-tag',
       const network = calls.map((call, index) => ({ ...call, index })).filter(call => call.cwd === target
         && (call.args[0] === 'fetch' || (call.args[0] === 'ls-remote' && call.args[1] !== '--get-url')));
       expect(network.map(call => call.args[0])).toEqual(['ls-remote', 'fetch']);
-      expect(network[0]!.args).toEqual(['ls-remote', '--symref', 'origin', 'HEAD']);
+      expect(network[0]!.args).toEqual(['ls-remote', '--symref', 'origin', 'HEAD', ref ?? 'main']);
       expect(network[1]!.args).toContain('--tags');
+      expect(network[1]!.args).toContain('--quiet');
+      expect(calls.filter(call => call.cwd === target && call.args[0] === 'checkout').every(call => call.args.includes('--quiet'))).toBe(true);
+      if (remoteSha256 || defaultSha256) {
+        const format = remoteSha256 ? 'sha256' : 'sha1';
+        expect(git(['-C', target, 'rev-parse', '--show-object-format'])).toBe(format);
+        expect(calls.some(call => call.args.includes(`--object-format=${format}`))).toBe(true);
+      }
       for (const call of network) {
         expect(calls[call.index - 2]).toEqual({ cwd: target, args: ['remote', 'get-url', 'origin'] });
         expect(calls[call.index - 1]).toEqual({ cwd: target, args: ['ls-remote', '--get-url', 'origin'] });
@@ -396,5 +428,81 @@ test.each(['default-master', 'default-main', 'branch', 'tag', 'lightweight-tag',
       server.stop(true);
       rmSync(dir, { recursive: true, force: true });
     }
-  }, 15000,
+  }, 30000,
 );
+
+
+for (const prompt of ['git-env', 'ssh-env', 'core-config', 'indexed-config'] as const)
+test.each([false, true])(`R2-1/R2-6: HTTP 401 leaves the credential store and prompts untouched (${prompt}, pin=%s)`, async (pin) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cook-rejected-token-'));
+  const home = join(dir, 'home'); mkdirSync(home);
+  const requests: Array<string | null> = [];
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+    requests.push(request.headers.get('authorization'));
+    return new Response('', { status: 401, headers: { 'WWW-Authenticate': 'Basic realm="fixture"' } });
+  } });
+  try {
+    const url = `http://127.0.0.1:${server.port}/private.git`;
+    const stored = `http://operator:synthetic-saved-login@127.0.0.1:${server.port}\n`;
+    const store = join(home, '.git-credentials'); writeFileSync(store, stored);
+    const helperCalls = join(dir, 'helper-calls');
+    const helper = join(dir, 'helper');
+    writeFileSync(helper, `#!/bin/sh\necho "$1" >> '${helperCalls}'\nexec git credential-store "$@"\n`, { mode: 0o755 });
+    const askpass = join(dir, 'askpass');
+    const promptCalls = join(dir, 'prompt-calls');
+    writeFileSync(askpass, `#!/bin/sh\necho called >> '${promptCalls}'\necho synthetic-prompt-answer\n`, { mode: 0o755 });
+    writeFileSync(join(home, '.gitconfig'), `[credential]\n helper = ${helper}\n` +
+      (prompt === 'core-config' ? `[core]\n askPass = ${askpass}\n` : ''));
+    const env = { PATH: process.env.PATH, HOME: home, GIT_CONFIG_NOSYSTEM: '1' };
+    const publicRepo = join(dir, 'public');
+    execFileSync('git', ['init', '-b', 'main', publicRepo], { env, stdio: 'pipe' });
+    execFileSync('git', ['-C', publicRepo, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+      'commit', '--allow-empty', '-m', 'fixture'], { env, stdio: 'pipe' });
+    const bin = join(dir, 'bin'); mkdirSync(bin);
+    writeFileSync(join(bin, 'bun'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const recipe = join(dir, 'recipe.json');
+    const token = 'synthetic-expired-token';
+    writeFileSync(recipe, JSON.stringify({ name: 'Rejected token', agent: { systemPrompt: 'test' },
+      mcpServers: { fixture: { command: 'node', source: { url, authSecret: 'PRIVATE_TOKEN', sslBypass: true } } } }));
+    const cliEnv = { ...env, PATH: `${bin}:${env.PATH}`, PRIVATE_TOKEN: token, GIT_TERMINAL_PROMPT: '1',
+      ...(prompt === 'git-env' ? { GIT_ASKPASS: askpass } :
+        prompt === 'ssh-env' ? { SSH_ASKPASS: askpass } :
+        prompt === 'indexed-config' ? { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.askPass', GIT_CONFIG_VALUE_0: askpass } : {}) };
+    const child = spawn(process.execPath, [resolve(import.meta.dir, '../bin/cook'), 'install', recipe,
+      '--out', join(dir, 'out'), '--yes', '--no-prompts', '--ch-repo', publicRepo, ...(pin ? ['--pin-refs'] : [])], {
+      env: cliEnv, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = '';
+    child.stdout.on('data', chunk => { output += chunk; }); child.stderr.on('data', chunk => { output += chunk; });
+    const status = await new Promise<number | null>((resolve, reject) => { child.on('error', reject); child.on('close', resolve); });
+    expect(status).not.toBe(0);
+    expect(readFileSync(store, 'utf8')).toBe(stored);
+    expect(existsSync(helperCalls)).toBe(false);
+    expect(existsSync(promptCalls)).toBe(false);
+    expect(output).toContain('token rejected (HTTP 401)');
+    expect(output).not.toContain('final URL in the recipe');
+    expect(output).not.toContain('git -c failed');
+    if (pin) {
+      expect(output).toContain('no artifacts written');
+      expect(output).not.toContain('no output written');
+      expect(output).not.toContain('run `git');
+    } else expect(output).toContain('git ls-remote failed (128)');
+    expect(output).not.toContain(token);
+    expect(requests.length).toBeGreaterThan(0);
+    expect(requests.every(auth => auth === `Basic ${Buffer.from(`oauth2:${token}`).toString('base64')}`)).toBe(true);
+
+    // Positive public CLI control: each operator prompt channel must still run.
+    // Reset helpers only for this control so the saved login remains untouched.
+    writeFileSync(join(home, '.gitconfig'), '[credential]\n helper =\n' +
+      (prompt === 'core-config' ? `[core]\n askPass = ${askpass}\n` : ''));
+    writeFileSync(recipe, JSON.stringify({ name: 'Public prompt control', agent: { systemPrompt: 'test' },
+      mcpServers: { fixture: { command: 'node', source: { url } } } }));
+    const control = spawn(process.execPath, [resolve(import.meta.dir, '../bin/cook'), 'install', recipe,
+      '--out', join(dir, 'control'), '--yes', '--no-prompts', '--ch-repo', publicRepo, '--pin-refs'], {
+      env: cliEnv, stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    expect(await new Promise<number | null>((resolve, reject) => { control.on('error', reject); control.on('close', resolve); })).not.toBe(0);
+    expect(existsSync(promptCalls)).toBe(true);
+    expect(readFileSync(store, 'utf8')).toBe(stored);
+  } finally { server.stop(true); rmSync(dir, { recursive: true, force: true }); }
+}, 15000);

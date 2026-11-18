@@ -1,23 +1,8 @@
 import { execFileSync } from 'node:child_process';
 import { repositoryIndependentGitEnv } from './git-env.js';
-import type { InstallPlan } from './plan.js';
-
-/** Recipe value names excluded from source-acquisition environments only. */
-export function knownSecretEnvironmentNames(plan: InstallPlan): Set<string> {
-  const requirements = new Set(plan.requirements.map(r => r.envName));
-  return new Set([
-    'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN',
-    ...(plan.parentWalk.recipe.services ?? []).flatMap(service => service.secrets ?? []),
-    ...plan.sources.flatMap(source => source.authSecret ? [source.authSecret] : []),
-    ...plan.credentialFiles.flatMap(file => file.fields.flatMap(field => field.envOverride ? [field.envOverride] : [])),
-    ...plan.envVars.filter(variable => !requirements.has(variable.name)).map(variable => variable.name),
-    ...Object.keys(plan.values).filter(name => !requirements.has(name)),
-  ]);
-}
-
 /** Host builds receive only ordinary base settings and explicitly selected
  * parent values. Recipe declarations and resolved values do not participate. */
-export function processAllowlistEnv(): NodeJS.ProcessEnv {
+export function processAllowlistEnv(includeBuildSelection = true): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   const allowed = new Set([
     'PATH', 'HOME', 'TMPDIR', 'LANG', 'TERM', 'CI', 'USER', 'LOGNAME', 'SHELL',
@@ -30,7 +15,7 @@ export function processAllowlistEnv(): NodeJS.ProcessEnv {
     'npm_config_registry', 'NPM_CONFIG_REGISTRY', 'PIP_INDEX_URL', 'UV_INDEX_URL',
     'CARGO_HOME', 'RUSTUP_HOME',
   ]);
-  const selected = (process.env.COOK_PASS_ENV ?? '').split(/[,\s]+/).filter(Boolean);
+  const selected = (includeBuildSelection ? process.env.COOK_PASS_ENV ?? '' : '').split(/[,\s]+/).filter(Boolean);
   if (selected.some(name => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))) {
     throw new Error('COOK_PASS_ENV must contain environment variable names, not values.');
   }
@@ -41,38 +26,21 @@ export function processAllowlistEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-/** Git additionally receives external authentication hooks and configuration channels. */
-export function gitEnvironment(base = processAllowlistEnv(), excluded: Iterable<string> = []): NodeJS.ProcessEnv {
-  const blocked = new Set(excluded);
-  const selected = new Set((process.env.COOK_PASS_ENV ?? '').split(/[,\s]+/).filter(Boolean));
-  for (const name of ['GH_TOKEN', 'GITHUB_TOKEN']) {
-    if (blocked.has(name) && process.env[name] !== undefined) {
-      if (!selected.has(name)) {
-        throw new Error(`Recipe secret ${name} collides with Git's helper environment; explicitly select ${name} with COOK_PASS_ENV to forward the parent value, or rename the recipe secret.`);
-      }
-      blocked.delete(name);
-    }
-  }
-  let env = { ...base };
-  for (const key of blocked) delete env[key];
-  // Explicit build opt-ins must not redirect Git repositories or bypass its
-  // separate authentication/configuration policy. Re-add Git's channels below.
-  for (const key of Object.keys(env)) {
-    if (/^GCM_/.test(key) || [
-      'GH_TOKEN', 'GITHUB_TOKEN', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR',
-      'XDG_CONFIG_HOME', 'SSH_ASKPASS', 'COOK_PASS_ENV',
-    ].includes(key)) delete env[key];
-  }
-  // Strip repository-local controls BEFORE restoring indexed operator config
-  // and BEFORE sourceGitEnvironment injects a credential.
-  env = repositoryIndependentGitEnv(env);
+/** Git uses the base allowlist and its own channels, never build selections or
+ * recipe value names. Repository-local controls are removed before config injection. */
+export function gitEnvironment(): NodeJS.ProcessEnv {
+  const env = repositoryIndependentGitEnv(processAllowlistEnv(false));
   for (const key of [
-    'SSH_AUTH_SOCK', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_SSH_VARIANT',
-    'GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_TERMINAL_PROMPT',
-    'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_NOSYSTEM', 'XDG_CONFIG_HOME',
+    'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_SSH_VARIANT', 'GIT_ASKPASS', 'GIT_TERMINAL_PROMPT',
+    'GIT_EXEC_PATH', 'GIT_SSL_NO_VERIFY', 'GIT_PROXY_COMMAND',
+    'GIT_HTTP_LOW_SPEED_LIMIT', 'GIT_HTTP_LOW_SPEED_TIME', 'GIT_ALLOW_PROTOCOL', 'GIT_PROTOCOL_FROM_USER',
     'GIT_SSL_CAINFO', 'GIT_SSL_CAPATH', 'GIT_SSL_CERT', 'GIT_SSL_KEY',
+    'GIT_SSL_CERT_PASSWORD_PROTECTED', 'GIT_SSL_VERSION', 'GIT_SSL_CIPHER_LIST',
     'GIT_PROXY_SSL_CAINFO', 'GIT_PROXY_SSL_CAPATH', 'GIT_PROXY_SSL_CERT', 'GIT_PROXY_SSL_KEY',
-    'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR', 'GH_TOKEN', 'GITHUB_TOKEN',
+    'GIT_PROXY_SSL_CERT_PASSWORD_PROTECTED', 'GIT_HTTP_USER_AGENT', 'GIT_HTTP_MAX_REQUESTS',
+    'GIT_DEFAULT_HASH', 'GIT_DEFAULT_REF_FORMAT', 'GIT_FLUSH',
+    'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_NOSYSTEM', 'XDG_CONFIG_HOME',
+    'SSH_ASKPASS', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR', 'GH_TOKEN', 'GITHUB_TOKEN',
   ]) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
   }
@@ -84,16 +52,15 @@ export function gitEnvironment(base = processAllowlistEnv(), excluded: Iterable<
     const match = /^GIT_CONFIG_(?:KEY|VALUE)_(\d+)$/.exec(key);
     if (match && Number(match[1]) < count) env[key] = process.env[key];
   }
-  for (const key of blocked) delete env[key];
   return env;
 }
 
 /** Add a private source's credential only to this action's Git subprocesses. */
 export function sourceGitEnvironment(
   url: string, authSecret: string | undefined, values: NodeJS.ProcessEnv = process.env,
-  location = 'Source', base?: NodeJS.ProcessEnv, excluded: Iterable<string> = [],
+  location = 'Source',
 ): NodeJS.ProcessEnv {
-  const env = gitEnvironment(base, excluded);
+  const env = gitEnvironment();
   if (!authSecret) return env;
   delete env[authSecret];
   const token = values[authSecret];
@@ -108,11 +75,11 @@ export function sourceGitEnvironment(
   }
   const rawCount = env.GIT_CONFIG_COUNT ?? '0';
   const count = Number(rawCount);
-  if (!/^\d+$/.test(rawCount) || !Number.isSafeInteger(count) || count > Number.MAX_SAFE_INTEGER - 4) {
+  if (!/^\d+$/.test(rawCount) || !Number.isSafeInteger(count) || count > Number.MAX_SAFE_INTEGER - 6) {
     throw new Error(`${location}: authSecret requires a valid GIT_CONFIG_COUNT.`);
   }
   assertAuthGitVersion(env, location);
-  env.GIT_CONFIG_COUNT = String(count + 4);
+  env.GIT_CONFIG_COUNT = String(count + 6);
   env[`GIT_CONFIG_KEY_${count}`] = `http.${origin}/.extraHeader`;
   env[`GIT_CONFIG_VALUE_${count}`] = `Authorization: Basic ${Buffer.from(`oauth2:${token}`).toString('base64')}`;
   // Keep all three redirect blocks as defense in depth. The exact key beats
@@ -123,6 +90,18 @@ export function sourceGitEnvironment(
     env[`GIT_CONFIG_KEY_${count + 1 + index}`] = key;
     env[`GIT_CONFIG_VALUE_${count + 1 + index}`] = 'false';
   }
+  // An Authorization header must never cause Git to get/reject the operator's
+  // unrelated saved login when this token is rejected.
+  env[`GIT_CONFIG_KEY_${count + 4}`] = 'credential.helper';
+  env[`GIT_CONFIG_VALUE_${count + 4}`] = '';
+  // Removing environment askpass channels alone exposes core.askPass from
+  // operator files/includes or indexed config. Override that channel too.
+  env[`GIT_CONFIG_KEY_${count + 5}`] = 'core.askPass';
+  env[`GIT_CONFIG_VALUE_${count + 5}`] = '';
+  env.GIT_TERMINAL_PROMPT = '0';
+  env.LC_ALL = 'C';
+  delete env.GIT_ASKPASS;
+  delete env.SSH_ASKPASS;
   return env;
 }
 
@@ -181,3 +160,15 @@ export function gitFailureOutput(error: unknown, token?: string): string {
 }
 
 export const AUTH_REDIRECT_HINT = 'authSecret disables HTTP redirects; put the final URL in the recipe.';
+
+/** Private diagnostics use stable English Git errors and retain redaction. */
+export function privateGitFailureOutput(error: unknown, token?: string): string {
+  let output = gitFailureOutput(error, token);
+  if (/could not read (?:Username|Password).*terminal prompts disabled/i.test(output)) {
+    output = `token rejected (HTTP 401)\n${output}`;
+  }
+  if (/redirection|redirect (?:from|to)|redirects? (?:not|disallowed|disabled)|requested URL returned error: 30[12378]\b/i.test(output)) {
+    output += `\n${AUTH_REDIRECT_HINT}`;
+  }
+  return output;
+}

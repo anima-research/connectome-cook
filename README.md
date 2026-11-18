@@ -144,7 +144,9 @@ Previously cook passed its whole environment to host builds. It never injected
 resolved requirements, although this README said they were available to install
 steps. The explicit parent channel keeps that use case without forwarding recipe
 values. Additional package-manager settings previously covered by broad prefix
-allowlists must also be selected explicitly.
+allowlists must also be selected explicitly. Git has a separate fixed set of
+supported authentication/configuration/transport channels below; other ambient
+`GIT_*` names are not forwarded, and `COOK_PASS_ENV` cannot extend Git's channels.
 
 Cook never prints or persists values **via the COOK_PASS_ENV channel** in locks,
 generated READMEs, recipes or the runtime `.env`. Normal recipe-declared runtime,
@@ -162,13 +164,17 @@ entries; the path-valued `GIT_SSL_CAINFO`/`CAPATH`/`CERT`/`KEY` and correspondin
 `DBUS_SESSION_BUS_ADDRESS`/`XDG_RUNTIME_DIR` for desktop keyrings. Helper settings
 `GCM_*` and `GH_TOKEN`/`GITHUB_TOKEN` go to Git by default, preserving existing Git
 Credential Manager and GitHub CLI setups. Builds receive these only if explicitly
-selected. If a recipe secret named `GH_TOKEN` or `GITHUB_TOKEN` would remove a
-parent helper credential, cook refuses with the variable name: explicitly select
-it with `COOK_PASS_ENV` to forward the parent value, or rename the recipe secret.
-A source's own `authSecret` is still sent only through its header channel.
+selected. Recipe value names never change Git's environment policy, and
+`COOK_PASS_ENV` applies only to builds, not Git. A source's own `authSecret`
+name is removed from that action's environment and sent through its header
+channel. For these private actions only, credential helpers and askpass are
+disabled and terminal prompts are off: a rejected token cannot erase the
+operator's saved login. Public actions retain external authentication.
 Ambient repository-redirection variables such as
 `GIT_DIR`/`GIT_WORK_TREE`/`GIT_CONFIG_PARAMETERS` are not forwarded to cook's Git
-subprocesses, even if selected for builds.
+subprocesses, even if selected for builds. Supported non-routing Git settings remain
+available, including `GIT_EXEC_PATH`, `GIT_SSL_NO_VERIFY`, `GIT_PROXY_COMMAND`,
+`GIT_HTTP_LOW_SPEED_*`, `GIT_ALLOW_PROTOCOL` and `GIT_PROTOCOL_FROM_USER`.
 
 Allowlisted package-manager variables, proxy URLs and operator-selected values
 can carry credentials: forward these only when you trust the build scripts,
@@ -264,7 +270,7 @@ Abbreviated commit IDs cannot be pinned: use the full 40-hex ID from
 `git rev-parse <ref>` with `--pin-refs`.
 
 Compatibility: Docker `cook build --pin-refs` also resolves private symbolic
-refs with `authSecret` instead of warning and continuing unpinned. Resolution
+refs with `authSecret` instead of refusing them and requiring a full commit SHA. Resolution
 failures are fatal. Docker image-build authentication without `--pin-refs` is
 unchanged; its existing credentialed-remote persistence is not fixed here.
 
