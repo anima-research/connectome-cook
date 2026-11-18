@@ -1,12 +1,11 @@
-import { execFileSync } from 'node:child_process';
-
-/** Keep user configuration/PATH, but never let an enclosing repository redirect
- * commands intended for an explicitly acquired checkout or scratch store. */
-export function repositoryIndependentGitEnv(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
-  const localVars = execFileSync('git', ['rev-parse', '--local-env-vars'], {
-    env, timeout: 10000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  for (const name of localVars.trim().split(/\s+/)) delete env[name];
+/** Remove repository-routing controls before Git's supported configuration
+ * channels (and any source credential) are injected. Strip the entire GIT_
+ * namespace rather than querying Git with an as-yet unfiltered environment.
+ * Callers must not apply this function after sourceGitEnvironment. */
+export function repositoryIndependentGitEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...base };
+  for (const name of Object.keys(env)) {
+    if (name.startsWith('GIT_')) delete env[name];
+  }
   return env;
 }

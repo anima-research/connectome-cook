@@ -126,7 +126,7 @@ async function runBuildPipeline(argv: string[]): Promise<BuildResult> {
   let pinnedChRef: string | undefined;
   if (flags['pin-refs']) {
     log.step('pinning refs (git ls-remote)');
-    pinSources(planResult.plan.sources);
+    pinSources(planResult.plan.sources, planResult.plan.values);
     const chLocation = `connectome-host (${DEFAULT_CH_REPO_URL})`;
     const chSha = resolveRemoteRef(DEFAULT_CH_REPO_URL, DEFAULT_CH_REF, false, chLocation);
     if (chSha) {
@@ -160,6 +160,8 @@ under the install dir, resolves host requirements (probe + confirm), writes
 the lowered configurations, a sourceable .env, a run.sh launcher, and
 ${log.dim('connectome.lock')}.  Re-running reconciles: components unchanged in the
 lock are kept, everything else is re-cloned.
+COOK_PASS_ENV selects extra parent environment names (comma/space-separated)
+for build tools without persisting their values.
 
 ${log.bold('SAFETY:')} unlike \`cook build\`, install commands run ON THIS MACHINE.
 The full action plan is printed and confirmed first.  Non-interactive runs
@@ -236,7 +238,7 @@ async function handleInstall(argv: string[]): Promise<number> {
     log.step(flags['bun-path'] !== undefined || flags['node-path'] !== undefined
       ? 'pinning component refs (git ls-remote); host bound by engine preflight'
       : 'pinning refs (git ls-remote)');
-    pinSources(planResult.plan.sources);
+    pinSources(planResult.plan.sources, planResult.plan.values);
     // Engine preflight fetches and binds the host itself; avoid ls-remote too.
     if (flags['bun-path'] === undefined && flags['node-path'] === undefined) {
       const chLocation = `connectome-host (${chRepoUrl})`;
