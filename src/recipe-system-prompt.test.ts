@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { validateRecipe } from './vendor/recipe.js';
 
-const MESSAGE = 'Recipe agent must have a "systemPrompt" string';
+const MESSAGE = 'Recipe agent "systemPrompt" must be a string when present';
 
 test('absent or null systemPrompt is accepted and normalized to the empty string, as the host does', () => {
   expect(validateRecipe({ name: 'T', agent: {} }).agent.systemPrompt).toBe('');

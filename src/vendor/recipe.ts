@@ -1,6 +1,7 @@
 /**
  * Vendored from connectome-host: forking-knowledge-miner/src/recipe.ts
  * Sync source: github.com/anima-research/connectome-host
+ * System-prompt validation tracks connectome-host 5cdab07f (absent/empty prompts).
  * Last synced: feat/recipe-extensions branch (recipe `extensions` block —
  *              custom strategies/modules via local imports; strategy.type
  *              widened to admit extension-registered names).
@@ -493,11 +494,11 @@ export function validateRecipe(raw: unknown): Recipe {
   }
 
   const agent = obj.agent as Record<string, unknown>;
-  // Host parity: absent/null normalizes to '', '' is accepted.
+  // Host parity (v0.8.0+ for promptless recipes): absent/null normalizes to '', '' is accepted.
   if (agent.systemPrompt === undefined || agent.systemPrompt === null) {
     agent.systemPrompt = '';
   } else if (typeof agent.systemPrompt !== 'string') {
-    throw new Error('Recipe agent must have a "systemPrompt" string');
+    throw new Error('Recipe agent "systemPrompt" must be a string when present');
   }
 
   // Extensions block — validated before the strategy check, which consults
