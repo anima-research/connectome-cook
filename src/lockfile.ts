@@ -1,19 +1,18 @@
 /** Versioned deployment record. Never serialize resolved operator values here. */
-import { createHash } from 'node:crypto';
-import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, statSync, readFileSync, writeFileSync, renameSync, unlinkSync, openSync, closeSync } from 'node:fs';
 import { dirname, join, posix, relative, resolve, sep } from 'node:path';
 import type { InstallPlan } from './plan.js';
 import type { McpSource } from './types.js';
 import { deriveRequiredVars } from './prompts.js';
 import { looksLikeSha } from './pin-refs.js';
-import { shellQuote, escapeForEnvFile } from './env-encoding.js';
-import { quoteForComposeEnvBlock } from './generators/compose.js';
+import { assertCredentialFreeSourceUrl, sourceLocation } from './source-url.js';
 import pkg from '../package.json' with { type: 'json' };
 
 export const LOCKFILE_NAME = 'connectome.lock';
 
 export interface LegacyComponent {
-  kind?: 'git';
+  kind?: 'git' | 'copy';
   key: string;
   role: 'mcp' | 'extension';
   url: string;
@@ -42,7 +41,8 @@ export interface LockedNpmComponent {
   path?: never;
   install?: never;
 }
-export type LockedComponent = LockedGitComponent | LockedNpmComponent;
+export interface LockedCopyComponent extends Omit<LegacyComponent, 'kind'> { kind: 'copy' }
+export type LockedComponent = LockedGitComponent | LockedNpmComponent | LockedCopyComponent;
 
 /** v1 carried arbitrary answers here, including secrets. v2 is names only. */
 export interface LockedRequirement {
@@ -51,11 +51,14 @@ export interface LockedRequirement {
   origin: string;
 }
 interface LockCommon {
+  hostDependencies?: import('./host-dependency.js').LockedHostDependency[];
+  incomplete?: true;
+  engines?: import('./host-engines.js').HostEngines;
   backend: 'docker' | 'host';
   recipePath: string;
   createdAt: string;
   localExtensions: Array<{ name: string; hostDir: string; path: string }>;
-  launch: { kind: 'compose'; dir: string } | { kind: 'script'; script: string };
+  launch: { kind: 'compose'; dir: string } | { kind: 'script'; script: string; userUnit?: string };
 }
 export interface LockfileV1 extends LockCommon {
   version: 1;
@@ -63,20 +66,19 @@ export interface LockfileV1 extends LockCommon {
   components: LegacyComponent[];
   requirements: Array<LockedRequirement & { value?: string }>;
 }
-/** Future engines/units/layout/health belong in separate optional extensions,
- * not in this version's build identity or launch contract. */
+/** New v2 metadata is informational; it does not drive reconcile or launch. */
 export interface LockfileV2 extends LockCommon {
   version: 2;
-  cook: { version: string; commit?: string };
+  cook: { packageVersion: string };
   recipe: { path: string; sha256: string };
   connectomeHost: { url: string; ref: string; commit?: string; path?: string };
   components: LockedComponent[];
   requirements: LockedRequirement[];
-  build: { id: string; dir: string };
-  credentials: string[];
+  build: { inputId: string; dir: string };
+  referencedVariables: string[];
   /** Only if cook defines a state location outside build.dir. */
   state?: { path: string };
-  outputs: Array<{ path: string; mode: number; sha256?: string; sha256Omitted?: 'contains-requirement-value' }>;
+  outputs: Array<{ path: string; mode: number; sha256?: string }>;
 }
 export type Lockfile = LockfileV1 | LockfileV2;
 
@@ -93,7 +95,7 @@ export function canonicalJson(value: unknown): string {
   }
   return JSON.stringify(value);
 }
-export function buildId(inputs: unknown): string {
+export function inputId(inputs: unknown): string {
   return sha256(canonicalJson(inputs));
 }
 export function fullCommit(commit: string | undefined, location: string): string {
@@ -109,6 +111,12 @@ export function resolveNpmComponents(sources: McpSource[]): LockedNpmComponent[]
   return sources.filter(s => s.install.kind === 'npm-global').map(source => {
     if (source.install.kind !== 'npm-global') throw new Error('unreachable');
     const spec = source.install.package;
+    // Validate URL specs before key/spec can enter logs or the lock. Scoped
+    // registry names are not URLs; their leading @ is a package delimiter.
+    const urlSpec = spec.replace(/^(?:@[^/@:]+\/)?[^/@:]+@(?=(?:git\+)?[a-z][a-z0-9+.-]*:\/\/)/i, '');
+    if (/^(?:git\+)?[a-z][a-z0-9+.-]*:\/\//i.test(urlSpec) || urlSpec.includes('://')) {
+      assertCredentialFreeSourceUrl(urlSpec, `${sourceLocation(source)}.npm`, { allowSuffix: true });
+    }
     // The first @ in a scoped name is not the version delimiter. Preserve
     // tags/ranges (and any other spec main accepted) verbatim, never resolve.
     const at = spec.indexOf('@', spec.startsWith('@') ? 1 : 0);
@@ -137,7 +145,7 @@ function recipeIdentityPath(path: string, root: string): string {
 /** Names are a conservative superset: runtime vars have no secret marker.
  * RequiredVar already classifies build/sidecar secrets; LockedRequirement does
  * not. Reuse the existing collector rather than maintain a secret-name list. */
-export function credentialNames(plan: InstallPlan): string[] {
+export function referencedVariables(plan: InstallPlan): string[] {
   const sidecarSecrets = (plan.parentWalk.recipe.services ?? []).flatMap(s => s.secrets ?? []);
   const vars = deriveRequiredVars(plan.envVars, plan.sources, sidecarSecrets, plan.walks);
   return [...new Set([
@@ -155,8 +163,8 @@ export function deploymentRecord(
   connectomeHost: LockfileV2['connectomeHost'],
   components: LockedComponent[],
   options: Record<string, unknown>,
-): Pick<LockfileV2, 'cook' | 'recipe' | 'build' | 'credentials' | 'requirements'> {
-  const cook = { version: pkg.version };
+): Pick<LockfileV2, 'cook' | 'recipe' | 'build' | 'referencedVariables' | 'requirements'> {
+  const cook = { packageVersion: pkg.version };
   // Programmatic plans without loader provenance hash canonical recipe JSON.
   const recipes = plan.walks.map(w => ({ path: recipeIdentityPath(w.path, plan.parentWalk.path), sha256: w.sourceSha256 ?? sha256(canonicalJson(w.recipe)) }));
   const recipe = { path: plan.recipePath, sha256: recipes[0]!.sha256 };
@@ -166,42 +174,14 @@ export function deploymentRecord(
   }).sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
   return {
     cook, recipe,
-    build: { dir: resolve(dir), id: buildId({ recipe: recipe.sha256, recipes, pins: { connectomeHost: hostPin, components: pins }, cook, backend, options }) },
-    credentials: credentialNames(plan),
+    build: { dir: resolve(dir), inputId: inputId({ recipe: recipe.sha256, recipes, pins: { connectomeHost: hostPin, components: pins }, cook, backend, options }) },
+    referencedVariables: referencedVariables(plan),
     requirements: plan.requirements.map(({ name, envName, origin }) => ({ name, envName, origin })),
   };
 }
 
-/** Only the reason crosses into the lock, never the matching answer. */
-export type PublicOutputDigest = string | { sha256Omitted: 'contains-requirement-value' } | undefined;
-
-/** Snapshot EVERY resolved requirement, independent of origin/name/secrecy.
- * Match all non-empty answers, including one character: a minimum length
- * would leave short secrets verifiable. Empty/unresolved answers match nothing.
- * Include the encodings cook writes, without their surrounding quotes, so
- * embedded/prefixed answers are caught too. Reuse the writers' encoders. */
-export function createOutputHasher(requirements: ReadonlyArray<{ value?: string }>): (content: string) => PublicOutputDigest {
-  const forms = new Set<string>();
-  for (const { value } of requirements) {
-    if (value === undefined || value === '') continue;
-    forms.add(value);
-    forms.add(JSON.stringify(value).slice(1, -1)); // lowered JSON / JSON in YAML
-    forms.add(quoteForComposeEnvBlock(value).slice(1, -1));
-    const env = escapeForEnvFile(value);
-    forms.add(env === value ? env : env.slice(1, -1));
-    forms.add(shellQuote(value).slice(1, -1));
-  }
-  const encodedValues = [...forms].map(value => Buffer.from(value, 'utf8'));
-  return content => {
-    // Use the same UTF-8 bytes as writeFileSync, including surrogate replacement.
-    const bytes = Buffer.from(content, 'utf8');
-    // Deliberately check generated bytes BEFORE computing an output digest.
-    if (encodedValues.some(value => bytes.includes(value))) {
-      return { sha256Omitted: 'contains-requirement-value' };
-    }
-    return sha256(bytes);
-  };
-}
+/** Eligibility is declared by the writer, never inferred from operator answers. */
+export type PublicOutputDigest = string | undefined;
 
 /** Explicit inventory, never a recursive scan of operator state. Public
  * digests must be captured from generated bytes BEFORE writing, not read back
@@ -227,21 +207,34 @@ export function outputRecords(
       continue; // A declared but unwritten output is not recorded.
     }
     const digest = sensitive.has(path) ? undefined : digests.get(path);
-    records.push({ path, mode, ...(typeof digest === 'string' ? { sha256: digest } : digest ?? {}) });
+    records.push({ path, mode, ...(digest === undefined ? {} : { sha256: digest }) });
   }
   return records;
 }
 
-export function writeLockfile(dir: string, lock: LockfileV2): void {
-  if (lock.backend === 'host' || lock.connectomeHost.commit !== undefined) {
-    fullCommit(lock.connectomeHost.commit, 'connectome-host');
-  }
-  for (const c of lock.components) if (c.kind === 'git' && (lock.backend === 'host' || c.commit !== undefined)) {
-    fullCommit(c.commit, c.key);
+export function writeLockfile(dir: string, lock: Lockfile): void {
+  if (lock.version === 2 && !lock.incomplete) {
+    if (lock.backend === 'host' || lock.connectomeHost.commit !== undefined) {
+      fullCommit(lock.connectomeHost.commit, 'connectome-host');
+    }
+    for (const c of lock.components) if (c.kind === 'git' && (lock.backend === 'host' || c.commit !== undefined)) {
+      fullCommit(c.commit, c.key);
+    }
   }
   // Defense in depth against callers passing a wider runtime requirement.
   const safe = { ...lock, requirements: lock.requirements.map(({ name, envName, origin }) => ({ name, envName, origin })) };
-  writeFileSync(join(dir, LOCKFILE_NAME), JSON.stringify(safe, null, 2) + '\n');
+  // Same-directory rename publishes a whole record, including incomplete markers.
+  const temp = join(dir, `.${LOCKFILE_NAME}.${randomUUID()}.tmp`);
+  const fd = openSync(temp, 'wx', 0o600);
+  try {
+    writeFileSync(fd, JSON.stringify(safe, null, 2) + '\n');
+    closeSync(fd);
+    renameSync(temp, join(dir, LOCKFILE_NAME));
+  } catch (err) {
+    try { closeSync(fd); } catch { /* Already closed. */ }
+    try { unlinkSync(temp); } catch { /* Preserve the original failure. */ }
+    throw err;
+  }
 }
 
 export function readLockfile(dir: string): Lockfile | null {

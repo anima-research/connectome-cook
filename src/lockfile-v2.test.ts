@@ -1,11 +1,11 @@
 import { afterEach, expect, test } from 'bun:test';
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { runDockerBackend } from './backends/docker.js';
 import { resolvePlan } from './plan.js';
 import { spawnSync } from 'node:child_process';
-import { buildId, createOutputHasher, deploymentRecord, fullCommit, outputRecords, sha256, writeLockfile, type LockfileV2, readLockfile } from './lockfile.js';
+import { inputId, deploymentRecord, fullCommit, outputRecords, sha256, writeLockfile, type LockfileV2, readLockfile } from './lockfile.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -42,7 +42,9 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(gitLog)}, JSON.stringify(args) + '\\n');
 if (args[0] === 'ls-remote') console.log(process.env.TEST_SHA + '\\t' + args[2]);
+if (args[0] === 'rev-parse' && args[1] === '--local-env-vars') { console.log('GIT_DIR\\nGIT_WORK_TREE\\nGIT_INDEX_FILE'); process.exit(0); }
 if (args[0] === 'rev-parse') {
+  if (process.env.GIT_DIR || process.env.GIT_WORK_TREE || process.env.GIT_INDEX_FILE) process.exit(99);
   if (process.env.TEST_MISSING_HEAD) process.exit(1);
   console.log(process.env.TEST_SHA);
 }
@@ -84,7 +86,7 @@ if (args[0] === 'clone') mkdirSync(args[2], { recursive: true });
 }
 
 for (const backend of ['docker', 'host'] as const) {
-  test(`${backend}: prompt answers and accepted probe defaults suppress public hashes`, () => {
+  test(`${backend}: prompt answers and accepted probe defaults are stripped without affecting digest eligibility`, () => {
     for (const source of ['prompt', 'probe'] as const) {
       const f = fixture();
       const answer = source === 'probe' ? join(f.dir, 'probe-default') : f.canary;
@@ -103,83 +105,62 @@ for (const backend of ['docker', 'host'] as const) {
       expect(f.lock().requirements[0]?.origin).toBe(source);
       for (const path of ['recipes/recipe.json', backend === 'docker' ? 'docker-compose.yml' : 'docker-compose.sidecars.yml']) {
         const output = f.lock().outputs.find(o => o.path === path)!;
-        expect(output.sha256).toBeUndefined();
-        expect(output).toHaveProperty('sha256Omitted', 'contains-requirement-value');
+        expect(output.sha256).toBe(sha256(readFileSync(join(f.out, path))));
       }
     }
   });
 
-  test(`${backend}: one-character answers match; empty optional answers do not suppress ordinary outputs`, () => {
-    for (const answer of ['λ', '']) {
+  test(`${backend}: digest eligibility and omissions do not reveal requirement answers`, () => {
+    const f = fixture();
+    let outputs: LockfileV2['outputs'] | undefined;
+    for (const answer of ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']) {
+      expect(f.run(backend, { ODD_ANSWER: answer }).status).toBe(0);
+      const lock = f.lock();
+      const publicRecords = lock.outputs.filter(o => o.sha256 !== undefined);
+      expect(publicRecords.length).toBeGreaterThan(2);
+      if (outputs) expect(publicRecords).toEqual(outputs);
+      outputs = publicRecords;
+      for (const path of ['.env', 'config/kv.conf', 'SIDECAR_SECRET', backend === 'docker' ? '.credential' : 'app/.credential']) {
+        expect(lock.outputs.find(o => o.path === path)?.sha256).toBeUndefined();
+      }
+      expect(JSON.stringify(lock)).not.toContain('sha256Omitted');
+      expect(lock.requirements.every(r => !('value' in r))).toBe(true);
+    }
+  }, 30_000);
+
+  test(`${backend}: credentialed npm URLs are rejected without a lock or secret in diagnostics`, () => {
+    for (const spec of ['https://user:SECRET@host/pkg.tgz', 'git+https://user:SECRET@host/pkg.git', 'pkg@https://user:SECRET@host/pkg.tgz',
+      'git+https://user:SECRET@host/pkg.git#v1.0.0', 'pkg@git+https://user:SECRET@host/pkg.git#v1.0.0',
+      '@scope/pkg@git+https://user:SECRET@host/pkg.git#semver:^1.2.0', 'git+ssh://oauth2@host/pkg.git#main']) {
       const f = fixture();
       const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
-      recipe.requirements.arbitrary.required = false;
-      recipe.services[0].environment = { LITERAL: answer };
-      // Avoid unresolved runtime template vars in the empty-answer case.
-      recipe.services[0].templateFiles[0].template = 'ordinary template';
-      recipe.agent.systemPrompt = 'ordinary prompt';
+      recipe.mcpServers.npm.source.npm = spec;
       writeFileSync(f.recipe, JSON.stringify(recipe));
-      const result = f.run(backend, { ODD_ANSWER: answer });
-      if (result.status !== 0) throw new Error(result.stderr);
-      for (const path of ['recipes/recipe.json', backend === 'docker' ? 'docker-compose.yml' : 'docker-compose.sidecars.yml']) {
-        const output = f.lock().outputs.find(o => o.path === path)!;
-        if (answer) {
-          expect(output.sha256).toBeUndefined();
-          expect(output).toHaveProperty('sha256Omitted', 'contains-requirement-value');
-        } else {
-          expect(output.sha256).toBe(sha256(readFileSync(join(f.out, path))));
-          expect(output).not.toHaveProperty('sha256Omitted');
-        }
-      }
+      const result = f.run(backend, {}, false);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain('embedded credentials');
+      expect(result.stderr + result.stdout).not.toContain('SECRET');
+      expect(existsSync(join(f.out, 'connectome.lock'))).toBe(false);
+      expect(existsSync(f.gitLog)).toBe(false);
     }
   });
 
-  for (const location of ['environment', 'template'] as const) {
-    for (const escaped of [false, true]) {
-      test(`${backend}: public ${location} omits answer verifiers (${escaped ? 'escaped' : 'literal'})`, () => {
-        for (const source of (escaped ? ['process-env'] : ['process-env', 'env-file'])) {
-          const f = fixture();
-          const answer = escaped ? 'private-"\\\n\t-dollar$-quote\'' : f.canary;
-          const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
-          if (location === 'environment') recipe.services[0].environment = { LITERAL: `prefix:${answer}:suffix` };
-          else recipe.services[0].templateFiles[0].template = `literal=${answer}`;
-          writeFileSync(f.recipe, JSON.stringify(recipe));
-          const envFile = join(f.dir, 'answers.env');
-          // This parser preserves bare backslashes; multiline values are not
-          // supported by env-file, so use the env source for that variant.
-          const fromFile = source === 'env-file';
-          if (fromFile) writeFileSync(envFile, `ODD_ANSWER=${answer}\n`);
-          const result = f.cli([backend === 'docker' ? 'build' : 'install', f.recipe,
-            '--out', f.out, '--no-prompts', '--yes', '--pin-refs',
-            ...(fromFile ? ['--env-file', envFile] : [])], { ODD_ANSWER: fromFile ? 'superseded-answer' : answer });
-          if (result.status !== 0) throw new Error(result.stderr);
-          const lock = f.lock();
-          expect(lock.requirements[0]?.origin).toBe(fromFile ? 'env-file' : 'process-env');
-          const output = lock.outputs.find(o => o.path === 'recipes/recipe.json')!;
-          expect(output.sha256).toBeUndefined();
-          expect(output).toHaveProperty('sha256Omitted', 'contains-requirement-value');
-          if (location === 'environment') {
-            const compose = lock.outputs.find(o => o.path === (backend === 'docker' ? 'docker-compose.yml' : 'docker-compose.sidecars.yml'))!;
-            expect(compose).toBeDefined();
-            expect(compose.sha256).toBeUndefined();
-            expect(compose).toHaveProperty('sha256Omitted', 'contains-requirement-value');
-          }
-          // Every raw/JSON/YAML occurrence is suppressed, not just the
-          // particular output that triggered the review finding.
-          const forms = [answer, JSON.stringify(answer).slice(1, -1), answer.replace(/\\/g, '\\\\').replace(/"/g, '\\"')];
-          for (const o of lock.outputs) {
-            const bytes = readFileSync(join(f.out, o.path), 'utf8');
-            if (forms.some(form => bytes.includes(form))) expect(o.sha256).toBeUndefined();
-          }
-          expect(lock.outputs.find(o => o.path === (backend === 'docker' ? 'entrypoint.sh' : 'run.sh'))?.sha256).toBeDefined();
-          // Owner decision A deliberately retains input identity, even when
-          // the operator put the same answer literally in the recipe.
-          expect(lock.recipe.sha256).toBe(sha256(readFileSync(f.recipe)));
-          expect(lock.build.id).toMatch(/^[a-f0-9]{64}$/);
-        }
-      });
+  test(`${backend}: credential-free npm Git refs and URL suffixes are preserved without registry calls`, () => {
+    for (const spec of ['git+https://example.invalid/pkg.git#v1.0.0',
+      'pkg@git+https://example.invalid/pkg.git#main',
+      '@scope/pkg@git+https://example.invalid/pkg.git#semver:^1.2.0',
+      'git+ssh://git@example.invalid/pkg.git#v1.0.0',
+      'https://example.invalid/pkg.tgz?download=1']) {
+      const f = fixture();
+      const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
+      recipe.mcpServers.npm.source.npm = spec;
+      writeFileSync(f.recipe, JSON.stringify(recipe));
+      const result = f.run(backend, {}, false);
+      if (result.status !== 0) throw new Error(result.stdout + result.stderr);
+      expect(f.lock().components.find(c => c.kind === 'npm')).toMatchObject({ key: `npm:${spec}`, spec });
+      expect(existsSync(f.npmLog)).toBe(false);
     }
-  }
+  });
 
   test(`${backend}: v2 writer/reader, output digests/modes, npm inventory, credential names, stable identity`, () => {
     const f = fixture();
@@ -188,7 +169,7 @@ for (const backend of ['docker', 'host'] as const) {
     expect(first.status).toBe(0);
     const lock = f.lock();
     expect(lock.version).toBe(2);
-    expect(lock.cook.version).toBe('0.0.1');
+    expect(lock.cook.packageVersion).toBe('0.0.1');
     expect(lock.recipe).toEqual({ path: f.recipe, sha256: sha256(readFileSync(f.recipe)) });
     expect(lock.connectomeHost.commit).toBe(SHA);
     expect(lock.components.find(c => c.kind === 'git')?.commit).toBe(SHA);
@@ -196,10 +177,10 @@ for (const backend of ['docker', 'host'] as const) {
       kind: 'npm', key: 'npm:@scope/pkg@1.2.3', role: 'mcp', name: '@scope/pkg', spec: '@scope/pkg@1.2.3', version: '1.2.3',
     });
     for (const name of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ODD_ANSWER', 'CRED_TOKEN', 'SIDECAR_SECRET']) {
-      expect(lock.credentials).toContain(name);
+      expect(lock.referencedVariables).toContain(name);
     }
     expect(lock.build.dir).toBe(f.out);
-    expect(lock.build.id).toMatch(/^[a-f0-9]{64}$/);
+    expect(lock.build.inputId).toMatch(/^[a-f0-9]{64}$/);
     expect(lock.state).toBeUndefined();
     const raw = readFileSync(join(f.out, 'connectome.lock'), 'utf8');
     expect(raw).not.toContain(f.canary);
@@ -216,9 +197,9 @@ for (const backend of ['docker', 'host'] as const) {
     }
     // A value rotation and timestamp are not immutable build inputs.
     expect(f.run(backend, { ODD_ANSWER: 'rotated-private-answer' }).status).toBe(0);
-    expect(f.lock().build.id).toBe(lock.build.id);
+    expect(f.lock().build.inputId).toBe(lock.build.inputId);
     expect(f.run(backend, { TEST_SHA: 'b'.repeat(40) }).status).toBe(0);
-    expect(f.lock().build.id).not.toBe(lock.build.id);
+    expect(f.lock().build.inputId).not.toBe(lock.build.inputId);
   });
 
   test(`${backend}: legacy v1 accepted, next materialization rewrites v2; unknown refused by reader`, () => {
@@ -284,7 +265,7 @@ for (const backend of ['docker', 'host'] as const) {
       });
       expect(existsSync(f.npmLog)).toBe(false);
     }
-  });
+  }, 30_000);
 }
 
 test('docker default build and run fallback retain main exit codes without invented provenance', () => {
@@ -453,6 +434,13 @@ for (const backend of ['docker', 'host'] as const) {
     recipe.services[0].templateFiles.push({ path, template: 'secret=${ODD_ANSWER}', mode: '600' });
     writeFileSync(f.recipe, JSON.stringify(recipe));
     const result = f.run(backend);
+    if (backend === 'host') {
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain('template target overlaps generated configuration');
+      expect(existsSync(join(f.out, 'connectome.lock'))).toBe(false);
+      expect(readFileSync(f.gitLog, 'utf8')).not.toContain('clone');
+      return;
+    }
     if (result.status !== 0) throw new Error(result.stderr);
     expect(result.status).toBe(0);
     const raw = readFileSync(join(f.out, 'connectome.lock'), 'utf8');
@@ -474,19 +462,38 @@ for (const backend of ['docker', 'host'] as const) {
     writeFileSync(join(f.dir, 'nested/child.json'), child);
     writeFileSync(f.recipe, JSON.stringify(recipe));
     expect(f.run(backend).status).toBe(0);
-    const first = f.lock().build.id;
+    const first = f.lock().build.inputId;
     const moved = join(f.dir, 'moved'); mkdirSync(join(moved, 'nested'), { recursive: true });
     writeFileSync(join(moved, 'recipe.json'), JSON.stringify(recipe));
     writeFileSync(join(moved, 'nested/child.json'), child);
     const out = join(moved, 'bundle');
     const args = [backend === 'docker' ? 'build' : 'install', join(moved, 'recipe.json'), '--out', out, '--no-prompts', '--yes', '--pin-refs'];
     expect(f.cli(args).status).toBe(0);
-    expect((readLockfile(out) as LockfileV2).build.id).toBe(first);
+    expect((readLockfile(out) as LockfileV2).build.inputId).toBe(first);
     writeFileSync(join(moved, 'nested/child.json'), child + '\n');
     expect(f.cli(args).status).toBe(0);
-    expect((readLockfile(out) as LockfileV2).build.id).not.toBe(first);
+    expect((readLockfile(out) as LockfileV2).build.inputId).not.toBe(first);
   });
 }
+
+test('host: immediate and runtime container templates cannot target generated parent or child recipes', () => {
+  for (const runtimeRender of [false, true]) {
+    for (const target of ['/recipes/recipe.json', '/recipes/sub/../recipe.json', '/recipes/child.json']) {
+      const f = fixture();
+      const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
+      recipe.modules = { fleet: { children: [{ name: 'child', recipe: './child.json' }] } };
+      writeFileSync(join(f.dir, 'child.json'), JSON.stringify({ name: 'child', agent: { systemPrompt: 'child' } }));
+      recipe.containerTemplateFiles = [{ hostPath: 'template', inContainer: target, template: 'not json', runtimeRender }];
+      writeFileSync(f.recipe, JSON.stringify(recipe));
+      const result = f.run('host', {}, false);
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain('template target overlaps generated configuration');
+      expect(existsSync(join(f.out, 'connectome.lock'))).toBe(false);
+      expect(existsSync(join(f.out, 'run.sh'))).toBe(false);
+      if (existsSync(f.gitLog)) expect(readFileSync(f.gitLog, 'utf8')).not.toContain('clone');
+    }
+  }
+});
 
 test('output inventory canonicalizes relative, absolute and dot-segment aliases; sensitive wins in either order', () => {
   const f = fixture(); mkdirSync(f.out);
@@ -534,7 +541,7 @@ test('identity changes for every git/npm pin, recipe, cook version, backend and 
   const minimal = await resolvePlan(minimalFile, { noPrompts: true, strict: false });
   if (!minimal.ok) throw new Error('minimal plan failed');
   const record = (host = lock.connectomeHost, components = lock.components, options = {}) =>
-    deploymentRecord(minimal.plan, 'docker', f.out, host, components, options).build.id;
+    deploymentRecord(minimal.plan, 'docker', f.out, host, components, options).build.inputId;
   const id = record();
   expect(record({ ...lock.connectomeHost, commit: 'b'.repeat(40) })).not.toBe(id);
   for (const component of lock.components) {
@@ -553,9 +560,9 @@ test('identity changes for every git/npm pin, recipe, cook version, backend and 
   expect(record()).not.toBe(withChild);
   minimal.plan.parentWalk.sourceSha256 = 'd'.repeat(64);
   expect(record()).not.toBe(id);
-  expect(buildId({ cook: '1', backend: 'host' })).not.toBe(buildId({ cook: '2', backend: 'host' }));
-  expect(buildId({ cook: '1', backend: 'host' })).not.toBe(buildId({ cook: '1', backend: 'docker' }));
-  expect(buildId({ a: 1, b: { z: 2, x: 3 } })).toBe(buildId({ b: { x: 3, z: 2 }, a: 1 }));
+  expect(inputId({ cook: '1', backend: 'host' })).not.toBe(inputId({ cook: '2', backend: 'host' }));
+  expect(inputId({ cook: '1', backend: 'host' })).not.toBe(inputId({ cook: '1', backend: 'docker' }));
+  expect(inputId({ a: 1, b: { z: 2, x: 3 } })).toBe(inputId({ b: { x: 3, z: 2 }, a: 1 }));
 });
 
 test('writer strips runtime value properties too; full-SHA enforcement and explicit output inventory', () => {
@@ -616,39 +623,113 @@ test('host unreadable/unknown lock refuses reconcile with exit 2 and preserves t
   for (const raw of ['not JSON', '{"version":999}']) {
     const f = fixture(); mkdirSync(f.out);
     writeFileSync(join(f.out, 'connectome.lock'), raw);
-    expect(f.run('host', {}, false).status).toBe(2);
+    const result = f.run('host', {}, false);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('Restore a known-good lock');
+    expect(result.stderr).toContain('fresh --out');
     expect(readFileSync(join(f.out, 'connectome.lock'), 'utf8')).toBe(raw);
     expect(existsSync(join(f.out, 'app'))).toBe(false);
   }
 });
 
-test('output hasher covers embedded JSON, YAML, Docker env and shell escapes, without recording matches', () => {
-  for (const answer of ["left'right", 'private-"\\\n\t-\'-$']) {
-    for (const backend of ['host', 'docker'] as const) {
-      const f = fixture();
-      const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
-      recipe.services[0].environment = { LITERAL: answer };
-      writeFileSync(f.recipe, JSON.stringify(recipe));
-      expect(f.run(backend, { ODD_ANSWER: answer }).status).toBe(0);
-      const forms = [answer, JSON.stringify(answer).slice(1, -1),
-        readFileSync(join(f.out, '.env'), 'utf8'),
-        readFileSync(join(f.out, backend === 'host' ? 'docker-compose.sidecars.yml' : 'docker-compose.yml'), 'utf8')];
-      for (const form of forms) {
-        expect(createOutputHasher([{ value: 'other' }, { value: answer }])(`prefix:${form}:suffix`))
-          .toEqual({ sha256Omitted: 'contains-requirement-value' });
-      }
-    }
-  }
-  expect(createOutputHasher([{ value: '\ud800' }])('\ufffd'))
-    .toEqual({ sha256Omitted: 'contains-requirement-value' });
-  for (const value of ['a', 'ab', 'abc', '\n', '\\', '"']) {
-    expect(createOutputHasher([{ value }])(`prefix:${value}:suffix`))
-      .toEqual({ sha256Omitted: 'contains-requirement-value' });
-  }
+test('host inventory is not reconcile machinery; edited public outputs are overwritten', () => {
+  const f = fixture();
+  expect(f.run('host').status).toBe(0);
+  const lock = f.lock();
+  lock.recipe.sha256 = 'edited';
+  lock.build.inputId = 'edited';
+  lock.cook.packageVersion = 'edited';
+  lock.referencedVariables = ['NOT_A_REQUIRED_SECRET'];
+  lock.outputs = [];
+  lock.components = lock.components.filter(c => c.kind !== 'npm');
+  writeLockfile(f.out, lock);
+  writeFileSync(join(f.out, 'run.sh'), 'hand edit');
+  const before = readFileSync(f.gitLog, 'utf8');
+  const result = f.run('host');
+  expect(result.status).toBe(0);
+  expect(readFileSync(f.gitLog, 'utf8').slice(before.length)).not.toContain('clone');
+  expect(readFileSync(join(f.out, 'run.sh'), 'utf8')).toContain('#!/usr/bin/env bash');
+  expect(f.lock().build.inputId).not.toBe('edited');
 });
 
-test('empty and unresolved requirements never match, and nonmatching outputs retain exact hashes', () => {
-  const hash = createOutputHasher([{ value: '' }, {}, { value: 'private-answer' }]);
-  expect(hash('')).toBe(sha256(''));
-  expect(hash('ordinary output')).toBe(sha256('ordinary output'));
+test('referenced variables include defaults, ordinary names and both alternatives without requiring all of them', () => {
+  const f = fixture();
+  const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
+  recipe.agent.systemPrompt = '${LOG_LEVEL} ${WITH_DEFAULT:-info} ${PUBLIC_URL} ${API_KEY}';
+  writeFileSync(f.recipe, JSON.stringify(recipe));
+  expect(f.run('docker').status).toBe(0);
+  for (const name of ['LOG_LEVEL', 'WITH_DEFAULT', 'PUBLIC_URL', 'API_KEY', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN']) {
+    expect(f.lock().referencedVariables).toContain(name);
+  }
+  expect(f.lock()).not.toHaveProperty('credentials');
+  expect(f.lock().cook).toEqual({ packageVersion: '0.0.1' });
+  expect(f.lock().build).not.toHaveProperty('id');
+});
+
+test('host initial acquisition and reuse HEAD reads ignore enclosing Git repository variables', () => {
+  const f = fixture();
+  const env = { GIT_DIR: '/not-this-checkout', GIT_WORK_TREE: '/not-this-worktree', GIT_INDEX_FILE: '/not-this-index' };
+  expect(f.run('host', env, false).status).toBe(0);
+  expect(f.run('host', env, false).status).toBe(0);
+  expect(f.lock().connectomeHost.commit).toBe(SHA);
+});
+
+test('host retains sibling-copy inventory without inventing a commit or hashing tree contents', () => {
+  const f = fixture();
+  const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
+  delete recipe.mcpServers.git;
+  recipe.mcpServers.sibling = { command: 'node', args: ['/sibling/index.js'] };
+  mkdirSync(join(f.dir, 'sibling'));
+  writeFileSync(join(f.dir, 'sibling/index.js'), 'first');
+  writeFileSync(f.recipe, JSON.stringify(recipe));
+  expect(f.run('host', {}, false).status).toBe(0);
+  const first = f.lock();
+  const copy = first.components.find(c => c.kind === 'copy');
+  expect(copy).toEqual({ kind: 'copy', key: 'sibling:sibling', role: 'mcp', url: '', ref: '', path: join(f.out, 'sibling'), install: 'sibling-copy' });
+  writeFileSync(join(f.dir, 'sibling/index.js'), 'second');
+  expect(f.run('host', {}, false).status).toBe(0);
+  expect(f.lock().build.inputId).toBe(first.build.inputId);
+  expect(readFileSync(join(f.out, 'sibling/index.js'), 'utf8')).toBe('second');
+});
+
+test('atomic writer preserves the previous lock on publication failure and strips legacy incomplete answers', () => {
+  const f = fixture();
+  expect(f.run('docker').status).toBe(0);
+  const before = readFileSync(join(f.out, 'connectome.lock'), 'utf8');
+  const preload = join(f.dir, 'fail-rename.ts');
+  writeFileSync(preload, `
+    import { mock } from 'bun:test';
+    import * as fs from 'node:fs';
+    mock.module('node:fs', () => ({ ...fs, renameSync: () => { throw new Error('injected publication failure'); } }));
+    const { writeLockfile } = await import(${JSON.stringify(join(import.meta.dir, 'lockfile.ts'))});
+    const dir = ${JSON.stringify(f.out)};
+    const lock = JSON.parse(fs.readFileSync(dir + '/connectome.lock', 'utf8'));
+    try { writeLockfile(dir, { ...lock, incomplete: true }); } catch { process.exit(17); }
+  `);
+  const result = spawnSync(process.execPath, [preload], { encoding: 'utf8' });
+  expect(result.status).toBe(17);
+  expect(readFileSync(join(f.out, 'connectome.lock'), 'utf8')).toBe(before);
+  expect(readdirSync(f.out).filter(path => path.endsWith('.tmp'))).toEqual([]);
+  const { version: _version, ...current } = f.lock();
+  writeLockfile(f.out, { ...current, version: 1, incomplete: true,
+    components: [], requirements: [{ name: 'legacy', envName: 'LEGACY', origin: 'prompt', value: f.canary }] });
+  expect(readFileSync(join(f.out, 'connectome.lock'), 'utf8')).not.toContain(f.canary);
+  expect(readLockfile(f.out)?.incomplete).toBe(true);
+});
+
+test('partial input ID deliberately excludes local extension bytes and package.json presence', () => {
+  const f = fixture();
+  const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
+  recipe.extensions = { local: { kind: 'strategy', path: './local/index.ts' } };
+  mkdirSync(join(f.dir, 'local'));
+  writeFileSync(join(f.dir, 'local/index.ts'), 'first');
+  writeFileSync(f.recipe, JSON.stringify(recipe));
+  expect(f.run('docker', {}, false).status).toBe(0);
+  const id = f.lock().build.inputId;
+  const dockerfile = readFileSync(join(f.out, 'Dockerfile'), 'utf8');
+  writeFileSync(join(f.dir, 'local/index.ts'), 'second');
+  writeFileSync(join(f.dir, 'local/package.json'), '{}');
+  expect(f.run('docker', {}, false).status).toBe(0);
+  expect(f.lock().build.inputId).toBe(id);
+  expect(readFileSync(join(f.out, 'Dockerfile'), 'utf8')).not.toBe(dockerfile);
 });

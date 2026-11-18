@@ -1,7 +1,11 @@
 import type { McpSource } from './types.js';
 
 /** Reject inline credentials before a source URL can reach logs, git, or artifacts. */
-export function assertCredentialFreeSourceUrl(url: string, location = 'Source URL'): void {
+export function assertCredentialFreeSourceUrl(
+  url: string,
+  location = 'Source URL',
+  options: { allowSuffix?: boolean } = {},
+): void {
   const credentialError = () => new Error(`${location}: embedded credentials are not allowed.`);
   // URL() silently trims whitespace and removes some controls. Reject the raw
   // spelling first, before parsing, logging, or passing it to another tool.
@@ -37,8 +41,9 @@ export function assertCredentialFreeSourceUrl(url: string, location = 'Source UR
     if (userinfo.includes(':')) throw credentialError();
     checkUsername(userinfo);
   }
-  // Source path derivation does not support URL suffixes.
-  if (url.includes('?') || url.includes('#')) {
+  // Git-source path derivation does not support URL suffixes. npm specs do:
+  // callers may preserve their query/ref while retaining all credential checks.
+  if (!options.allowSuffix && (url.includes('?') || url.includes('#'))) {
     throw new Error(`${location}: query strings and fragments are not supported in source URLs.`);
   }
   // URL-shaped spellings must parse or fail, never fall through as paths.
