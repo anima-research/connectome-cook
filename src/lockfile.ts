@@ -11,9 +11,10 @@
  * requirement names and origins), not answers or credentials.
  */
 
-import { closeSync, fchmodSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, fchmodSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { log } from './log.js';
 
 export const LOCKFILE_NAME = 'connectome.lock';
 
@@ -92,19 +93,23 @@ export function writeLockfile(dir: string, lock: Lockfile): void {
       closeSync(fd);
     }
     renameSync(temporary, path);
-    // Persist the directory entry too, where directory syncing is supported.
-    try {
-      const directoryFd = openSync(dir, 'r');
-      try {
-        fsyncSync(directoryFd);
-      } finally {
-        closeSync(directoryFd);
-      }
-    } catch (err) {
-      if (!['EINVAL', 'EISDIR', 'EPERM'].includes((err as NodeJS.ErrnoException).code ?? '')) throw err;
-    }
-  } finally {
+  } catch (err) {
     rmSync(temporary, { force: true });
+    throw err;
+  }
+
+  // The lock is published. A durability error must not trigger install rollback.
+  try {
+    const directoryFd = openSync(dir, 'r');
+    try {
+      fsyncSync(directoryFd);
+    } finally {
+      closeSync(directoryFd);
+    }
+  } catch (err) {
+    if (!['EINVAL', 'EISDIR', 'EPERM'].includes((err as NodeJS.ErrnoException).code ?? '')) {
+      log.warn(`${path}: lock published, but crash durability is uncertain: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 }
 
@@ -114,7 +119,8 @@ export function readLockfile(dir: string): Lockfile | null {
   try {
     content = readFileSync(path, 'utf-8');
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    // A dangling symlink is an unreadable lock, not a missing lock.
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT' && !lstatSync(path, { throwIfNoEntry: false })) return null;
     throw err;
   }
   const raw = JSON.parse(content) as Lockfile;

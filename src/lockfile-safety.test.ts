@@ -85,27 +85,32 @@ for (const [label, content] of [
   ['unknown version', '{"version":99}'],
   ['truncated', '{"version":1,"backend":"host",'],
   ['unreadable directory', null],
+  ['dangling symlink', undefined],
 ] as const) {
-  test(`install and run refuse ${label} locks without removing the agent workspace`, () => {
+  test(`install refuses ${label} locks without removing the agent workspace`, () => {
     fs.mkdirSync(join(out, 'app', 'workspace'), { recursive: true });
     const sentinel = join(out, 'app', 'workspace', 'agent-state');
     fs.writeFileSync(sentinel, 'must survive');
     const lockPath = join(out, LOCKFILE_NAME);
     if (content === null) fs.mkdirSync(lockPath);
+    else if (content === undefined) fs.symlinkSync(join(out, 'missing-lock'), lockPath);
     else fs.writeFileSync(lockPath, content);
     const result = run('install');
     expect(fs.readFileSync(sentinel, 'utf8')).toBe('must survive');
     expect(fs.existsSync(join(dir, 'commands'))).toBe(false);
     expect(result.status).toBe(2);
     const message = result.stdout + result.stderr;
-    for (const hint of [lockPath, 'Inspect', 'move it aside', 'fresh install', 'cook that wrote it']) {
+    for (const hint of [lockPath, 'Inspect', 'restore a valid copy', 'move it aside', 'fresh install', 'compatible cook if the version is unsupported']) {
       expect(message).toContain(hint);
     }
-    const launch = run('run', out);
-    expect(launch.status).not.toBe(0);
-    expect(launch.stdout + launch.stderr).toContain('unreadable');
+    if (content !== undefined) {
+      const launch = run('run', out);
+      expect(launch.status).not.toBe(0);
+      expect(launch.stdout + launch.stderr).toContain('unreadable');
+    }
     expect(fs.readFileSync(sentinel, 'utf8')).toBe('must survive');
-    if (content !== null) expect(fs.readFileSync(lockPath, 'utf8')).toBe(content);
+    if (content === undefined) expect(fs.lstatSync(lockPath).isSymbolicLink()).toBe(true);
+    else if (content !== null) expect(fs.readFileSync(lockPath, 'utf8')).toBe(content);
   });
 }
 
@@ -222,7 +227,7 @@ test('atomic lock syncs the complete temporary file before rename and the direct
 
 for (const operation of ['open', 'sync'] as const) {
   for (const code of ['EINVAL', 'EISDIR', 'EPERM', 'EIO']) {
-    test(`directory ${operation} ${code}: only unsupported-platform errors are ignored`, () => {
+    test(`directory ${operation} ${code}: unsupported-platform errors are silent; EIO warns`, () => {
       const originalOpen = fs.openSync;
       const originalSync = fs.fsyncSync;
       let directoryFd: number | undefined;
@@ -237,12 +242,15 @@ for (const operation of ['open', 'sync'] as const) {
         if (fd === directoryFd) throw error;
         originalSync(fd);
       });
+      const warn = spyOn(process.stderr, 'write').mockReturnValue(true);
       try {
-        if (code === 'EIO') expect(() => writeLockfile(dir, oldLock())).toThrow('directory failure');
-        else writeLockfile(dir, oldLock());
+        writeLockfile(dir, oldLock());
+        if (code === 'EIO') expect(warn).toHaveBeenCalledWith(expect.stringContaining('crash durability is uncertain: directory failure'));
+        else expect(warn).not.toHaveBeenCalled();
       } finally {
         open.mockRestore();
         sync.mockRestore();
+        warn.mockRestore();
       }
       if (directoryFd !== undefined) expect(() => fs.fstatSync(directoryFd!)).toThrow();
       expect(readLockfile(dir)?.version).toBe(1);

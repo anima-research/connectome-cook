@@ -620,7 +620,7 @@ async function materializeHost(
     existingLock = readLockfile(installDir);
   } catch (err) {
     log.error(`refusing install: cannot read ${join(installDir, LOCKFILE_NAME)} (${err instanceof Error ? err.message : String(err)}). `
-      + 'Inspect the lock, then either move it aside to force a fresh install (which may remove existing targets), or use the cook that wrote it.');
+      + 'Inspect the lock: restore a valid copy, or use a compatible cook if the version is unsupported. To force a fresh install, move it aside (this may remove existing targets).');
     return { exitCode: 2, outDir: installDir };
   }
 

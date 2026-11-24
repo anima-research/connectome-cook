@@ -35,8 +35,8 @@ function host(range: unknown = '^1.0.0', section = 'dependencies') {
   git(['add', 'package.json']); git(['commit', '--allow-empty', '-m', 'Synthetic host']);
 }
 function option(name = 'fixture-local-input', path = archive, hash = digest) { return `${name}=${path}#sha256=${hash}`; }
-function install(extra: string[] = ['--host-dependency', option()], env: NodeJS.ProcessEnv = {}) {
-  const result = spawnSync(realBun, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, ...(extra.includes('--ch-ref') ? [] : ['--ch-ref', 'main']), '--no-prompts', '--yes', ...extra], {
+function install(extra: string[] = ['--host-dependency', option()], env: NodeJS.ProcessEnv = {}, bunArgs: string[] = []) {
+  const result = spawnSync(realBun, [...bunArgs, resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, ...(extra.includes('--ch-ref') ? [] : ['--ch-ref', 'main']), '--no-prompts', '--yes', ...extra], {
     encoding: 'utf8', env: { ...process.env, TMPDIR: join(dir, 'staging'), PATH: shim + ':' + process.env.PATH, ...env },
   });
   if (result.status === 0 && existsSync(join(out, 'connectome.lock'))) {
@@ -222,6 +222,37 @@ test('post-install output failure removes the mutated checkout and only this att
   expect(existsSync(join(out, 'app'))).toBe(false);
   expect(existsSync(old)).toBe(true); expect(existsSync(failed)).toBe(false);
   expect(readdirSync(join(dir, 'staging'))).toEqual([]);
+});
+test('R1-1: an EIO syncing the lock directory after rename keeps the completed install', () => {
+  const preload = join(dir, 'fail-directory-sync.ts');
+  writeFileSync(preload, `
+import { spyOn } from 'bun:test';
+import * as fs from 'node:fs';
+const original = fs.fsyncSync;
+const installDir = ${JSON.stringify(out)};
+spyOn(fs, 'fsyncSync').mockImplementation(fd => {
+  if (fs.existsSync(installDir + '/connectome.lock')
+      && fs.fstatSync(fd).isDirectory() && fs.readlinkSync('/proc/self/fd/' + fd) === installDir) {
+    throw Object.assign(new Error('fixture directory fsync EIO'), { code: 'EIO' });
+  }
+  original(fd);
+});
+`);
+  const result = install(undefined, {}, ['--preload', preload]);
+  expect(result.error).toBeUndefined();
+  expect(existsSync(join(out, 'connectome.lock')), result.stderr).toBe(true);
+  const lock = JSON.parse(readFileSync(join(out, 'connectome.lock'), 'utf8'));
+  expect(lock.incomplete).toBeUndefined();
+  const snapshot = lock.hostDependencies[0].snapshot;
+  expect(snapshot).toBe(join(out, 'host-inputs', digest + '.tgz'));
+  expect({
+    status: result.status,
+    app: existsSync(join(out, 'app', 'node_modules', 'fixture-local-input')),
+    snapshot: existsSync(snapshot),
+  }).toEqual({ status: 0, app: true, snapshot: true });
+  expect(result.stderr).toContain('durability');
+  expect(result.stderr).toContain('fixture directory fsync EIO');
+  expect(result.stderr).not.toContain('write failed');
 });
 test('declined confirm gate removes staging and creates no output', () => {
   const result = spawnSync(realBun, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, '--no-prompts', '--host-dependency', option()], { encoding: 'utf8', env: { ...process.env, TMPDIR: join(dir, 'staging') } });
