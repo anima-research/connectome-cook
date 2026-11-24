@@ -14,7 +14,7 @@ export type { Recipe } from './vendor/recipe.js';
 
 /** Result of walking a recipe tree: parent + every reachable fleet child. */
 export interface WalkResult {
-  /** SHA-256 of the exact loaded UTF-8 JSON, before validation/substitution. */
+  /** For the root recipe, SHA-256 of the exact loaded UTF-8 JSON, before validation/substitution. */
   sourceSha256?: string;
   /** Absolute path (or URL) the recipe was loaded from. */
   path: string;

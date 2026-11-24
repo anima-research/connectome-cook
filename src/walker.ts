@@ -68,7 +68,9 @@ export async function walkRecipe(rootPath: string): Promise<WalkResult[]> {
     visited.add(loc);
 
     let sourceSha256: string | undefined;
-    const recipe = await loadRecipeRaw(loc, text => { sourceSha256 = createHash('sha256').update(text).digest('hex'); });
+    const recipe = await loadRecipeRaw(loc, results.length === 0 ? text => {
+      sourceSha256 = createHash('sha256').update(text).digest('hex');
+    } : undefined);
     results.push({ path: loc, recipe, sourceSha256 });
 
     const base = sourceBaseFor(loc);

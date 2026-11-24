@@ -62,8 +62,8 @@ ${log.bold('Flags:')}
   --image-name <name>    Override the generated image name
   --no-prompts           Non-interactive; warn-and-continue on missing values
   --env-file <path>      Read variable values from this file before prompting
-  --pin-refs             Optional: resolve full commit SHAs
-                         Docker records commits only when pinned.
+  --pin-refs             Resolve branch/tag refs to commit SHAs; fail if unresolved
+                         Optional; Docker records commits only when pinned.
   --allow-incomplete-templates
                          Write templated config files even when \${VAR}
                          references render as empty.  Default: refuse the
@@ -171,7 +171,7 @@ ${log.bold('Flags:')}
   --strict               Fail if any MCP server / extension can't be materialized
   --no-prompts           Non-interactive (requires --yes to actually install)
   --yes                  Skip the confirm gate
-  --pin-refs             Resolve branch refs to commit SHAs before cloning
+  --pin-refs             Resolve branch/tag refs to commit SHAs; fail if unresolved
   --allow-incomplete-templates
                          Write templated config files even when \${VAR}
                          references render as empty (default: refuse)

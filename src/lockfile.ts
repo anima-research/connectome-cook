@@ -1,7 +1,7 @@
 /** Versioned deployment record. Never serialize resolved operator values here. */
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, statSync, readFileSync, writeFileSync, renameSync, unlinkSync, openSync, closeSync } from 'node:fs';
-import { dirname, join, posix, relative, resolve, sep } from 'node:path';
+import { existsSync, statSync, lstatSync, fchmodSync, readFileSync, writeFileSync, renameSync, unlinkSync, openSync, closeSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
 import type { InstallPlan } from './plan.js';
 import type { McpSource } from './types.js';
 import { deriveRequiredVars } from './prompts.js';
@@ -30,7 +30,7 @@ export interface LockedNpmComponent {
   kind: 'npm';
   key: string;
   role: 'mcp' | 'extension';
-  name: string;
+  name?: string;
   spec: string;
   version?: string;
   integrity?: string;
@@ -74,7 +74,7 @@ export interface LockfileV2 extends LockCommon {
   connectomeHost: { url: string; ref: string; commit?: string; path?: string };
   components: LockedComponent[];
   requirements: LockedRequirement[];
-  build: { inputId: string; dir: string };
+  build: { dir: string };
   referencedVariables: string[];
   /** Only if cook defines a state location outside build.dir. */
   state?: { path: string };
@@ -86,7 +86,7 @@ export function sha256(data: string | Uint8Array): string {
   return createHash('sha256').update(data).digest('hex');
 }
 /** Canonical JSON: lexically sorted object keys; array order is significant. */
-export function canonicalJson(value: unknown): string {
+function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']';
   if (value !== null && typeof value === 'object') {
     return '{' + Object.entries(value).filter(([, v]) => v !== undefined)
@@ -94,9 +94,6 @@ export function canonicalJson(value: unknown): string {
       .map(([k, v]) => JSON.stringify(k) + ':' + canonicalJson(v)).join(',') + '}';
   }
   return JSON.stringify(value);
-}
-export function inputId(inputs: unknown): string {
-  return sha256(canonicalJson(inputs));
 }
 export function fullCommit(commit: string | undefined, location: string): string {
   if (!commit || !looksLikeSha(commit)) {
@@ -111,35 +108,30 @@ export function resolveNpmComponents(sources: McpSource[]): LockedNpmComponent[]
   return sources.filter(s => s.install.kind === 'npm-global').map(source => {
     if (source.install.kind !== 'npm-global') throw new Error('unreachable');
     const spec = source.install.package;
-    // Validate URL specs before key/spec can enter logs or the lock. Scoped
-    // registry names are not URLs; their leading @ is a package delimiter.
-    const urlSpec = spec.replace(/^(?:@[^/@:]+\/)?[^/@:]+@(?=(?:git\+)?[a-z][a-z0-9+.-]*:\/\/)/i, '');
-    if (/^(?:git\+)?[a-z][a-z0-9+.-]*:\/\//i.test(urlSpec) || urlSpec.includes('://')) {
-      assertCredentialFreeSourceUrl(urlSpec, `${sourceLocation(source)}.npm`, { allowSuffix: true });
+    // Strip an optional registry-name alias, not URL/shorthand userinfo.
+    const [, name, target] = /^((?:@[\w.~%-]+\/)?[\w.~%-]+)(?:@([\s\S]*))?$/.exec(spec) ?? [];
+    const sourceSpec = target ?? spec;
+    const hosted = !(name && target === undefined) && (/^[^/\\?#]+\/[^/\\?#]+/.test(sourceSpec)
+      || /^(?:github|gitlab|bitbucket|gist):/i.test(sourceSpec));
+    const url = /^[a-z][a-z0-9+.-]*:[/\\]/i.test(sourceSpec) || sourceSpec.includes('://');
+    const location = `${sourceLocation(source)}.npm`;
+    if (url || hosted) {
+      if (!url && /^[^/?#]*@/.test(sourceSpec)) {
+        throw new Error(`${location}: embedded credentials are not allowed.`);
+      }
+      assertCredentialFreeSourceUrl(sourceSpec, location, { allowSuffix: true });
     }
-    // The first @ in a scoped name is not the version delimiter. Preserve
-    // tags/ranges (and any other spec main accepted) verbatim, never resolve.
-    const at = spec.indexOf('@', spec.startsWith('@') ? 1 : 0);
-    const name = at < 0 ? spec : spec.slice(0, at);
-    const declaredVersion = at < 0 ? '' : spec.slice(at + 1);
+    // Names and exact versions describe registry specs only, not e.g. Git,
+    // tarballs, local paths, hosted shorthands or npm aliases.
+    const registry = name !== undefined && !url && !hosted
+      && (!target || !/[:/\\@?#]/.test(target)) && !name.startsWith('.') && !/\.(?:tgz|tar\.gz|tar)$/i.test(sourceSpec);
+    const declaredVersion = registry ? target ?? '' : '';
     const version = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(declaredVersion);
     const exact = version && !version[1]?.split('.').some(part => /^0\d+$/.test(part));
-    return { kind: 'npm', key: source.key, role: source.role ?? 'mcp', name, spec,
+    return { kind: 'npm', key: source.key, role: source.role ?? 'mcp', spec,
+      ...(registry ? { name } : {}),
       ...(exact ? { version: declaredVersion } : {}) };
   });
-}
-
-/** Logical tree paths, never the machine's absolute recipe directory. URL
- * recipes use URL pathnames relative to the root URL's directory as well. */
-function recipeIdentityPath(path: string, root: string): string {
-  const url = /^https?:\/\//.test(path) ? new URL(path) : undefined;
-  const rootUrl = /^https?:\/\//.test(root) ? new URL(root) : undefined;
-  if (url) {
-    return (rootUrl ? posix.relative(posix.dirname(rootUrl.pathname), url.pathname)
-      : url.pathname.replace(/^\//, '')) + url.search;
-  }
-  if (rootUrl) return path.replace(/^[/\\]+/, '').split(sep).join('/');
-  return relative(dirname(root), path).split(sep).join('/');
 }
 
 /** Names are a conservative superset: runtime vars have no secret marker.
@@ -158,23 +150,14 @@ export function referencedVariables(plan: InstallPlan): string[] {
 
 export function deploymentRecord(
   plan: InstallPlan,
-  backend: LockfileV2['backend'],
   dir: string,
-  connectomeHost: LockfileV2['connectomeHost'],
-  components: LockedComponent[],
-  options: Record<string, unknown>,
 ): Pick<LockfileV2, 'cook' | 'recipe' | 'build' | 'referencedVariables' | 'requirements'> {
-  const cook = { packageVersion: pkg.version };
-  // Programmatic plans without loader provenance hash canonical recipe JSON.
-  const recipes = plan.walks.map(w => ({ path: recipeIdentityPath(w.path, plan.parentWalk.path), sha256: w.sourceSha256 ?? sha256(canonicalJson(w.recipe)) }));
-  const recipe = { path: plan.recipePath, sha256: recipes[0]!.sha256 };
-  const { path: _path, ...hostPin } = connectomeHost;
-  const pins = components.map(c => c.kind === 'npm' ? c : {
-    kind: c.kind, key: c.key, role: c.role, url: c.url, ref: c.ref, commit: c.commit, install: c.install,
-  }).sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+  const { sourceSha256, recipe } = plan.parentWalk;
   return {
-    cook, recipe,
-    build: { dir: resolve(dir), inputId: inputId({ recipe: recipe.sha256, recipes, pins: { connectomeHost: hostPin, components: pins }, cook, backend, options }) },
+    cook: { packageVersion: pkg.version },
+    // Programmatic plans without loader provenance hash canonical recipe JSON.
+    recipe: { path: plan.recipePath, sha256: sourceSha256 ?? sha256(canonicalJson(recipe)) },
+    build: { dir: resolve(dir) },
     referencedVariables: referencedVariables(plan),
     requirements: plan.requirements.map(({ name, envName, origin }) => ({ name, envName, origin })),
   };
@@ -224,12 +207,17 @@ export function writeLockfile(dir: string, lock: Lockfile): void {
   // Defense in depth against callers passing a wider runtime requirement.
   const safe = { ...lock, requirements: lock.requirements.map(({ name, envName, origin }) => ({ name, envName, origin })) };
   // Same-directory rename publishes a whole record, including incomplete markers.
+  const path = join(dir, LOCKFILE_NAME);
   const temp = join(dir, `.${LOCKFILE_NAME}.${randomUUID()}.tmp`);
   const fd = openSync(temp, 'wx', 0o600);
   try {
     writeFileSync(fd, JSON.stringify(safe, null, 2) + '\n');
+    // Keep the temp file private while writing; publish with normal lock permissions.
+    const previous = lstatSync(path, { throwIfNoEntry: false });
+    const mode = previous?.isFile() ? previous.mode & 0o777 : 0o666 & ~process.umask();
+    fchmodSync(fd, mode);
     closeSync(fd);
-    renameSync(temp, join(dir, LOCKFILE_NAME));
+    renameSync(temp, path);
   } catch (err) {
     try { closeSync(fd); } catch { /* Already closed. */ }
     try { unlinkSync(temp); } catch { /* Preserve the original failure. */ }

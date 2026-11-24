@@ -95,10 +95,9 @@ For code that must link against things already on the machine:
 Cook probes the candidates, suggests the first hit, lets you confirm or
 override, and exposes the answer as `$SPRING_HOME` — usable in recipe
 `${VAR}` references and install steps. The lock records requirement names and
-origins, never their resolved answers. **Secrets must not be literals in recipes;
-supply them through requirements**, not literal defaults or template/environment
-strings. `recipe.sha256` and `build.inputId` are computed from the recipe bytes as
-written (including any literal secret), not a redacted recipe.
+origins, never their resolved answers. **Secrets must not be literals in recipes or source specs;
+supply them through requirements or credential inputs**, not literal defaults or template/environment
+strings. `recipe.sha256` hashes the recipe as written, not a redacted copy.
 
 ### Source credentials
 
@@ -110,8 +109,11 @@ is refused. Known token prefixes (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
 `github_pat_`, `glpat-`) are rejected anywhere in the decoded username, case-insensitively,
 as are token usernames (`oauth2`, `x-access-token`, `x-token-auth`).
 Protocol-relative (`//host/path`) spellings require an explicit scheme.
-Query strings and fragments are unsupported and rejected: source path
-derivation does not support these suffixes. This validation is not shell quoting
+Git source URLs reject queries and fragments because source path derivation
+does not support them. npm specs can use ordinary URL suffixes and Git
+`#ref`s, but cook rejects credential-shaped query or fragment parameters
+(such as `token`, `access_token` and `X-Amz-Signature`) and userinfo in
+hosted shorthands. This validation is not shell quoting
 and does not make generated Docker commands safe for arbitrary URLs or refs.
 Surrounding whitespace and ASCII control characters are also rejected. Unknown
 token formats may not be recognized: never put credentials in a source URL.
@@ -146,100 +148,44 @@ Abbreviated commit IDs cannot be pinned: use the full 40-hex ID from
 
 ### `connectome.lock` v2
 
-The fix is removal of **all requirement answers**, secret or not, from the
-lock. Requirements contain only `name`, `envName`, and `origin`. Resolution,
-install environments and `.env` are unchanged. Old v1 records can already
-contain secrets; rewriting cannot undo earlier disclosure.
+Both `cook build` and `cook install` write a v2 lock on success. It records
+what cook materialized and where to launch it. The lock never stores resolved
+requirement answers.
 
-Both backends write v2 on **successful materialisation**, including a build or
-install into a fresh directory. Readers accept v1 and v2 and refuse unknown
-versions. Host reconcile may keep matching checkouts and reads their actual
-HEADs. Incomplete markers from main remain fail-closed and can still be written
-in v1 during a failed upgrade (without requirement answers).
+| Field | What it records |
+|---|---|
+| `cook.packageVersion` | The version from cook's `package.json`, not a source revision. |
+| `recipe` | The root recipe path or URL and SHA-256 of its loaded UTF-8 JSON, before validation or substitution. Programmatic plans without loaded text use canonical recipe JSON. |
+| `connectomeHost`, `components` | Git URL/ref and full commit SHA when known. Host installs record checkout HEADs; unpinned Docker refs may have no commit. Host sibling copies have `kind: "copy"` and no commit. npm entries record the declared `spec`; registry specs also get `name` and an exact `version` if declared. No npm lookup is performed and no `integrity` is recorded. |
+| `build.dir` | Absolute output directory. |
+| `requirements` | Requirement `name`, `envName`, and `origin`; no values. |
+| `referencedVariables` | Sorted, unique names, including defaulted and nonsecret variables, provider alternatives, build/sidecar secrets and credential-file overrides (or `path#field`). Not a list of required credentials. |
+| `outputs` | Generated paths and numeric permission bits. Declared public outputs include the SHA-256 of the bytes cook generated before writing; `.env`, credential/secret files and rendered templates get mode only. Sensitive paths take precedence when declarations overlap. |
+| `backend`, `launch`, `engines`, `hostDependencies`, `incomplete` | Launch hints (including `launch.userUnit` when selected) and host install safeguards. |
 
-**The new v2 fields are informational inventory, not reconcile inputs.** No
-current cook reader compares `cook`, `recipe.sha256`, `build`,
-`referencedVariables`, `outputs`, or npm inventory entries. No deployment-layer
-consumer is supplied or assumed. Changing these fields does not invalidate a
-checkout; editing `run.sh` does not produce a drift refusal and the next install
-can overwrite it. Host clone reuse still uses URL, ref, install command, an
-optional requested commit, target existence, and main's incomplete/engine/host
-dependency safeguards. `cook run` uses the existing backend/launch fields; it
-is not output verification. See [the revised RFC](docs/rfc/cook-lifecycle-and-lock-v2.md).
+The new inventory fields don't control clone reuse or launch, verify disk
+content, or prove a build is reproducible. npm entries describe declarations,
+not globally installed packages. Output digests aren't a recursive inventory
+of checkouts or operator state, and digest eligibility doesn't depend on the
+values of answers. Use a fresh output directory rather than an untrusted
+pre-seeded one. See the [lifecycle RFC](docs/rfc/cook-lifecycle-and-lock-v2.md).
 
-Inventory fields:
+#### Compatibility
 
-- `cook: {packageVersion}` is only `package.json`'s version (currently `0.0.1`),
-  **not** a cook source revision or generator fingerprint. No commit is guessed.
-- `recipe: {path, sha256}` hashes the exact loaded UTF-8 root JSON, before
-  validation/substitution. Programmatic walks without loaded text hash canonical
-  recipe JSON. Git commits, when recorded, are full 40/64-hex SHAs. Host Git
-  checkouts require actual HEADs; unpinned Docker refs can omit commits.
-- `components` includes `kind: "git"` provenance and `kind: "npm"` entries
-  (`key, role, name, spec, version?, integrity?`). npm tags/ranges remain
-  unresolved; exact versions are recorded when declared. No registry lookup
-  is added and **no integrity metadata is currently available**, so integrity
-  is omitted. URL specs with embedded credentials are rejected. Host npm
-  entries describe declarations, not globally installed packages; existing
-  npx behavior is unchanged. Host sibling copies retain main's entries with
-  `kind: "copy"`, target path, empty URL/ref and `install: "sibling-copy"`,
-  without invented commits. Docker's copy behavior is unchanged.
-- `build: {inputId, dir}` gives a **partial input ID**, not a build/content ID,
-  and the absolute output directory. Its exact formula and omissions are below.
-- `referencedVariables: string[]` is a sorted, deduplicated name inventory,
-  **not required credentials**. It includes ordinary/defaulted runtime variables,
-  both provider alternatives, requirement env names, build/sidecar secret names,
-  and credential-file overrides (or `path#field`). It cannot tell a consumer
-  which names are secret, required, optional, or alternatives; do **not** require
-  every entry or treat it as a startup checklist. Values are never included.
-- `outputs` inventories explicit generated paths, numeric permission bits
-  (`mode & 0777`) and SHA-256 for declared public files: launcher, optional
-  user unit, lowered recipes, Compose/Dockerfile and documentation. `.env`,
-  credential/secret files and rendered templates have **mode only**. Eligibility
-  comes from declared sensitivity, never a search for operator answers; rotating
-  a value cannot change the pattern of omissions. Sensitive classification wins
-  when paths overlap. Digests describe captured generated bytes **before the
-  write**, not current disk content. There is no drift checking. Unavailable
-  generated bytes get mode only. The lock, copied/cloned trees and operator
-  state are not recursively hashed. Links and races can still redirect writes;
-  use a fresh output directory, not an untrusted pre-seeded one.
-
-**Input ID formula:**
-`build.inputId = hex(SHA256(UTF8(canonicalJSON(input))))`, where `input` is
-`{recipe: rootSha256, recipes: [{path, sha256}, ...],
-pins: {connectomeHost: {url, ref, commit?}, components},
-cook: {packageVersion}, backend, options}`. Canonical JSON sorts object keys
-lexically, omits undefined object properties, retains array order, and has no
-whitespace. Recipes retain walker order and use root-directory-relative paths
-(URL trees use relative pathnames plus query strings); components sort by key.
-Git/copy descriptors contain `kind,key,role,url,ref,commit?,install`, npm entries
-contain `kind,key,role,name,spec,version?,integrity?`. Options are `strict`,
-`allowIncompleteTemplates`, and Docker's optional `imageName`.
-
-**Not hashed:** local extension contents or package.json presence, sibling-copy
-contents, unpinned remote commit changes, cook generator/source changes under
-the same package version, selected engine binaries, host dependency archives,
-user-unit selection, resolved answers, output/check-out directories, timestamps,
-other CLI flags, or install-script transitive dependencies. Even builds with
-different generated bytes can share an input ID. An identical recipe tree moved
-to another output directory keeps it. Never use it as a cache validity check,
-unique deployment identity, or proof of reproducibility.
-
-**Secret boundary:** never put secret literals in recipes or source specs; use
-requirements/credential inputs instead. Recipe and partial-input hashes include
-literal recipe bytes, so they can verify guesses about literal secrets. Public
-outputs containing recipe literals are still public; there is no value scanner.
-
-Main's `engines`, `hostDependencies`, incomplete markers and `launch.userUnit`
-remain intact with their existing readers and semantics. No new layout, units,
-health, activation or rollback machinery is added; `state` is omitted because
-cook defines no separate state root outside `build.dir`.
-
-Lock writes use a private same-directory temporary file plus atomic rename.
-An unreadable/unknown host lock refuses reconcile with exit 2: restore a
-known-good lock, or choose a fresh `--out` directory. Before moving a damaged
-lock aside to reinstall in place, back up the install and recover the original
-`--host-dependency` inputs: removing it loses their safety record.
+- Cook reads v1 and v2 locks and rejects unknown versions. A successful
+  build/install upgrades a v1 lock; a failed host upgrade may leave a v1
+  incomplete marker, without answers. Old v1 locks may already contain
+  secrets: rotate exposed credentials; rewriting the lock doesn't undo disclosure.
+- Cook versions before lock v2 treat a v2 lock as unreadable and `cook install`
+  reinstalls from scratch, replacing existing checkouts including `app/`.
+  Don't run an older cook against a v2 install.
+- Cook publishes locks by atomic rename from a same-directory temporary file.
+  New locks honor the umask; rewrites preserve an existing regular lock's
+  permission bits.
+- A v2-capable cook refuses to reconcile an unreadable or unsupported host
+  lock (exit 2). Restore a known-good lock or choose a fresh `--out` directory.
+  Before moving a damaged lock aside to reinstall in place, back up the
+  install and recover the original `--host-dependency` inputs.
 
 ### Templates
 
@@ -255,7 +201,7 @@ lock aside to reinstall in place, back up the install and recover the original
 --image-name <name>    Override the generated image name
 --no-prompts           Non-interactive; warn-and-continue on missing values
 --env-file <path>      Read variable values from this file before prompting
---pin-refs             Optional: resolve full Git commit SHAs
+--pin-refs             Resolve branch/tag refs to commit SHAs; fail if unresolved
 ```
 
 ### Anthropic credentials

@@ -1023,9 +1023,7 @@ async function materializeHost(
       recipePath: plan.recipePath,
       createdAt: new Date().toISOString(),
       connectomeHost, components: lockedComponents,
-      ...deploymentRecord(plan, 'host', installDir, connectomeHost, lockedComponents, {
-        strict: plan.options.strict, allowIncompleteTemplates: options.allowIncompleteTemplates,
-      }),
+      ...deploymentRecord(plan, installDir),
       localExtensions: plan.localExtensions.map(ext => ({
         name: ext.name, hostDir: ext.hostDir, path: join(ext.hostDir, ext.entryBasename),
       })),

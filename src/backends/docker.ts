@@ -328,10 +328,7 @@ export async function runDockerBackend(
       recipePath: plan.recipePath,
       createdAt: new Date().toISOString(),
       connectomeHost, components,
-      ...deploymentRecord(plan, 'docker', outDir, connectomeHost, components, {
-        strict: options.strict, imageName: options.imageName,
-        allowIncompleteTemplates: options.allowIncompleteTemplates,
-      }),
+      ...deploymentRecord(plan, outDir),
       localExtensions: localExtensions.map(ext => ({
         name: ext.name, hostDir: ext.hostDir, path: `${ext.inContainerPath}/${ext.entryBasename}`,
       })),

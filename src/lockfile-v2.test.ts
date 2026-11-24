@@ -1,11 +1,11 @@
 import { afterEach, expect, test } from 'bun:test';
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { runDockerBackend } from './backends/docker.js';
 import { resolvePlan } from './plan.js';
 import { spawnSync } from 'node:child_process';
-import { inputId, deploymentRecord, fullCommit, outputRecords, sha256, writeLockfile, type LockfileV2, readLockfile } from './lockfile.js';
+import { fullCommit, outputRecords, sha256, writeLockfile, type LockfileV2, readLockfile } from './lockfile.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -145,24 +145,46 @@ for (const backend of ['docker', 'host'] as const) {
     }
   });
 
+  test.each([
+    'https://registry.example.com/pkg.tgz?token=SECRET',
+    'pkg@https://host/pkg.tgz?X-Amz-Signature=SECRET',
+    'https://host/pkg.tgz#access_token=SECRET',
+    'github:user:SECRET@host/repo',
+    '@scope/pkg@https://host/pkg.tgz?download=1&%70rivate_token=SECRET',
+    'git+https://host/pkg.git#ref?sig=SECRET',
+    'github:owner/repo#X-Amz-Credential=SECRET',
+  ])(`${backend}: refuses npm credential spelling %s before acquisition`, spec => {
+    const f = fixture();
+    const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
+    recipe.mcpServers.npm.source.npm = spec;
+    writeFileSync(f.recipe, JSON.stringify(recipe));
+    const result = f.run(backend, {}, false);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('embedded credentials');
+    expect(result.stdout + result.stderr).not.toContain('SECRET');
+    expect(existsSync(join(f.out, 'connectome.lock'))).toBe(false);
+    expect(existsSync(f.gitLog)).toBe(false);
+  });
+
   test(`${backend}: credential-free npm Git refs and URL suffixes are preserved without registry calls`, () => {
     for (const spec of ['git+https://example.invalid/pkg.git#v1.0.0',
       'pkg@git+https://example.invalid/pkg.git#main',
       '@scope/pkg@git+https://example.invalid/pkg.git#semver:^1.2.0',
-      'git+ssh://git@example.invalid/pkg.git#v1.0.0',
-      'https://example.invalid/pkg.tgz?download=1']) {
+      'git+ssh://git@example.invalid/pkg.git#token',
+      'https://example.invalid/pkg.tgz?download=1', 'github:owner/repo#main',
+      'owner/repo#main', '@scope/pkg@github:owner/repo#main', 'file:pkg.tgz', 'pkg.tgz', 'npm:pkg@1.2.3']) {
       const f = fixture();
       const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
       recipe.mcpServers.npm.source.npm = spec;
       writeFileSync(f.recipe, JSON.stringify(recipe));
       const result = f.run(backend, {}, false);
       if (result.status !== 0) throw new Error(result.stdout + result.stderr);
-      expect(f.lock().components.find(c => c.kind === 'npm')).toMatchObject({ key: `npm:${spec}`, spec });
+      expect(f.lock().components.find(c => c.kind === 'npm')).toEqual({ kind: 'npm', role: 'mcp', key: `npm:${spec}`, spec });
       expect(existsSync(f.npmLog)).toBe(false);
     }
-  });
+  }, 30_000);
 
-  test(`${backend}: v2 writer/reader, output digests/modes, npm inventory, credential names, stable identity`, () => {
+  test(`${backend}: v2 writer/reader, output digests/modes, npm inventory, and variable names`, () => {
     const f = fixture();
     const first = f.run(backend);
     expect(first.stderr).not.toContain('failed');
@@ -179,8 +201,7 @@ for (const backend of ['docker', 'host'] as const) {
     for (const name of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ODD_ANSWER', 'CRED_TOKEN', 'SIDECAR_SECRET']) {
       expect(lock.referencedVariables).toContain(name);
     }
-    expect(lock.build.dir).toBe(f.out);
-    expect(lock.build.inputId).toMatch(/^[a-f0-9]{64}$/);
+    expect(lock.build).toEqual({ dir: f.out });
     expect(lock.state).toBeUndefined();
     const raw = readFileSync(join(f.out, 'connectome.lock'), 'utf8');
     expect(raw).not.toContain(f.canary);
@@ -195,11 +216,6 @@ for (const backend of ['docker', 'host'] as const) {
       expect(output.mode).toBe(statSync(join(f.out, output.path)).mode & 0o777);
       if (output.sha256) expect(output.sha256).toBe(sha256(readFileSync(join(f.out, output.path))));
     }
-    // A value rotation and timestamp are not immutable build inputs.
-    expect(f.run(backend, { ODD_ANSWER: 'rotated-private-answer' }).status).toBe(0);
-    expect(f.lock().build.inputId).toBe(lock.build.inputId);
-    expect(f.run(backend, { TEST_SHA: 'b'.repeat(40) }).status).toBe(0);
-    expect(f.lock().build.inputId).not.toBe(lock.build.inputId);
   });
 
   test(`${backend}: legacy v1 accepted, next materialization rewrites v2; unknown refused by reader`, () => {
@@ -426,55 +442,21 @@ for (const backend of ['docker', 'host'] as const) {
     expect(raw).not.toContain(sha256(`secret=${f.canary}`));
   });
 
-  test(`${backend}: sensitive output aliases win over public inventory without a secret hash anywhere`, () => {
-    const f = fixture(backend === 'host' ? 'host.json' : 'recipe.json');
-    const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
-    const path = backend === 'docker' ? './README.md' : './recipes/host.json';
-    recipe.services[0].volumes.push({ source: path, target: '/etc/alias' });
-    recipe.services[0].templateFiles.push({ path, template: 'secret=${ODD_ANSWER}', mode: '600' });
-    writeFileSync(f.recipe, JSON.stringify(recipe));
-    const result = f.run(backend);
-    if (backend === 'host') {
-      expect(result.status).toBe(2);
-      expect(result.stderr).toContain('template target overlaps generated configuration');
-      expect(existsSync(join(f.out, 'connectome.lock'))).toBe(false);
-      expect(readFileSync(f.gitLog, 'utf8')).not.toContain('clone');
-      return;
-    }
-    if (result.status !== 0) throw new Error(result.stderr);
-    expect(result.status).toBe(0);
-    const raw = readFileSync(join(f.out, 'connectome.lock'), 'utf8');
-    const normalized = path.slice(2);
-    const outputs = f.lock().outputs.filter(o => resolve(f.out, o.path) === resolve(f.out, path));
-    expect(outputs).toHaveLength(1);
-    expect(outputs[0]).toEqual({ path: normalized, mode: statSync(join(f.out, path)).mode & 0o777 });
-    expect(raw).not.toContain(f.canary);
-    expect(raw).not.toContain(sha256(readFileSync(join(f.out, path))));
-    expect(raw).not.toContain(sha256(`secret=${f.canary}`));
-  });
-
-  test(`${backend}: relocating an identical recipe tree and output keeps identity`, () => {
-    const f = fixture();
-    const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
-    recipe.modules = { fleet: { children: [{ name: 'child', recipe: './nested/child.json' }] } };
-    mkdirSync(join(f.dir, 'nested'));
-    const child = JSON.stringify({ name: 'child', agent: { systemPrompt: 'child' } });
-    writeFileSync(join(f.dir, 'nested/child.json'), child);
-    writeFileSync(f.recipe, JSON.stringify(recipe));
-    expect(f.run(backend).status).toBe(0);
-    const first = f.lock().build.inputId;
-    const moved = join(f.dir, 'moved'); mkdirSync(join(moved, 'nested'), { recursive: true });
-    writeFileSync(join(moved, 'recipe.json'), JSON.stringify(recipe));
-    writeFileSync(join(moved, 'nested/child.json'), child);
-    const out = join(moved, 'bundle');
-    const args = [backend === 'docker' ? 'build' : 'install', join(moved, 'recipe.json'), '--out', out, '--no-prompts', '--yes', '--pin-refs'];
-    expect(f.cli(args).status).toBe(0);
-    expect((readLockfile(out) as LockfileV2).build.inputId).toBe(first);
-    writeFileSync(join(moved, 'nested/child.json'), child + '\n');
-    expect(f.cli(args).status).toBe(0);
-    expect((readLockfile(out) as LockfileV2).build.inputId).not.toBe(first);
-  });
 }
+
+test('host: sensitive template aliases cannot overwrite generated recipes', () => {
+  const f = fixture('host.json');
+  const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
+  const path = './recipes/host.json';
+  recipe.services[0].volumes.push({ source: path, target: '/etc/alias' });
+  recipe.services[0].templateFiles.push({ path, template: 'secret=${ODD_ANSWER}', mode: '600' });
+  writeFileSync(f.recipe, JSON.stringify(recipe));
+  const result = f.run('host');
+  expect(result.status).toBe(2);
+  expect(result.stderr).toContain('template target overlaps generated configuration');
+  expect(existsSync(join(f.out, 'connectome.lock'))).toBe(false);
+  expect(readFileSync(f.gitLog, 'utf8')).not.toContain('clone');
+});
 
 test('host: immediate and runtime container templates cannot target generated parent or child recipes', () => {
   for (const runtimeRender of [false, true]) {
@@ -495,6 +477,7 @@ test('host: immediate and runtime container templates cannot target generated pa
   }
 });
 
+// Cover sensitivity aliases without requiring a Docker template to overwrite a generated file.
 test('output inventory canonicalizes relative, absolute and dot-segment aliases; sensitive wins in either order', () => {
   const f = fixture(); mkdirSync(f.out);
   writeFileSync(join(f.out, 'secret'), f.canary, { mode: 0o600 });
@@ -529,40 +512,9 @@ test('build and run help describe optional pinning and Docker commit provenance'
     expect(result.stdout).toMatch(/Docker records commits only when pinned/i);
   }
   expect(f.cli(['build', '--help']).stdout).toContain('cook build <recipe-path-or-url> [flags]');
-});
-
-test('identity changes for every git/npm pin, recipe, cook version, backend and option; canonical key order is stable', async () => {
-  const f = fixture();
-  expect(f.run('docker').status).toBe(0);
-  const lock = f.lock();
-  // Build a programmatic plan to exercise each identity input independently.
-  const minimalFile = join(f.dir, 'minimal.json');
-  writeFileSync(minimalFile, JSON.stringify({ name: 'minimal', agent: { systemPrompt: 'test' } }));
-  const minimal = await resolvePlan(minimalFile, { noPrompts: true, strict: false });
-  if (!minimal.ok) throw new Error('minimal plan failed');
-  const record = (host = lock.connectomeHost, components = lock.components, options = {}) =>
-    deploymentRecord(minimal.plan, 'docker', f.out, host, components, options).build.inputId;
-  const id = record();
-  expect(record({ ...lock.connectomeHost, commit: 'b'.repeat(40) })).not.toBe(id);
-  for (const component of lock.components) {
-    const changed = lock.components.map(c => c !== component ? c : c.kind === 'git'
-      ? { ...c, commit: 'c'.repeat(40) } : { ...c, integrity: 'sha512-ZGVmZw==' });
-    expect(record(lock.connectomeHost, changed)).not.toBe(id);
+  for (const command of ['build', 'install']) {
+    expect(f.cli([command, '--help']).stdout).toMatch(/--pin-refs[^\n]+branch\/tag refs[^\n]+fail if unresolved/);
   }
-  expect(record(lock.connectomeHost, lock.components.map(c => c.kind === 'npm' ? { ...c, version: '2.0.0' } : c))).not.toBe(id);
-  expect(record(lock.connectomeHost, lock.components.map(c => c.kind === 'npm' ? { ...c, spec: '@scope/pkg@next', version: undefined } : c))).not.toBe(id);
-  for (const options of [{ imageName: 'different' }, { strict: true }, { allowIncompleteTemplates: true }]) {
-    expect(record(lock.connectomeHost, lock.components, options)).not.toBe(id);
-  }
-  minimal.plan.walks.push({ ...minimal.plan.parentWalk, path: '/child.json', sourceSha256: 'e'.repeat(64) });
-  const withChild = record();
-  minimal.plan.walks[1]!.sourceSha256 = 'f'.repeat(64);
-  expect(record()).not.toBe(withChild);
-  minimal.plan.parentWalk.sourceSha256 = 'd'.repeat(64);
-  expect(record()).not.toBe(id);
-  expect(inputId({ cook: '1', backend: 'host' })).not.toBe(inputId({ cook: '2', backend: 'host' }));
-  expect(inputId({ cook: '1', backend: 'host' })).not.toBe(inputId({ cook: '1', backend: 'docker' }));
-  expect(inputId({ a: 1, b: { z: 2, x: 3 } })).toBe(inputId({ b: { x: 3, z: 2 }, a: 1 }));
 });
 
 test('writer strips runtime value properties too; full-SHA enforcement and explicit output inventory', () => {
@@ -637,7 +589,7 @@ test('host inventory is not reconcile machinery; edited public outputs are overw
   expect(f.run('host').status).toBe(0);
   const lock = f.lock();
   lock.recipe.sha256 = 'edited';
-  lock.build.inputId = 'edited';
+  lock.build.dir = '/ignored-build-directory';
   lock.cook.packageVersion = 'edited';
   lock.referencedVariables = ['NOT_A_REQUIRED_SECRET'];
   lock.outputs = [];
@@ -649,7 +601,7 @@ test('host inventory is not reconcile machinery; edited public outputs are overw
   expect(result.status).toBe(0);
   expect(readFileSync(f.gitLog, 'utf8').slice(before.length)).not.toContain('clone');
   expect(readFileSync(join(f.out, 'run.sh'), 'utf8')).toContain('#!/usr/bin/env bash');
-  expect(f.lock().build.inputId).not.toBe('edited');
+  expect(f.lock().build.dir).toBe(f.out);
 });
 
 test('referenced variables include defaults, ordinary names and both alternatives without requiring all of them', () => {
@@ -688,7 +640,7 @@ test('host retains sibling-copy inventory without inventing a commit or hashing 
   expect(copy).toEqual({ kind: 'copy', key: 'sibling:sibling', role: 'mcp', url: '', ref: '', path: join(f.out, 'sibling'), install: 'sibling-copy' });
   writeFileSync(join(f.dir, 'sibling/index.js'), 'second');
   expect(f.run('host', {}, false).status).toBe(0);
-  expect(f.lock().build.inputId).toBe(first.build.inputId);
+  expect(f.lock().components.find(c => c.kind === 'copy')).toEqual(copy);
   expect(readFileSync(join(f.out, 'sibling/index.js'), 'utf8')).toBe('second');
 });
 
@@ -717,19 +669,29 @@ test('atomic writer preserves the previous lock on publication failure and strip
   expect(readLockfile(f.out)?.incomplete).toBe(true);
 });
 
-test('partial input ID deliberately excludes local extension bytes and package.json presence', () => {
+test.each([0o022, 0o027])('atomic publication honors umask %i on creation', mask => {
+  const previousUmask = process.umask(mask);
+  try {
+    const f = fixture();
+    expect(f.run('docker').status).toBe(0);
+    expect(statSync(join(f.out, 'connectome.lock')).mode & 0o777).toBe(0o666 & ~mask);
+  } finally {
+    process.umask(previousUmask);
+  }
+});
+
+test('atomic publication preserves an existing lock mode', () => {
   const f = fixture();
-  const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
-  recipe.extensions = { local: { kind: 'strategy', path: './local/index.ts' } };
-  mkdirSync(join(f.dir, 'local'));
-  writeFileSync(join(f.dir, 'local/index.ts'), 'first');
-  writeFileSync(f.recipe, JSON.stringify(recipe));
-  expect(f.run('docker', {}, false).status).toBe(0);
-  const id = f.lock().build.inputId;
-  const dockerfile = readFileSync(join(f.out, 'Dockerfile'), 'utf8');
-  writeFileSync(join(f.dir, 'local/index.ts'), 'second');
-  writeFileSync(join(f.dir, 'local/package.json'), '{}');
-  expect(f.run('docker', {}, false).status).toBe(0);
-  expect(f.lock().build.inputId).toBe(id);
-  expect(readFileSync(join(f.out, 'Dockerfile'), 'utf8')).not.toBe(dockerfile);
+  const path = join(f.out, 'connectome.lock');
+  expect(f.run('docker').status).toBe(0);
+  for (const mode of [0o644, 0o600]) {
+    chmodSync(path, mode);
+    writeLockfile(f.out, f.lock());
+    expect(statSync(path).mode & 0o777).toBe(mode);
+  }
+});
+
+test('compatibility docs warn that older cooks reinstall from scratch on v2', () => {
+  const readme = readFileSync(join(import.meta.dir, '../README.md'), 'utf8').replace(/\s+/g, ' ');
+  expect(readme.split('#### Compatibility')[1]?.split('### Templates')[0] ?? '').toContain('Cook versions before lock v2 treat a v2 lock as unreadable and `cook install` reinstalls from scratch');
 });
