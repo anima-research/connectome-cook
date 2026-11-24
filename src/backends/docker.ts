@@ -24,6 +24,7 @@ import { generateEntrypoint } from '../generators/entrypoint.js';
 import { confirmWrite } from '../prompts.js';
 import { hostFilename, serializeCredentialFile } from '../credentials.js';
 import { lowerToConfiguration, recipeFilename } from '../configuration.js';
+import { detectExternalServers } from '../source-detector.js';
 import { DEFAULT_CH_REF, DEFAULT_CH_REPO_URL } from '../generators/dockerfile.js';
 import { writeLockfile, type Lockfile } from '../lockfile.js';
 import {
@@ -95,6 +96,15 @@ export async function runDockerBackend(
     credentialValues,
   } = plan;
   const outDir = options.outDir;
+
+  const external = detectExternalServers(walks);
+  if (external.length > 0) {
+    log.error(
+      `MCP server(s) marked source.external (${external.map(s => s.name).join(', ')}) are installed on a host, ` +
+      `not in an image — use \`cook install\` or give them a git/npm source`,
+    );
+    return { exitCode: 2, outDir };
+  }
 
   const input: GeneratorInput = { walks, sources, localExtensions, envVars, options };
 

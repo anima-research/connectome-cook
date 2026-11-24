@@ -111,6 +111,42 @@ and does not make generated Docker commands safe for arbitrary URLs or refs.
 Surrounding whitespace and ASCII control characters are also rejected. Unknown
 token formats may not be recognized: never put credentials in a source URL.
 
+### Host-installed MCP servers
+
+If a stdio MCP server is already installed on the host, declare it in
+`mcpServers` like this:
+
+```json
+{
+  "example": {
+    "command": "/opt/node/bin/node",
+    "args": ["/opt/example-mcp/server.js", "--stdio"],
+    "source": { "external": true }
+  }
+}
+```
+
+`cook install --strict` accepts this declaration without fetching, building,
+copying or rewriting the server's launch settings. The source block cannot
+also contain git, npm or other fields. `cook check` and the install preview
+list the server as external. The host's `connectome.lock` lists external
+servers by name and command only, without args, env or a commit pin.
+`cook build` rejects the declaration because host paths are not image paths.
+
+Use a literal absolute path for the command. For recognized interpreters
+(Node.js as `node` or `nodejs`, Bun, Deno, Python and `uv`),
+cook looks past leading interpreter flags for the entry point. A script
+path must also be literal and absolute (no `${VAR}`); Python's `-m` can
+name an installed module. Cook refuses common fetch-and-run launchers
+such as `npx`, `uvx`, `pipx`, `bun x` and `uv tool run`. It leaves
+server arguments such as `--repo=acme/widgets` and `application/json`
+alone, even if they contain slashes or look like paths.
+
+This is a heuristic, not a full command-line parser or an offline guarantee.
+Cook recognizes common flags with separate values but does not inspect
+wrappers, scripts or their dependencies. You still need to install and
+maintain the executable and any files it uses.
+
 ### Sidecars in host mode
 
 `cook install` supports recipes with sidecar `services` and

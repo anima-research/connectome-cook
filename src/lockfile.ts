@@ -39,6 +39,11 @@ export interface LockedRequirement {
   origin: string;
 }
 
+interface LockedExternalServer {
+  name: string;
+  command: string;
+}
+
 export interface Lockfile {
   version: 1;
   /** Hash-pinned local inputs and explicit pre-install package.json edits. */
@@ -56,11 +61,20 @@ export interface Lockfile {
   /** connectome-host provenance. */
   connectomeHost: { url: string; ref: string; commit?: string; path?: string };
   components: LockedComponent[];
+  /** Host-installed servers, not resolved components. No args, env or pin. */
+  external?: LockedExternalServer[];
   /** Local extension bundles (name → source dir on the operator's disk). */
   localExtensions: Array<{ name: string; hostDir: string; path: string }>;
   requirements: LockedRequirement[];
   /** Backend-specific launch hint: compose dir (docker) or launcher path (host). */
   launch: { kind: 'compose'; dir: string } | { kind: 'script'; script: string; userUnit?: string };
+}
+
+/** Collapse identical declarations across recipes and sort by name, then command. */
+export function lockedExternalServers(servers: readonly LockedExternalServer[]): LockedExternalServer[] {
+  const unique = new Map(servers.map(({ name, command }) => [JSON.stringify([name, command]), { name, command }]));
+  const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
+  return [...unique.values()].sort((a, b) => compare(a.name, b.name) || compare(a.command, b.command));
 }
 
 export function writeLockfile(dir: string, lock: Lockfile): void {

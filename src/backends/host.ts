@@ -41,7 +41,8 @@ import promptsLib from 'prompts';
 import { repositoryIndependentGitEnv } from '../git-env.js';
 import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
 import { log } from '../log.js';
-import type { GeneratorInput, McpSource } from '../types.js';
+import type { ExternalServer, GeneratorInput, McpSource } from '../types.js';
+import { detectExternalServers } from '../source-detector.js';
 import type { Recipe } from '../vendor/recipe.js';
 import type { InstallPlan } from '../plan.js';
 import { generateOverlays } from '../generators/overlay.js';
@@ -56,6 +57,7 @@ import {
 import { serializeCredentialFile } from '../credentials.js';
 import {
   LOCKFILE_NAME,
+  lockedExternalServers,
   readLockfile,
   writeLockfile,
   type Lockfile,
@@ -132,6 +134,8 @@ export interface HostActions {
   skipped: Array<{ key: string; reason: string }>;
   /** Extension name → in-place host entry path (local extensions). */
   localExtensionPaths: Map<string, string>;
+  /** Host-installed MCP servers; launched as declared. */
+  external: ExternalServer[];
 }
 
 /** Map a source's container path onto the install dir: `/zulip_mcp` →
@@ -211,7 +215,7 @@ export function planHostActions(plan: InstallPlan, options: HostBackendOptions):
     localExtensionPaths.set(ext.name, join(ext.hostDir, ext.entryBasename));
   }
 
-  return { clones, copies, skipped, localExtensionPaths };
+  return { clones, copies, skipped, localExtensionPaths, external: detectExternalServers(plan.walks) };
 }
 
 /** Bind the host install command by role, independently of planner ordering. */
@@ -239,6 +243,10 @@ export function renderActionPreview(actions: HostActions, options: HostBackendOp
   }
   for (const s of actions.skipped) {
     lines.push(`  - SKIP ${s.key}: ${s.reason}`);
+  }
+  if (actions.external.length > 0) {
+    lines.push('', 'External MCP servers used as installed (not fetched, built or copied):');
+    for (const { name, command } of actions.external) lines.push(`  - ${name}: ${command}`);
   }
   if (actions.localExtensionPaths.size > 0) {
     lines.push('');
@@ -984,6 +992,7 @@ async function materializeHost(
     const lock: Lockfile = {
       version: 1,
       backend: 'host',
+      ...(actions.external.length > 0 ? { external: lockedExternalServers(actions.external) } : {}),
       ...(dependencies ? { hostDependencies: dependencies.records } : {}),
       ...(engines ? { engines } : {}),
       recipePath: plan.recipePath,
