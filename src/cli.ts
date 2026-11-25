@@ -11,7 +11,7 @@ import type { SubcommandHandler } from './types.js';
 import { loadRecipeRaw, type Recipe } from './vendor/recipe.js';
 import { LOCKFILE_NAME, readLockfile } from './lockfile.js';
 import { walkRecipe } from './walker.js';
-import { detectExternalServers, detectSources } from './source-detector.js';
+import { detectExternalServers, detectSources, EXTERNAL_LAUNCH_CHECK } from './source-detector.js';
 import { detectExtensions } from './extension-detector.js';
 import { collectEnvVars } from './env-collector.js';
 import { resolvePlan } from './plan.js';
@@ -113,6 +113,7 @@ async function runBuildPipeline(argv: string[]): Promise<BuildResult> {
   }
 
   const planResult = await resolvePlan(recipePath, {
+    backend: 'docker',
     strict: !!flags.strict,
     noPrompts: flags.prompts === false,
     envFile: flags['env-file'],
@@ -496,9 +497,11 @@ async function handleCheck(argv: string[]): Promise<number> {
     }
   }
 
-  for (const server of detectExternalServers(walks)) {
-    process.stdout.write(`    ${log.bold(server.name)}  ${log.dim(`(external: ${server.command}, host-installed — not fetched or built)`)}  in: ${server.recipePath.split('/').pop()}\n`);
+  const external = detectExternalServers(walks);
+  for (const server of external) {
+    process.stdout.write(`    ${log.bold(server.name)}  ${log.dim(`(external: ${server.command}, not a cook build source)`)}  in: ${server.recipePath.split('/').pop()}\n`);
   }
+  if (external.length > 0) log.info(EXTERNAL_LAUNCH_CHECK);
 
   let detectedExts;
   try {

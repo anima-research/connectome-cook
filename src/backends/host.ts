@@ -35,14 +35,14 @@ import { applyHostDependencies, assertHostDependencyReinstall, parseHostDependen
  */
 
 import { execFileSync, execSync } from 'node:child_process';
-import { chmodSync, cpSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, constants, cpSync, existsSync, mkdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
 import { repositoryIndependentGitEnv } from '../git-env.js';
 import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
 import { log } from '../log.js';
 import type { ExternalServer, GeneratorInput, McpSource } from '../types.js';
-import { detectExternalServers } from '../source-detector.js';
+import { detectExternalServers, EXTERNAL_LAUNCH_CHECK } from '../source-detector.js';
 import type { Recipe } from '../vendor/recipe.js';
 import type { InstallPlan } from '../plan.js';
 import { generateOverlays } from '../generators/overlay.js';
@@ -225,7 +225,16 @@ export function bindHostEngine(actions: HostActions, bunPath: string): void {
   host.buildCommand = shellQuote(bunPath) + ' install';
 }
 
-/** Render the confirm-gate preview. Pure (string). */
+function isExecutableFile(path: string): boolean {
+  try {
+    accessSync(path, constants.X_OK);
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Render the confirm-gate preview, with advisory checks of external paths. */
 export function renderActionPreview(actions: HostActions, options: HostBackendOptions, dependencies: LockedHostDependency[] = []): string {
   const lines: string[] = [];
   lines.push(`Host install plan → ${options.installDir}`);
@@ -245,8 +254,16 @@ export function renderActionPreview(actions: HostActions, options: HostBackendOp
     lines.push(`  - SKIP ${s.key}: ${s.reason}`);
   }
   if (actions.external.length > 0) {
-    lines.push('', 'External MCP servers used as installed (not fetched, built or copied):');
-    for (const { name, command } of actions.external) lines.push(`  - ${name}: ${command}`);
+    lines.push('', 'External MCP servers (cook does not fetch, build or copy them):', EXTERNAL_LAUNCH_CHECK);
+    for (const { name, command, script, recipePath } of actions.external) {
+      lines.push(`  - ${recipeFilename(recipePath)}#${name}: ${command}`);
+      if (!isExecutableFile(command)) {
+        lines.push(`      warning: command ${JSON.stringify(command)} is missing or not executable`);
+      }
+      if (script !== undefined && !isExecutableFile(script)) {
+        lines.push(`      warning: detected script ${JSON.stringify(script)} is missing or not executable`);
+      }
+    }
   }
   if (actions.localExtensionPaths.size > 0) {
     lines.push('');

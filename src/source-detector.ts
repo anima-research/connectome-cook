@@ -207,11 +207,14 @@ function isExternalSource(
   return 'external' in source;
 }
 
+export const EXTERNAL_LAUNCH_CHECK =
+  'External launch check rejects common fetch-runner commands and relative entry points. ' +
+  'This is an operator-mistake check, not a safety gate; unusual option orders can pass.';
+
 /**
- * Every server marked `source: { external: true }`, in walk order. The
- * marker only makes sense when the host can launch the server without cook:
- * check the executable and recognized interpreter entry point, not the
- * server's own arguments. Report invalid launches in one aggregated error.
+ * Every server marked `source: { external: true }`, in walk order.
+ * Check the command and recognized interpreter entry point, not the server's
+ * own arguments. Report rejected declarations in one aggregated error.
  */
 export function detectExternalServers(walks: WalkResult[]): ExternalServer[] {
   const servers: ExternalServer[] = [];
@@ -219,18 +222,26 @@ export function detectExternalServers(walks: WalkResult[]): ExternalServer[] {
   for (const walk of walks) {
     for (const [name, server] of Object.entries(walk.recipe.mcpServers ?? {})) {
       if (!server.source || !isExternalSource(server.source)) continue;
-      const problem = externalServerProblem(server);
-      if (problem) problems.push(`  - ${walk.path} :: ${name}: ${problem}`);
-      else servers.push({ recipePath: walk.path, name, command: server.command! });
+      const launch = inspectExternalLaunch(server);
+      if ('problem' in launch) problems.push(`  - ${walk.path} :: ${name}: ${launch.problem}`);
+      else servers.push({ recipePath: walk.path, name, command: server.command!, ...launch });
     }
   }
   if (problems.length > 0) {
     throw new Error(
-      `MCP server(s) marked source.external are not launchable as installed:\n${problems.join('\n')}\n` +
-        `Use a literal absolute command and, for an interpreter script, a literal absolute script path.`,
+      `External launch check rejected MCP server(s) marked source.external:\n${problems.join('\n')}\n` +
+        EXTERNAL_LAUNCH_CHECK,
     );
   }
   return servers;
+}
+
+/** A host path cannot be used as an external launch in a Docker image. */
+export function dockerExternalServerProblem(walks: WalkResult[]): string | undefined {
+  const external = detectExternalServers(walks);
+  if (external.length === 0) return undefined;
+  return `MCP server(s) marked source.external (${external.map(s => s.name).join(', ')}) use host paths, ` +
+    'not image paths — use `cook install` or give them a git/npm source';
 }
 
 /** Package-manager front ends and their common JavaScript entry points. */
@@ -244,7 +255,7 @@ function isFetchTool(entry: string): boolean {
 // CLI parser: unlisted leading options are treated as single tokens.
 const INTERPRETER_VALUE_FLAGS = new Map<string, readonly string[]>([
   ['node', ['-r', '--require', '--import', '--loader', '--experimental-loader',
-    '--env-file', '--env-file-if-exists', '-C', '--conditions']],
+    '--env-file', '--env-file-if-exists', '-C', '--conditions', '--disable-warning']],
   ['bun', ['-r', '--preload', '--require', '--import', '-c', '--config', '--cwd', '--env-file', '--conditions']],
   ['deno', ['-c', '--config', '--import-map', '--env-file', '--location', '--lock']],
   ['python', ['-W', '-X']],
@@ -267,27 +278,29 @@ function launchOperands(
   return args.slice(i);
 }
 
-function externalServerProblem(server: RecipeMcpServer): string | undefined {
+function inspectExternalLaunch(server: RecipeMcpServer): { problem: string } | { script?: string } {
   if (typeof server.command !== 'string' || !server.command || server.url ||
     (server.transport !== undefined && server.transport !== 'stdio')) {
-    return 'external requires a stdio command, not a url';
+    return { problem: 'external requires a stdio command, not a url' };
   }
-  if (server.args?.some(arg => typeof arg !== 'string')) return 'external args must be strings';
+  if (server.args?.some(arg => typeof arg !== 'string')) return { problem: 'external args must be strings' };
 
   const command = server.command;
   const name = basename(command);
-  const fetchProblem = `command '${command}' fetches at runtime; use an installed server or drop the external marker`;
+  const fetchProblem = {
+    problem: 'launch matches a common fetch-runner command; use an installed server or drop the external marker',
+  };
   if (isFetchTool(command)) return fetchProblem;
   const literalAbsolute = (value: string) => isAbsolute(value) && !value.includes('${');
   if (!literalAbsolute(command)) {
-    return `command ${JSON.stringify(command)} must be a literal absolute path`;
+    return { problem: `command ${JSON.stringify(command)} must be a literal absolute path` };
   }
 
-  const runtime = name === 'nodejs' ? 'node'
+  const runtime = /^node(?:js|\d+(?:\.\d+)*)?$/.test(name) ? 'node'
     : /^python(?:\d+(?:\.\d+)?)?$/.test(name) ? 'python'
     : name;
   const valueFlags = INTERPRETER_VALUE_FLAGS.get(runtime);
-  if (!valueFlags) return undefined;
+  if (!valueFlags) return {};
 
   // Inline code and project scripts aren't paths to an installed server.
   const entryOption = runtime === 'python' ? /^-[mc]/
@@ -306,14 +319,14 @@ function externalServerProblem(server: RecipeMcpServer): string | undefined {
   if (runtime === 'python' && entry?.startsWith('-m')) {
     const module = entry.slice(2) || next;
     if (module && /^(?:pipx?|uvx?)(?:\.|$)/.test(module)) return fetchProblem;
-    if (module && /^\w+(?:\.\w+)*$/.test(module)) return undefined;
-    return 'python -m needs a literal module name';
+    if (module && /^\w+(?:\.\w+)*$/.test(module)) return {};
+    return { problem: 'python -m needs a literal module name' };
   }
   const script = entry === '--' ? next : entry;
-  if (!entry || !script || entryOption?.test(entry)) return `interpreter '${name}' needs an installed script`;
+  if (!entry || !script || entryOption?.test(entry)) return { problem: `interpreter '${name}' needs an installed script` };
   if (isFetchTool(script)) return fetchProblem;
-  if (!literalAbsolute(script)) return `script ${JSON.stringify(script)} must be a literal absolute path`;
-  return undefined;
+  if (!literalAbsolute(script)) return { problem: `script ${JSON.stringify(script)} must be a literal absolute path` };
+  return { script };
 }
 
 /**

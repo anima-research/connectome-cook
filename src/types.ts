@@ -98,6 +98,8 @@ export interface ExternalServer {
   /** `mcpServers` key. */
   name: string;
   command: string;
+  /** Literal absolute script selected by the launch heuristic, if found. */
+  script?: string;
 }
 
 /** A source-less extension with a recipe-relative path: cook bundles the

@@ -128,24 +128,34 @@ If a stdio MCP server is already installed on the host, declare it in
 
 `cook install --strict` accepts this declaration without fetching, building,
 copying or rewriting the server's launch settings. The source block cannot
-also contain git, npm or other fields. `cook check` and the install preview
-list the server as external. The host's `connectome.lock` lists external
-servers by name and command only, without args, env or a commit pin.
+also contain git, npm or other fields. Recipes using this marker currently
+load only through cook: connectome-host's validator rejects them until a host
+change lands. A separate connectome-host PR is being prepared.
+
+`cook check` and the install preview list the server as external. The preview
+warns without failing if the command or a detected absolute script is missing
+or not executable. The host's `connectome.lock` records each external server's
+name, command and declaring recipe filename, without args, env or a commit pin.
 `cook build` rejects the declaration because host paths are not image paths.
 
 Use a literal absolute path for the command. For recognized interpreters
-(Node.js as `node` or `nodejs`, Bun, Deno, Python and `uv`),
+(Node.js as `node`, `nodejs` or a versioned name like `node22`, Bun, Deno,
+Python and `uv`),
 cook looks past leading interpreter flags for the entry point. A script
 path must also be literal and absolute (no `${VAR}`); Python's `-m` can
-name an installed module. Cook refuses common fetch-and-run launchers
-such as `npx`, `uvx`, `pipx`, `bun x` and `uv tool run`. It leaves
-server arguments such as `--repo=acme/widgets` and `application/json`
-alone, even if they contain slashes or look like paths.
+name an installed module. The launch check rejects common fetch-runner
+commands and relative entry points. It leaves server arguments such as
+`--repo=acme/widgets` and `application/json` alone, even if they look like paths.
 
-This is a heuristic, not a full command-line parser or an offline guarantee.
-Cook recognizes common flags with separate values but does not inspect
-wrappers, scripts or their dependencies. You still need to install and
-maintain the executable and any files it uses.
+This is an operator-mistake check, not a safety gate or an offline guarantee:
+unusual option orders can pass. Cook does not inspect wrappers, scripts or
+dependencies. The heuristic can also reject installed launches such as
+`python3 -Im pkg.server`, `uv run -m pkg.server`, and `npm --prefix /opt/x start`.
+You still need to install and maintain the executable and any files it uses.
+
+External executables that find their interpreter through `PATH` (for example,
+`#!/usr/bin/env node`) can pick up cook's selected engines or the user unit's
+`PATH`; to keep a specific interpreter, set `command` to its absolute path.
 
 ### Sidecars in host mode
 
