@@ -1010,6 +1010,7 @@ async function materializeHost(
       launch: { kind: 'script', script: join(installDir, 'run.sh'), ...(userUnitHint !== undefined ? { userUnit: userUnitHint } : {}) },
     };
     writeLockfile(installDir, lock);
+    completed = true;
   } catch (err) {
     log.error(`write failed: ${err instanceof Error ? err.message : String(err)}`);
     return { exitCode: 3, outDir: installDir };
@@ -1018,7 +1019,6 @@ async function materializeHost(
   log.success(`host install complete → ${installDir}`);
   log.info('');
   log.info(`Next: ${log.bold(`${join(installDir, 'run.sh')}`)}`);
-  completed = true;
   return { exitCode: 0, outDir: installDir };
   } finally {
     cleanup();

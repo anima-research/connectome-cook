@@ -103,16 +103,44 @@ for (const [label, content] of [
     for (const hint of [lockPath, 'Inspect', 'restore a valid copy', 'move it aside', 'fresh install', 'compatible cook if the version is unsupported']) {
       expect(message).toContain(hint);
     }
-    if (content !== undefined) {
-      const launch = run('run', out);
-      expect(launch.status).not.toBe(0);
-      expect(launch.stdout + launch.stderr).toContain('unreadable');
-    }
+    const launch = run('run', out);
+    expect(launch.status).not.toBe(0);
+    expect(launch.stdout + launch.stderr).toContain('unreadable');
     expect(fs.readFileSync(sentinel, 'utf8')).toBe('must survive');
     if (content === undefined) expect(fs.lstatSync(lockPath).isSymbolicLink()).toBe(true);
     else if (content !== null) expect(fs.readFileSync(lockPath, 'utf8')).toBe(content);
   });
 }
+
+test('run refuses a host install with a dangling lock without building or launching', () => {
+  expect(run('install').status).toBe(0);
+  const lockPath = join(out, LOCKFILE_NAME);
+  const missingLock = join(out, 'missing-lock');
+  fs.unlinkSync(lockPath);
+  fs.symlinkSync(missingLock, lockPath);
+
+  const marker = join(dir, 'launched');
+  for (const script of [join(dir, 'bin', 'docker'), join(out, 'run.sh')]) {
+    fs.writeFileSync(script, '#!/bin/sh\n: > "$LAUNCH_MARKER"\n', { mode: 0o755 });
+  }
+  const entries = fs.readdirSync(out).sort();
+  const hostEnv = fs.readFileSync(join(out, '.env'), 'utf8');
+  // Avoid build-affecting flags so run discovers the lock via --out.
+  // If it falls through to a build, supply values and accept its write prompt.
+  const launch = spawnSync(process.execPath, [CLI, 'run', recipe, '--out', out], {
+    env: { ...env, SDK_ROOT: ANSWER, GIT_TOKEN: TOKEN, OPTIONAL: 'set', LAUNCH_MARKER: marker },
+    encoding: 'utf8',
+    input: 'y\n',
+  });
+  expect({
+    status: launch.status,
+    newFiles: fs.readdirSync(out).filter(name => !entries.includes(name)).sort(),
+    launched: fs.existsSync(marker),
+  }).toEqual({ status: 1, newFiles: [], launched: false });
+  expect(launch.stderr).toContain(`unreadable ${LOCKFILE_NAME}`);
+  expect(fs.readlinkSync(lockPath)).toBe(missingLock);
+  expect(fs.readFileSync(join(out, '.env'), 'utf8')).toBe(hostEnv);
+});
 
 function oldLock(): Lockfile {
   return {
