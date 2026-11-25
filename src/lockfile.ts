@@ -7,12 +7,14 @@
  * the lock — and whose target directory exists — is skipped, not re-cloned).
  *
  * Secrets never land here — values live in the backend's .env. The lock
- * records WHAT was materialized (components, commits, paths, answered
- * requirements), not credentials.
+ * records WHAT was materialized (components, commits, paths,
+ * requirement names and origins), not answers or credentials.
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, fchmodSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { log } from './log.js';
 
 export const LOCKFILE_NAME = 'connectome.lock';
 
@@ -35,6 +37,7 @@ export interface LockedComponent {
 export interface LockedRequirement {
   name: string;
   envName: string;
+  /** Legacy v1 input only; never persisted by writeLockfile. */
   value?: string;
   origin: string;
 }
@@ -64,13 +67,63 @@ export interface Lockfile {
 }
 
 export function writeLockfile(dir: string, lock: Lockfile): void {
-  writeFileSync(join(dir, LOCKFILE_NAME), JSON.stringify(lock, null, 2) + '\n');
+  // Strip legacy answers at the persistence boundary, including when an old
+  // lock is rewritten as incomplete. Do not mutate the caller's in-memory lock.
+  const sanitized = {
+    ...lock,
+    requirements: lock.requirements.map(({ value: _value, ...metadata }) => metadata),
+  };
+  const path = join(dir, LOCKFILE_NAME);
+  let mode: number | undefined;
+  try {
+    mode = statSync(path).mode & 0o7777;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+  const temporary = join(dir, `.${LOCKFILE_NAME}.${randomUUID()}.tmp`);
+  // New locks use the normal file-creation mode (subject to umask). Existing
+  // locks retain their exact mode, even when the current umask is stricter.
+  const fd = openSync(temporary, 'wx', mode === undefined ? 0o666 : 0o600);
+  try {
+    try {
+      writeFileSync(fd, JSON.stringify(sanitized, null, 2) + '\n');
+      if (mode !== undefined) fchmodSync(fd, mode);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, path);
+  } catch (err) {
+    rmSync(temporary, { force: true });
+    throw err;
+  }
+
+  // The lock is published. A durability error must not trigger install rollback.
+  try {
+    const directoryFd = openSync(dir, 'r');
+    try {
+      fsyncSync(directoryFd);
+    } finally {
+      closeSync(directoryFd);
+    }
+  } catch (err) {
+    if (!['EINVAL', 'EISDIR', 'EPERM'].includes((err as NodeJS.ErrnoException).code ?? '')) {
+      log.warn(`${path}: lock published, but crash durability is uncertain: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 }
 
 export function readLockfile(dir: string): Lockfile | null {
   const path = join(dir, LOCKFILE_NAME);
-  if (!existsSync(path)) return null;
-  const raw = JSON.parse(readFileSync(path, 'utf-8')) as Lockfile;
+  let content: string;
+  try {
+    content = readFileSync(path, 'utf-8');
+  } catch (err) {
+    // A dangling symlink is an unreadable lock, not a missing lock.
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT' && !lstatSync(path, { throwIfNoEntry: false })) return null;
+    throw err;
+  }
+  const raw = JSON.parse(content) as Lockfile;
   if (raw.version !== 1) {
     throw new Error(`${path}: unsupported lockfile version ${String(raw.version)}`);
   }

@@ -1,6 +1,6 @@
 import mri from 'mri';
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -349,6 +349,16 @@ function launchFromLock(dir: string, passthroughArgs: string[]): Promise<number>
   });
 }
 
+function hasLockEntry(dir: string): boolean {
+  try {
+    return lstatSync(join(dir, LOCKFILE_NAME), { throwIfNoEntry: false }) !== undefined;
+  } catch (err) {
+    // A recipe file isn't a directory. Other lookup errors should be
+    // reported by launchFromLock, not treated as permission to build.
+    return (err as NodeJS.ErrnoException).code !== 'ENOTDIR';
+  }
+}
+
 /** Candidate materialization dirs for a recipe, in preference order. */
 async function findMaterialization(
   target: string,
@@ -365,7 +375,7 @@ async function findMaterialization(
     // Unloadable recipe — the build path will surface the real error.
   }
   for (const dir of candidates) {
-    if (existsSync(join(dir, LOCKFILE_NAME))) return dir;
+    if (hasLockEntry(dir)) return dir;
   }
   return null;
 }
@@ -404,7 +414,7 @@ async function handleRun(argv: string[]): Promise<number> {
     || runFlags.prompts === false;
 
   // 1. Materialized dir named directly.
-  if (target && existsSync(join(target, LOCKFILE_NAME))) {
+  if (target && hasLockEntry(target)) {
     return launchFromLock(resolve(target), passthroughArgs);
   }
 

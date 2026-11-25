@@ -93,7 +93,25 @@ For code that must link against things already on the machine:
 
 Cook probes the candidates, suggests the first hit, lets you confirm or
 override, and exposes the answer as `$SPRING_HOME` — usable in recipe
-`${VAR}` references and install steps, and recorded in the lock.
+`${VAR}` references and install steps. Answers are not recorded in the lock.
+
+### Lock contents and recovery
+
+`connectome.lock` (v1) records the backend, recipe path, creation time,
+component sources/refs and available commits, materialized paths, requirement
+names/env names/origins, and launch hints (plus selected host engines and pinned
+host dependencies when used). Requirement answers stay in the backend's `.env`,
+not the lock. Older locks (including copies and backups) may contain answers,
+including `authSecret` tokens: re-run `cook install` or `cook build` to strip them
+from the active lock, and rotate any token that may have been exposed.
+
+Writes use a synced temporary file and atomic rename, preserving the existing
+mode but not ownership, ACLs or extended attributes. `cook install` refuses an
+unreadable or unknown-version lock before removing targets; `cook run` also
+refuses it. Inspect the lock and restore a valid copy, or use a compatible cook
+if the version is unsupported. Moving the lock aside forces a fresh install,
+which may remove existing targets, including the agent workspace under `app/`.
+`cook build` regenerates the Docker bundle's lock without reading the old one.
 
 ### Source credentials
 

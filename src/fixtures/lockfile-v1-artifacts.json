@@ -1,0 +1,19 @@
+{
+  "build": {
+    ".env": "d514863523c879a6278f98985ec8b44cd0fe301db4ff36294c753dcd5ee268ac",
+    ".env.example": "d3002bab689bca819ec785fb16f9e377a1f964f64dfcc07466fd73933a6911dc",
+    "Dockerfile": "6c62a3a5070968152386dafcee185269328d41b87adc09babcb64e7be7b64706",
+    "GIT_TOKEN": "94e16349472baa1abc8373c64b92cc85da6774b2d8a90f447c741176a9b68376",
+    "README.md": "70c907e93db317b8f3d70987ad55b961adf709afe61c92f879fd008f26100bc8",
+    "connectome.lock": "239618c2fdba7627893056f854238edbe0e529b2456c69d8aa9d9b264b9f399b",
+    "docker-compose.yml": "e01e714d9e5de8357d86a3361f0af45452ce4b80bb7aa8b32d080e288ff83daf",
+    "entrypoint.sh": "081614c53b39fbb9a733b2d33d67bae3133f1e866d40082312d7813ede84f25c",
+    "recipes/recipe.json": "a2fe4fb6dc7481c74514f966343f60f019a62bdba72f467895abd4f8ddff2ad1"
+  },
+  "install": {
+    ".env": "6c781ab3d3a8ccb0481acb0f02df4c47974034380cfcafe2281e2ec7c9b941c0",
+    "connectome.lock": "d1bb55fc8b76d465c8bb838745943812035053303db0640c4ee8a7017b1942b3",
+    "recipes/recipe.json": "04b46446e369bf4ccdae99de79863cda6ea299467c5ca67a18aca1d32905442b",
+    "run.sh": "a700af15963b9f9edc7d7546697490466eb573cf581149ec7cd60c5bad6996b5"
+  }
+}

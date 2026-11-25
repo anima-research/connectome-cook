@@ -227,7 +227,7 @@ describe('lockfile', () => {
       launch: { kind: 'script', script: '/inst/run.sh' },
     };
     writeLockfile(dir, lock);
-    expect(readLockfile(dir)).toEqual(lock);
+    expect(readLockfile(dir)).toEqual({ ...lock, requirements: [{ name: 'spring', envName: 'SPRING_HOME', origin: 'probe' }] });
     expect(readLockfile('/nonexistent-dir-xyz')).toBeNull();
 
     writeFileSync(join(dir, 'connectome.lock'), JSON.stringify({ version: 99 }));
