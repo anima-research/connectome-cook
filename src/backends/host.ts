@@ -155,6 +155,8 @@ export function hostBuildCommand(source: McpSource): string {
   }
 }
 
+const BUN_INSTALL_ARGS = ['install', '--ignore-scripts'] as const;
+
 /** Compute every action the host install would take. Pure. */
 export function planHostActions(plan: InstallPlan, options: HostBackendOptions): HostActions {
   const clones: CloneAction[] = [];
@@ -167,7 +169,7 @@ export function planHostActions(plan: InstallPlan, options: HostBackendOptions):
     url: options.chRepoUrl,
     ref: options.chRef,
     target: join(options.installDir, 'app'),
-    buildCommand: 'bun install',
+    buildCommand: ['bun', ...BUN_INSTALL_ARGS].join(' '),
     ...(options.chCommit !== undefined ? { commit: options.chCommit } : {}),
   });
 
@@ -218,7 +220,7 @@ export function planHostActions(plan: InstallPlan, options: HostBackendOptions):
 export function bindHostEngine(actions: HostActions, bunPath: string): void {
   const host = actions.clones.find(action => action.role === 'connectome-host');
   if (!host) throw new Error('E_HOST_ENGINE_PLAN: connectome-host clone is missing');
-  host.buildCommand = shellQuote(bunPath) + ' install';
+  host.buildCommand = [shellQuote(bunPath), ...BUN_INSTALL_ARGS].join(' ');
 }
 
 /** Render the confirm-gate preview. Pure (string). */
@@ -394,7 +396,7 @@ async function executeClone(
     log.step(`building ${log.dim(action.target)}: ${action.buildCommand}`);
     // The fixed host build needs no shell: Bun itself must be the direct child
     // so PID-only cancellation stops it, without signaling any helpers.
-    if (commands && action.role === 'connectome-host') await commands.run(context.bun ?? 'bun', ['install'], action.target, true, buildEnv);
+    if (commands && action.role === 'connectome-host') await commands.run(context.bun ?? 'bun', [...BUN_INSTALL_ARGS], action.target, true, buildEnv);
     else if (commands) await commands.run('/bin/sh', ['-c', action.buildCommand], action.target, true, buildEnv);
     else execSync(action.buildCommand, {
       cwd: action.target,

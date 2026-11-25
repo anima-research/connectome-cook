@@ -65,6 +65,15 @@ afterEach(() => {
   for (const path of snapshots) rmSync(path, { recursive: true, force: true });
   rmSync(dir, { recursive: true, force: true });
 });
+test('host dependency install skips root lifecycle scripts in the direct Bun invocation', () => {
+  const pkg = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8'));
+  pkg.scripts = { postinstall: 'touch host-postinstall' };
+  writeFileSync(join(repo, 'package.json'), JSON.stringify(pkg));
+  git(['commit', '-qam', 'Add host postinstall']);
+  const r = install();
+  expect(r.status).toBe(0);
+  expect(existsSync(join(out, 'app', 'host-postinstall'))).toBe(false);
+});
 test('CLI installs the artifact version offline, previews and records direct/override deltas and pinned commit', () => {
   const commit = git(['rev-parse', 'HEAD']);
   const r = install(); if (r.status) console.error(r.stdout, r.stderr);

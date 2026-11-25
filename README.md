@@ -95,6 +95,14 @@ Cook probes the candidates, suggests the first hit, lets you confirm or
 override, and exposes the answer as `$SPRING_HOME` — usable in recipe
 `${VAR}` references and install steps, and recorded in the lock.
 
+### Host install scripts
+
+The host install preview and command include `bun install --ignore-scripts`
+for connectome-host. This skips install lifecycle scripts from the project's
+`package.json` and its dependencies, including trusted dependencies. It does
+not change component commands (including npm installs and builds) or Docker
+build commands.
+
 ### Source credentials
 
 Source URLs must not embed password/token userinfo. Bare usernames such as
