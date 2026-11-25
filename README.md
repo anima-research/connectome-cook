@@ -160,7 +160,7 @@ requirement answers.
 | `build.dir` | Absolute output directory. |
 | `requirements` | Requirement `name`, `envName`, and `origin`; no values. |
 | `referencedVariables` | Sorted, unique names, including defaulted and nonsecret variables, provider alternatives, build/sidecar secrets and credential-file overrides (or `path#field`). Not a list of required credentials. |
-| `outputs` | Generated paths and numeric permission bits. Declared public outputs include the SHA-256 of the bytes cook generated before writing; `.env`, credential/secret files and rendered templates get mode only. Sensitive paths take precedence when declarations overlap. |
+| `outputs` | Generated or preserved output paths and numeric permission bits. Declared public outputs include the SHA-256 of the bytes cook generated before writing; `.env`, credential/secret files and rendered templates get mode only. Sensitive paths take precedence when declarations overlap. |
 | `backend`, `launch`, `engines`, `hostDependencies`, `incomplete` | Launch hints (including `launch.userUnit` when selected) and host install safeguards. |
 
 The new inventory fields don't control clone reuse or launch, verify disk

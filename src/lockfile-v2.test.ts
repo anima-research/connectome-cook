@@ -147,12 +147,19 @@ for (const backend of ['docker', 'host'] as const) {
 
   test.each([
     'https://registry.example.com/pkg.tgz?token=SECRET',
+    'https://host/pkg.tgz?TOKEN=SECRET',
+    'https://host/pkg.tgz?%74oken=SECRET',
     'pkg@https://host/pkg.tgz?X-Amz-Signature=SECRET',
+    'https://host/pkg.tgz?Signature=SECRET',
+    'https://host/pkg.tgz?sig=SECRET',
     'https://host/pkg.tgz#access_token=SECRET',
     'github:user:SECRET@host/repo',
+    'user:SECRET@host/repo',
     '@scope/pkg@https://host/pkg.tgz?download=1&%70rivate_token=SECRET',
     'git+https://host/pkg.git#ref?sig=SECRET',
     'github:owner/repo#X-Amz-Credential=SECRET',
+    'git+https://ghp_SECRET@host/pkg.git',
+    'git+https://x-access-token:SECRET@host/pkg.git',
   ])(`${backend}: refuses npm credential spelling %s before acquisition`, spec => {
     const f = fixture();
     const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
@@ -166,23 +173,68 @@ for (const backend of ['docker', 'host'] as const) {
     expect(existsSync(f.gitLog)).toBe(false);
   });
 
-  test(`${backend}: credential-free npm Git refs and URL suffixes are preserved without registry calls`, () => {
-    for (const spec of ['git+https://example.invalid/pkg.git#v1.0.0',
-      'pkg@git+https://example.invalid/pkg.git#main',
-      '@scope/pkg@git+https://example.invalid/pkg.git#semver:^1.2.0',
-      'git+ssh://git@example.invalid/pkg.git#token',
-      'https://example.invalid/pkg.tgz?download=1', 'github:owner/repo#main',
-      'owner/repo#main', '@scope/pkg@github:owner/repo#main', 'file:pkg.tgz', 'pkg.tgz', 'npm:pkg@1.2.3']) {
-      const f = fixture();
-      const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
-      recipe.mcpServers.npm.source.npm = spec;
-      writeFileSync(f.recipe, JSON.stringify(recipe));
-      const result = f.run(backend, {}, false);
-      if (result.status !== 0) throw new Error(result.stdout + result.stderr);
-      expect(f.lock().components.find(c => c.kind === 'npm')).toEqual({ kind: 'npm', role: 'mcp', key: `npm:${spec}`, spec });
-      expect(existsSync(f.npmLog)).toBe(false);
-    }
-  }, 30_000);
+  test.each([
+    'tools@npm:a@https://u:SECRET@h/p.tgz',
+    'tools@npm:a@git+https://u:SECRET@h/r',
+    "tools!@npm:a@https://u:SECRET@h/p.tgz",
+    'npm:@s/p@1?token=SECRET',
+    'tools@npm:github:u:SECRET@h/r',
+    'npm:u:SECRET@h/r',
+    'npm:pkg@1#ref?sig=SECRET',
+    'npm:pkg@latest#token=SECRET',
+    'npm:https://u:SECRET@h/p.tgz',
+    'npm:git+ssh://oauth2@h/r',
+    'npm:https://h/p.tgz',
+    'npm:git+https://h/r',
+    'npm:github:owner/repo',
+    'npm:owner/repo',
+    'npm:file:pkg.tgz',
+    'npm:../pkg',
+    'npm:pkg.tgz',
+    'npm:pkg@some.tar.gz',
+    'npm:pkg@.local',
+    'npm:',
+    'npm:pkg@',
+  ])(`${backend}: refuses non-registry npm alias %s before acquisition`, spec => {
+    const f = fixture();
+    const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
+    recipe.mcpServers.npm.source.npm = spec;
+    writeFileSync(f.recipe, JSON.stringify(recipe));
+    const result = f.run(backend, {}, false);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('mcpServers.npm.source.npm: npm aliases must target a registry package.\n');
+    expect(result.stdout + result.stderr).not.toContain('SECRET');
+    expect(existsSync(join(f.out, 'connectome.lock'))).toBe(false);
+    expect(existsSync(f.gitLog)).toBe(false);
+  });
+
+  test.each([
+    'git+https://example.invalid/pkg.git#v1.0.0',
+    'pkg@git+https://example.invalid/pkg.git#main',
+    '@scope/pkg@git+https://example.invalid/pkg.git#semver:^1.2.0',
+    'git+ssh://git@example.invalid/pkg.git#token',
+    'https://example.invalid/pkg.tgz?download=1', 'github:owner/repo#main',
+    'owner/repo#main', '@scope/pkg@github:owner/repo#main', 'file:pkg.tgz', 'pkg.tgz',
+    'tools@npm:@scope/real-tools@1.2.3', '@scope/a@npm:@other/b@^1', 'npm:@scope/b@1.2.3', 'npm:@scope/b',
+    'tools@npm:@scope/x@latest', 'npm:@s/p@next',
+    'npm:p~x@1', "npm:!p~x'()*@1", "npm:@~s'!()*/!p~x'()*@1",
+    'tools!@npm:@s/p@next', 'NPM:@s/p@1.2.3', 'npm:pkg', 'npm:@s/pkg.tgz@next',
+    // The unscoped target would otherwise be mistaken for a credential username.
+    'npm:oauth2@next', 'npm:pkg@ghp_X',
+    ...['pkg', '@s/pkg'].flatMap(name => [
+      '1.2.3', '^1.2', '~2', '1.x', '*', '1 - 2', '>=1 <2', '^1 || ^2', '1.2.3-rc.1',
+      '2.0.0-rc.1+build', 'latest', 'next', 'beta-1', 'LATEST', 'canary-2026.11.25',
+    ].map(selector => `npm:${name}@${selector}`)),
+  ])(`${backend}: preserves credential-free npm spec %s without registry calls`, spec => {
+    const f = fixture();
+    const recipe = JSON.parse(readFileSync(f.recipe, 'utf8'));
+    recipe.mcpServers.npm.source.npm = spec;
+    writeFileSync(f.recipe, JSON.stringify(recipe));
+    const result = f.run(backend, {}, false);
+    if (result.status !== 0) throw new Error(result.stdout + result.stderr);
+    expect(f.lock().components.find(c => c.kind === 'npm')).toEqual({ kind: 'npm', role: 'mcp', key: `npm:${spec}`, spec });
+    expect(existsSync(f.npmLog)).toBe(false);
+  });
 
   test(`${backend}: v2 writer/reader, output digests/modes, npm inventory, and variable names`, () => {
     const f = fixture();

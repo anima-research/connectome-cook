@@ -1,6 +1,7 @@
 /** Versioned deployment record. Never serialize resolved operator values here. */
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, statSync, lstatSync, fchmodSync, readFileSync, writeFileSync, renameSync, unlinkSync, openSync, closeSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { join, relative, resolve } from 'node:path';
 import type { InstallPlan } from './plan.js';
 import type { McpSource } from './types.js';
@@ -102,6 +103,22 @@ export function fullCommit(commit: string | undefined, location: string): string
   return commit.toLowerCase();
 }
 
+const npmArchive = /\.(?:tgz|tar\.gz|tar)$/i;
+
+function isRegistryAliasTarget(target: string): boolean {
+  // Registry aliases can still refer to legacy names containing ~'!()*.
+  const [, name, selector] = /^((?:@[a-z0-9_~'!()*-][a-z0-9._~'!()*-]*\/[a-z0-9_~'!()*-]|[a-z0-9~'!()*-])[a-z0-9._~'!()*-]*)(?:@(.+))?$/i.exec(target) ?? [];
+  if (!name || name.length > 214 || /^(?:node_modules|favicon\.ico)$/i.test(name)) return false;
+  // npm treats unscoped archive names and file-shaped selectors as paths.
+  if (!name.startsWith('@') && npmArchive.test(name)) return false;
+  if (selector === undefined) return true;
+  if (selector.startsWith('.') || npmArchive.test(selector)) return false;
+  // Keep semver optional for commands that do not need range validation.
+  const { validRange } = createRequire(import.meta.url)('semver') as typeof import('semver');
+  // npm treats non-range selectors as tags only if encodeURIComponent leaves them unchanged.
+  return selector.trim() !== '' && (validRange(selector) !== null || /^[A-Za-z0-9_.!~*'()-]+$/.test(selector));
+}
+
 /** Inventory only what the recipe declares. No new registry/cache lookup:
  * cook has no offline npm integrity metadata, so integrity is omitted. */
 export function resolveNpmComponents(sources: McpSource[]): LockedNpmComponent[] {
@@ -109,14 +126,21 @@ export function resolveNpmComponents(sources: McpSource[]): LockedNpmComponent[]
     if (source.install.kind !== 'npm-global') throw new Error('unreachable');
     const spec = source.install.package;
     // Strip an optional registry-name alias, not URL/shorthand userinfo.
-    const [, name, target] = /^((?:@[\w.~%-]+\/)?[\w.~%-]+)(?:@([\s\S]*))?$/.exec(spec) ?? [];
+    const [, name, target] = /^((?:@[\w.~%'!()*-]+\/)?[\w.~%'!()*-]+)(?:@([\s\S]*))?$/.exec(spec) ?? [];
     const sourceSpec = target ?? spec;
+    const component: LockedNpmComponent = { kind: 'npm', key: source.key, role: source.role ?? 'mcp', spec };
+    const location = `${sourceLocation(source)}.npm`;
+    if (/^npm:/i.test(sourceSpec)) {
+      if (!isRegistryAliasTarget(sourceSpec.slice('npm:'.length))) {
+        throw new Error(`${location}: npm aliases must target a registry package.`);
+      }
+      return component;
+    }
     const hosted = !(name && target === undefined) && (/^[^/\\?#]+\/[^/\\?#]+/.test(sourceSpec)
       || /^(?:github|gitlab|bitbucket|gist):/i.test(sourceSpec));
     const url = /^[a-z][a-z0-9+.-]*:[/\\]/i.test(sourceSpec) || sourceSpec.includes('://');
-    const location = `${sourceLocation(source)}.npm`;
     if (url || hosted) {
-      if (!url && /^[^/?#]*@/.test(sourceSpec)) {
+      if (hosted && !url && /^[^/?#]*@/.test(sourceSpec)) {
         throw new Error(`${location}: embedded credentials are not allowed.`);
       }
       assertCredentialFreeSourceUrl(sourceSpec, location, { allowSuffix: true });
@@ -124,11 +148,11 @@ export function resolveNpmComponents(sources: McpSource[]): LockedNpmComponent[]
     // Names and exact versions describe registry specs only, not e.g. Git,
     // tarballs, local paths, hosted shorthands or npm aliases.
     const registry = name !== undefined && !url && !hosted
-      && (!target || !/[:/\\@?#]/.test(target)) && !name.startsWith('.') && !/\.(?:tgz|tar\.gz|tar)$/i.test(sourceSpec);
+      && (!target || !/[:/\\@?#]/.test(target)) && !name.startsWith('.') && !npmArchive.test(sourceSpec);
     const declaredVersion = registry ? target ?? '' : '';
     const version = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(declaredVersion);
     const exact = version && !version[1]?.split('.').some(part => /^0\d+$/.test(part));
-    return { kind: 'npm', key: source.key, role: source.role ?? 'mcp', spec,
+    return { ...component,
       ...(registry ? { name } : {}),
       ...(exact ? { version: declaredVersion } : {}) };
   });

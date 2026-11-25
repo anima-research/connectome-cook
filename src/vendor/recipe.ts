@@ -10,6 +10,7 @@
  *              Earlier syncs: bb40b64 (credentialFiles), a111e79 (parent-dir
  *              resolution + enabledTools/disabledTools + activity), 6273370
  *              (source metadata).
+ * local patch: `onSource` exposes the raw recipe text to cook for hashing.
  *
  * Note: cook does NOT vendor `substituteEnvVars` itself — `loadRecipeRaw`
  * deliberately skips substitution so the env-collector can scan placeholders

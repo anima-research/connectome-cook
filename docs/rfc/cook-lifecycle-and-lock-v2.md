@@ -7,7 +7,7 @@ Cook materializes a recipe into a directory and records the result in
 policy belong outside cook. The lock is a record of materialization, not a
 desired-state specification or a cache key.
 
-`cook run` uses the backend and launch hints. Host installs reuse matching
+`cook run` uses the launch hint. Host installs reuse matching
 checkouts based on URL, ref, install command, any requested commit and target
 existence. Incomplete installs, selected engines and host dependencies have
 their own safeguards. The new inventory fields do not control these decisions.
