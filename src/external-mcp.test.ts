@@ -195,7 +195,7 @@ describe('external servers on the CLI', () => {
     });
   });
 
-  test('host preview warns without failing for missing or non-executable commands and detected scripts', () => {
+  test('host preview requires executable commands and readable entry points without failing install', () => {
     const node = join(dir, 'node');
     const executable = join(dir, 'executable.js');
     const nonExecutable = join(dir, 'non-executable.js');
@@ -213,9 +213,9 @@ describe('external servers on the CLI', () => {
     expect(install.status).toBe(0);
     expect(install.stdout).toContain(`warning: command "${missing}" is missing or not executable`);
     expect(install.stdout).toContain(`warning: command "${nonExecutable}" is missing or not executable`);
-    expect(install.stdout).toContain(`warning: detected script "${missing}" is missing or not executable`);
-    expect(install.stdout).toContain(`warning: detected script "${nonExecutable}" is missing or not executable`);
-    expect(install.stdout.match(/is missing or not executable/g)).toHaveLength(4);
+    expect(install.stdout).toContain(`warning: detected entry point "${missing}" is missing or not a readable file`);
+    expect(install.stdout).not.toContain(`warning: detected entry point "${nonExecutable}"`);
+    expect(install.stdout.match(/warning: (?:command|detected entry point)/g)).toHaveLength(3);
     expect(install.stdout).toContain('not a safety gate; unusual option orders can pass');
   });
 });

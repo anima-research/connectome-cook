@@ -130,12 +130,13 @@ If a stdio MCP server is already installed on the host, declare it in
 copying or rewriting the server's launch settings. The source block cannot
 also contain git, npm or other fields. Recipes using this marker currently
 load only through cook: connectome-host's validator rejects them until a host
-change lands. A separate connectome-host PR is being prepared.
+change lands.
 
 `cook check` and the install preview list the server as external. The preview
-warns without failing if the command or a detected absolute script is missing
-or not executable. The host's `connectome.lock` records each external server's
-name, command and declaring recipe filename, without args, env or a commit pin.
+warns without failing if the command is missing or not executable, or if a
+detected absolute entry point is missing or not a readable file. The host's
+`connectome.lock` records each external server's name, command and declaring
+recipe filename, without args, env or a commit pin.
 `cook build` rejects the declaration because host paths are not image paths.
 
 Use a literal absolute path for the command. For recognized interpreters

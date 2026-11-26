@@ -225,9 +225,9 @@ export function bindHostEngine(actions: HostActions, bunPath: string): void {
   host.buildCommand = shellQuote(bunPath) + ' install';
 }
 
-function isExecutableFile(path: string): boolean {
+function isAccessibleFile(path: string, mode: number): boolean {
   try {
-    accessSync(path, constants.X_OK);
+    accessSync(path, mode);
     return statSync(path).isFile();
   } catch {
     return false;
@@ -257,11 +257,11 @@ export function renderActionPreview(actions: HostActions, options: HostBackendOp
     lines.push('', 'External MCP servers (cook does not fetch, build or copy them):', EXTERNAL_LAUNCH_CHECK);
     for (const { name, command, script, recipePath } of actions.external) {
       lines.push(`  - ${recipeFilename(recipePath)}#${name}: ${command}`);
-      if (!isExecutableFile(command)) {
+      if (!isAccessibleFile(command, constants.X_OK)) {
         lines.push(`      warning: command ${JSON.stringify(command)} is missing or not executable`);
       }
-      if (script !== undefined && !isExecutableFile(script)) {
-        lines.push(`      warning: detected script ${JSON.stringify(script)} is missing or not executable`);
+      if (script !== undefined && !isAccessibleFile(script, constants.R_OK)) {
+        lines.push(`      warning: detected entry point ${JSON.stringify(script)} is missing or not a readable file`);
       }
     }
   }
