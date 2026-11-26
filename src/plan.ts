@@ -27,7 +27,7 @@ import type {
 } from './types.js';
 import { walkRecipe } from './walker.js';
 import { detectRecipeFilenameCollisions } from './configuration.js';
-import { detectSources } from './source-detector.js';
+import { detectSources, dockerExternalServerProblem } from './source-detector.js';
 import { detectExtensions } from './extension-detector.js';
 import { collectEnvVars } from './env-collector.js';
 import {
@@ -50,6 +50,8 @@ import {
 } from './requirements.js';
 
 export interface PlanOptions {
+  /** Reject host-installed MCP servers while planning a Docker build. */
+  backend?: 'docker' | 'host';
   /** Fail on any MCP server / extension cook can't bake. */
   strict: boolean;
   /** Non-interactive: warn-and-continue on missing values. */
@@ -170,6 +172,10 @@ export async function resolvePlan(
   let envVars: EnvVar[];
   try {
     log.step(`detecting MCP sources (${opts.strict ? 'strict' : 'non-strict'})`);
+    if (opts.backend === 'docker') {
+      const problem = dockerExternalServerProblem(walks);
+      if (problem) throw new Error(problem);
+    }
     sources = detectSources(walks, { strict: opts.strict });
     // Extensions: git-sourced ones join the sources list (builder stages,
     // secrets, systemPackages all reuse the MCP machinery); local bundles

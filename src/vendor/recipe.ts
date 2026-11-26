@@ -27,7 +27,7 @@
  *   - resolveRecipeRelative() — parent-dir-relative path resolution helper,
  *     used by walker.ts to traverse fleet children
  *
- * Two deliberate divergences from upstream:
+ * Deliberate divergences from upstream:
  *
  *   1. We expose loadRecipeRaw() instead of loadRecipe(). Cook needs to scan
  *      raw recipe JSON for ${VAR} patterns BEFORE substitution (so we can
@@ -40,6 +40,10 @@
  *      @animalabs/agent-framework, a runtime-only dep) to `Record<string,
  *      unknown>`. Cook only cares whether wake is enabled, not its config
  *      shape.
+ *
+ *   3. Cook recipes can mark a host-installed MCP server with
+ *      `source: { external: true }`. Cook ships it as `sourceMeta`, not as
+ *      a runtime `source`.
  */
 
 import { readFileSync, existsSync } from 'node:fs';
@@ -125,12 +129,15 @@ export interface RecipeMcpServer {
   credentialFiles?: RecipeCredentialFile[];
 }
 
-/** Where an MCP server's code comes from at image build time. Either a git
- *  checkout (`url` + clone/build) or a published npm package installed
- *  globally so the recipe's `npx` command resolves it offline. */
+/** Where an MCP server's code comes from: git, npm, or an existing host install. */
 export type RecipeMcpServerSource =
   | RecipeMcpServerGitSource
-  | RecipeMcpServerNpmSource;
+  | RecipeMcpServerNpmSource
+  | RecipeMcpServerExternalSource;
+
+export interface RecipeMcpServerExternalSource {
+  external: true;
+}
 
 export interface RecipeMcpServerGitSource {
   url: string;
@@ -628,16 +635,14 @@ export function validateRecipe(raw: unknown): Recipe {
           throw new Error(`mcpServers.${id}.source must be an object`);
         }
         const src = server.source as Record<string, unknown>;
-        // Two source shapes: an npm-registry package (`npm`) or a git
-        // checkout (`url`). Exactly one must be present.
-        const hasNpm = src.npm !== undefined;
-        const hasUrl = src.url !== undefined;
-        if (hasNpm && hasUrl) {
-          throw new Error(
-            `mcpServers.${id}.source must set either 'npm' or 'url', not both`,
-          );
-        }
-        if (hasNpm) {
+        if ('external' in src) {
+          if (src.external !== true || Object.keys(src).length !== 1) {
+            throw new Error(`mcpServers.${id}.source.external must be exactly { "external": true }`);
+          }
+        } else if (src.npm !== undefined) {
+          if (src.url !== undefined) {
+            throw new Error(`mcpServers.${id}.source must set either 'npm' or 'url', not both`);
+          }
           // npm-registry source: a single package spec, no git/build metadata.
           if (typeof src.npm !== 'string' || !src.npm) {
             throw new Error(`mcpServers.${id}.source.npm must be a non-empty string`);

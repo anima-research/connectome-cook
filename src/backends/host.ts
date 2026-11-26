@@ -35,13 +35,14 @@ import { applyHostDependencies, assertHostDependencyReinstall, parseHostDependen
  */
 
 import { execFileSync, execSync } from 'node:child_process';
-import { chmodSync, cpSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, constants, cpSync, existsSync, mkdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
 import { repositoryIndependentGitEnv } from '../git-env.js';
 import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
 import { log } from '../log.js';
-import type { GeneratorInput, McpSource } from '../types.js';
+import type { ExternalServer, GeneratorInput, McpSource } from '../types.js';
+import { detectExternalServers, EXTERNAL_LAUNCH_CHECK } from '../source-detector.js';
 import type { Recipe } from '../vendor/recipe.js';
 import type { InstallPlan } from '../plan.js';
 import { generateOverlays } from '../generators/overlay.js';
@@ -56,6 +57,7 @@ import {
 import { serializeCredentialFile } from '../credentials.js';
 import {
   LOCKFILE_NAME,
+  lockedExternalServers,
   readLockfile,
   writeLockfile,
   type Lockfile,
@@ -132,6 +134,8 @@ export interface HostActions {
   skipped: Array<{ key: string; reason: string }>;
   /** Extension name → in-place host entry path (local extensions). */
   localExtensionPaths: Map<string, string>;
+  /** Host-installed MCP servers; launched as declared. */
+  external: ExternalServer[];
 }
 
 /** Map a source's container path onto the install dir: `/zulip_mcp` →
@@ -211,7 +215,7 @@ export function planHostActions(plan: InstallPlan, options: HostBackendOptions):
     localExtensionPaths.set(ext.name, join(ext.hostDir, ext.entryBasename));
   }
 
-  return { clones, copies, skipped, localExtensionPaths };
+  return { clones, copies, skipped, localExtensionPaths, external: detectExternalServers(plan.walks) };
 }
 
 /** Bind the host install command by role, independently of planner ordering. */
@@ -221,7 +225,16 @@ export function bindHostEngine(actions: HostActions, bunPath: string): void {
   host.buildCommand = shellQuote(bunPath) + ' install';
 }
 
-/** Render the confirm-gate preview. Pure (string). */
+function isAccessibleFile(path: string, mode: number): boolean {
+  try {
+    accessSync(path, mode);
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Render the confirm-gate preview, with advisory checks of external paths. */
 export function renderActionPreview(actions: HostActions, options: HostBackendOptions, dependencies: LockedHostDependency[] = []): string {
   const lines: string[] = [];
   lines.push(`Host install plan → ${options.installDir}`);
@@ -239,6 +252,18 @@ export function renderActionPreview(actions: HostActions, options: HostBackendOp
   }
   for (const s of actions.skipped) {
     lines.push(`  - SKIP ${s.key}: ${s.reason}`);
+  }
+  if (actions.external.length > 0) {
+    lines.push('', 'External MCP servers (cook does not fetch, build or copy them):', EXTERNAL_LAUNCH_CHECK);
+    for (const { name, command, script, recipePath } of actions.external) {
+      lines.push(`  - ${recipeFilename(recipePath)}#${name}: ${command}`);
+      if (!isAccessibleFile(command, constants.X_OK)) {
+        lines.push(`      warning: command ${JSON.stringify(command)} is missing or not executable`);
+      }
+      if (script !== undefined && !isAccessibleFile(script, constants.R_OK)) {
+        lines.push(`      warning: detected entry point ${JSON.stringify(script)} is missing or not a readable file`);
+      }
+    }
   }
   if (actions.localExtensionPaths.size > 0) {
     lines.push('');
@@ -984,6 +1009,7 @@ async function materializeHost(
     const lock: Lockfile = {
       version: 1,
       backend: 'host',
+      ...(actions.external.length > 0 ? { external: lockedExternalServers(actions.external) } : {}),
       ...(dependencies ? { hostDependencies: dependencies.records } : {}),
       ...(engines ? { engines } : {}),
       recipePath: plan.recipePath,

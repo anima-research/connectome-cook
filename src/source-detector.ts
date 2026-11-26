@@ -17,17 +17,24 @@
  *     `(recipePath, mcpServerName)` pair.
  *   - non-strict mode → emit a sibling-copy entry. Operator must supply a
  *     checkout adjacent to the recipe at build time.
+ *
+ * A server marked `source: { external: true }` is installed on the host
+ * outside cook: it is validated (see `detectExternalServers`) and skipped
+ * in both modes — it is never a source.
  */
 
-import { basename } from 'node:path';
+import { basename, isAbsolute } from 'node:path';
 import { assertCredentialFreeSourceUrl } from './source-url.js';
 import type {
+  ExternalServer,
   InstallPattern,
   McpSource,
   SourceRef,
   WalkResult,
 } from './types.js';
 import type {
+  RecipeMcpServer,
+  RecipeMcpServerExternalSource,
   RecipeMcpServerGitSource,
   RecipeMcpServerNpmSource,
   RecipeMcpServerSource,
@@ -144,6 +151,8 @@ export function detectSources(
   const byKey = new Map<string, McpSource>();
   /** Unresolved entries to either error on (strict) or shim (non-strict). */
   const unresolved: Array<{ recipePath: string; mcpServerName: string }> = [];
+  // Validates every external marker; those servers are skipped below.
+  detectExternalServers(walks);
 
   for (const walk of walks) {
     const servers = walk.recipe.mcpServers;
@@ -152,6 +161,7 @@ export function detectSources(
     for (const [serverName, server] of Object.entries(servers)) {
       const ref: SourceRef = { recipePath: walk.path, mcpServerName: serverName };
 
+      if (server.source && isExternalSource(server.source)) continue;
       if (server.source) {
         if (isNpmRegistrySource(server.source)) {
           addNpmRegistrySource(byKey, server.source, ref);
@@ -188,6 +198,135 @@ export function detectSources(
   }
 
   return Array.from(byKey.values());
+}
+
+/** Narrow a recipe source to the cook-only external marker. */
+function isExternalSource(
+  source: RecipeMcpServerSource,
+): source is RecipeMcpServerExternalSource {
+  return 'external' in source;
+}
+
+export const EXTERNAL_LAUNCH_CHECK =
+  'External launch check rejects common fetch-runner commands and relative entry points. ' +
+  'This is an operator-mistake check, not a safety gate; unusual option orders can pass.';
+
+/**
+ * Every server marked `source: { external: true }`, in walk order.
+ * Check the command and recognized interpreter entry point, not the server's
+ * own arguments. Report rejected declarations in one aggregated error.
+ */
+export function detectExternalServers(walks: WalkResult[]): ExternalServer[] {
+  const servers: ExternalServer[] = [];
+  const problems: string[] = [];
+  for (const walk of walks) {
+    for (const [name, server] of Object.entries(walk.recipe.mcpServers ?? {})) {
+      if (!server.source || !isExternalSource(server.source)) continue;
+      const launch = inspectExternalLaunch(server);
+      if ('problem' in launch) problems.push(`  - ${walk.path} :: ${name}: ${launch.problem}`);
+      else servers.push({ recipePath: walk.path, name, command: server.command!, ...launch });
+    }
+  }
+  if (problems.length > 0) {
+    throw new Error(
+      `External launch check rejected MCP server(s) marked source.external:\n${problems.join('\n')}\n` +
+        EXTERNAL_LAUNCH_CHECK,
+    );
+  }
+  return servers;
+}
+
+/** A host path cannot be used as an external launch in a Docker image. */
+export function dockerExternalServerProblem(walks: WalkResult[]): string | undefined {
+  const external = detectExternalServers(walks);
+  if (external.length === 0) return undefined;
+  return `MCP server(s) marked source.external (${external.map(s => s.name).join(', ')}) use host paths, ` +
+    'not image paths — use `cook install` or give them a git/npm source';
+}
+
+/** Package-manager front ends and their common JavaScript entry points. */
+const EXTERNAL_FETCH_TOOLS = new Set(['npx', 'uvx', 'npm', 'pnpm', 'yarn', 'bunx', 'pipx']);
+
+function isFetchTool(entry: string): boolean {
+  return EXTERNAL_FETCH_TOOLS.has(basename(entry).replace(/(?:-cli)?\.[cm]?js$/, ''));
+}
+
+// Only options that take a separate value need listing. This is not a full
+// CLI parser: unlisted leading options are treated as single tokens.
+const INTERPRETER_VALUE_FLAGS = new Map<string, readonly string[]>([
+  ['node', ['-r', '--require', '--import', '--loader', '--experimental-loader',
+    '--env-file', '--env-file-if-exists', '-C', '--conditions', '--disable-warning']],
+  ['bun', ['-r', '--preload', '--require', '--import', '-c', '--config', '--cwd', '--env-file', '--conditions']],
+  ['deno', ['-c', '--config', '--import-map', '--env-file', '--location', '--lock']],
+  ['python', ['-W', '-X']],
+  ['uv', ['--directory', '--project', '--config-file', '--python', '-p', '--with',
+    '--with-requirements', '--env-file']],
+]);
+
+/** Find the entry-point selector after the interpreter's own flags. */
+function launchOperands(
+  args: readonly string[],
+  valueFlags: readonly string[],
+  entryOption?: RegExp,
+): readonly string[] {
+  let i = 0;
+  for (; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === '--' || arg === '-' || !arg.startsWith('-') || entryOption?.test(arg)) break;
+    if (valueFlags.includes(arg)) i++;
+  }
+  return args.slice(i);
+}
+
+function inspectExternalLaunch(server: RecipeMcpServer): { problem: string } | { script?: string } {
+  if (typeof server.command !== 'string' || !server.command || server.url ||
+    (server.transport !== undefined && server.transport !== 'stdio')) {
+    return { problem: 'external requires a stdio command, not a url' };
+  }
+  if (server.args?.some(arg => typeof arg !== 'string')) return { problem: 'external args must be strings' };
+
+  const command = server.command;
+  const name = basename(command);
+  const fetchProblem = {
+    problem: 'launch matches a common fetch-runner command; use an installed server or drop the external marker',
+  };
+  if (isFetchTool(command)) return fetchProblem;
+  const literalAbsolute = (value: string) => isAbsolute(value) && !value.includes('${');
+  if (!literalAbsolute(command)) {
+    return { problem: `command ${JSON.stringify(command)} must be a literal absolute path` };
+  }
+
+  const runtime = /^node(?:js|\d+(?:\.\d+)*)?$/.test(name) ? 'node'
+    : /^python(?:\d+(?:\.\d+)?)?$/.test(name) ? 'python'
+    : name;
+  const valueFlags = INTERPRETER_VALUE_FLAGS.get(runtime);
+  if (!valueFlags) return {};
+
+  // Inline code and project scripts aren't paths to an installed server.
+  const entryOption = runtime === 'python' ? /^-[mc]/
+    : runtime === 'node' || runtime === 'bun' ? /^(?:-[ep]|--(?:eval|print|run))(?:=|$)/
+    : undefined;
+  let operands = launchOperands(server.args ?? [], valueFlags, entryOption);
+  if ((runtime === 'bun' || runtime === 'deno') && operands[0] === 'x') return fetchProblem;
+  if (runtime === 'uv' && operands[0] === 'tool' &&
+    launchOperands(operands.slice(1), valueFlags)[0] === 'run') return fetchProblem;
+
+  if ((runtime !== 'node' && runtime !== 'python' && operands[0] === 'run') ||
+    (runtime === 'deno' && operands[0] === 'serve')) {
+    operands = launchOperands(operands.slice(1), valueFlags, entryOption);
+  }
+  const [entry, next] = operands;
+  if (runtime === 'python' && entry?.startsWith('-m')) {
+    const module = entry.slice(2) || next;
+    if (module && /^(?:pipx?|uvx?)(?:\.|$)/.test(module)) return fetchProblem;
+    if (module && /^\w+(?:\.\w+)*$/.test(module)) return {};
+    return { problem: 'python -m needs a literal module name' };
+  }
+  const script = entry === '--' ? next : entry;
+  if (!entry || !script || entryOption?.test(entry)) return { problem: `interpreter '${name}' needs an installed script` };
+  if (isFetchTool(script)) return fetchProblem;
+  if (!literalAbsolute(script)) return { problem: `script ${JSON.stringify(script)} must be a literal absolute path` };
+  return { script };
 }
 
 /**

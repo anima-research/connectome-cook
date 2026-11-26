@@ -111,6 +111,53 @@ and does not make generated Docker commands safe for arbitrary URLs or refs.
 Surrounding whitespace and ASCII control characters are also rejected. Unknown
 token formats may not be recognized: never put credentials in a source URL.
 
+### Host-installed MCP servers
+
+If a stdio MCP server is already installed on the host, declare it in
+`mcpServers` like this:
+
+```json
+{
+  "example": {
+    "command": "/opt/node/bin/node",
+    "args": ["/opt/example-mcp/server.js", "--stdio"],
+    "source": { "external": true }
+  }
+}
+```
+
+`cook install --strict` accepts this declaration without fetching, building,
+copying or rewriting the server's launch settings. The source block cannot
+also contain git, npm or other fields. Recipes using this marker currently
+load only through cook: connectome-host's validator rejects them until a host
+change lands.
+
+`cook check` and the install preview list the server as external. The preview
+warns without failing if the command is missing or not executable, or if a
+detected absolute entry point is missing or not a readable file. The host's
+`connectome.lock` records each external server's name, command and declaring
+recipe filename, without args, env or a commit pin.
+`cook build` rejects the declaration because host paths are not image paths.
+
+Use a literal absolute path for the command. For recognized interpreters
+(Node.js as `node`, `nodejs` or a versioned name like `node22`, Bun, Deno,
+Python and `uv`),
+cook looks past leading interpreter flags for the entry point. A script
+path must also be literal and absolute (no `${VAR}`); Python's `-m` can
+name an installed module. The launch check rejects common fetch-runner
+commands and relative entry points. It leaves server arguments such as
+`--repo=acme/widgets` and `application/json` alone, even if they look like paths.
+
+This is an operator-mistake check, not a safety gate or an offline guarantee:
+unusual option orders can pass. Cook does not inspect wrappers, scripts or
+dependencies. The heuristic can also reject installed launches such as
+`python3 -Im pkg.server`, `uv run -m pkg.server`, and `npm --prefix /opt/x start`.
+You still need to install and maintain the executable and any files it uses.
+
+External executables that find their interpreter through `PATH` (for example,
+`#!/usr/bin/env node`) can pick up cook's selected engines or the user unit's
+`PATH`; to keep a specific interpreter, set `command` to its absolute path.
+
 ### Sidecars in host mode
 
 `cook install` supports recipes with sidecar `services` and

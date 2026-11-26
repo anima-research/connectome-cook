@@ -24,6 +24,7 @@ import { generateEntrypoint } from '../generators/entrypoint.js';
 import { confirmWrite } from '../prompts.js';
 import { hostFilename, serializeCredentialFile } from '../credentials.js';
 import { lowerToConfiguration, recipeFilename } from '../configuration.js';
+import { dockerExternalServerProblem } from '../source-detector.js';
 import { DEFAULT_CH_REF, DEFAULT_CH_REPO_URL } from '../generators/dockerfile.js';
 import { writeLockfile, type Lockfile } from '../lockfile.js';
 import {
@@ -95,6 +96,12 @@ export async function runDockerBackend(
     credentialValues,
   } = plan;
   const outDir = options.outDir;
+
+  const externalProblem = dockerExternalServerProblem(walks);
+  if (externalProblem) {
+    log.error(externalProblem);
+    return { exitCode: 2, outDir };
+  }
 
   const input: GeneratorInput = { walks, sources, localExtensions, envVars, options };
 
