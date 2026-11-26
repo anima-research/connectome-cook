@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { REAL_GIT, markForeign, originUploadPack } from './test-support/foreign-git.js';
+import { REAL_GIT, foreignGitTest, markForeign, originUploadPack } from './test-support/foreign-git.js';
 
 let dir: string, bin: string, host: string, component: string, recipe: string, out: string;
 let env: NodeJS.ProcessEnv;
@@ -84,7 +84,7 @@ function hiddenCommit(source: string) {
   return sha;
 }
 
-for (const mode of ['quoted paths', 'file URL rewrite', 'bare host']) test(`foreign local sources clone, pin and fetch by name (${mode})`, () => {
+for (const mode of ['quoted paths', 'file URL rewrite', 'bare host']) foreignGitTest(`foreign local sources clone, pin and fetch by name (${mode})`, () => {
   if (mode === 'quoted paths') {
     const quoted = join(dir, "host with 'quote % \\");
     renameSync(host, quoted);
@@ -102,12 +102,17 @@ for (const mode of ['quoted paths', 'file URL rewrite', 'bare host']) test(`fore
   if (result.status) console.error(result.stdout, result.stderr);
   expect(result.status).toBe(0);
   checkOrigin('app', host, true);
+  if (mode === 'quoted paths') {
+    expect(originUploadPack(join(out, 'app'), env)).toBe(
+      String.raw`git -c 'safe.directory=${dir}/host with '\''quote % \' -c 'safe.directory=${dir}/host with '\''quote % \/.git' upload-pack`,
+    );
+  }
   checkOrigin('component-src', component, true);
   checkLock();
   expect(git(join(out, 'component-src'), 'rev-parse', 'HEAD')).toBe(sha);
 });
 
-test('foreign local host engine preflight can fetch and probe missing refs', () => {
+foreignGitTest('foreign local host engine preflight can fetch and probe missing refs', () => {
   foreign();
   const engines = ['--bun-path', join(bin, 'bun'), '--node-path', join(bin, 'node')];
   expect(install('missing', engines, host + '/').stderr).toContain('E_HOST_ENGINE_REF:');
@@ -117,7 +122,7 @@ test('foreign local host engine preflight can fetch and probe missing refs', () 
   checkLock();
 });
 
-for (const character of ['*', '\u0085']) test(`foreign local source refuses ${character === '*' ? 'wildcards' : 'controls'} before creating the install`, () => {
+for (const character of ['*', '\u0085']) foreignGitTest(`foreign local source refuses ${character === '*' ? 'wildcards' : 'controls'} before creating the install`, () => {
   const bad = join(dir, 'private' + character + 'path');
   renameSync(component, bad);
   foreign([host, bad]);
@@ -127,6 +132,19 @@ for (const character of ['*', '\u0085']) test(`foreign local source refuses ${ch
   expect(result.stderr).toContain('E_LOCAL_SOURCE_PATH:');
   expect(result.stderr + result.stdout).not.toContain(bad);
   expect(existsSync(out)).toBe(false);
+});
+
+for (const character of ['*', '\u0085']) foreignGitTest(`--pin-refs does not echo a foreign host path with ${character === '*' ? 'wildcards' : 'controls'}`, () => {
+  const bad = join(dir, 'private' + character + 'path');
+  renameSync(host, bad);
+  foreign([bad]);
+  for (const ref of ['main', 'f'.repeat(40)]) {
+    const result = install(ref, ['--pin-refs'], bad);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr + result.stdout).not.toContain(bad);
+    expect(result.stderr).toContain('E_LOCAL_SOURCE_PATH: --ch-repo:');
+    expect(existsSync(out)).toBe(false);
+  }
 });
 
 test('owned local source keeps plain clone semantics for unusual paths and hidden commits', () => {
@@ -140,12 +158,52 @@ test('owned local source keeps plain clone semantics for unusual paths and hidde
   expect(git(join(out, 'app'), 'rev-parse', 'HEAD')).toBe(sha);
 });
 
-test('foreign local source with a SHA only reachable from a custom ref fails with guidance', () => {
+foreignGitTest('foreign local source fetches a SHA only reachable from a custom ref', () => {
   foreign();
-  const result = install(hiddenCommit(host));
+  const sha = hiddenCommit(host);
+  const result = install(sha);
+  expect(result.status).toBe(0);
+  expect(git(join(out, 'app'), 'rev-parse', 'HEAD')).toBe(sha);
+  checkOrigin('app', host, true);
+});
+
+foreignGitTest('foreign local source still gives guidance for an unavailable SHA', () => {
+  foreign();
+  const result = install('f'.repeat(40));
   expect(result.status).not.toBe(0);
   expect(result.stderr).toContain('specify the full ref name');
   expect(existsSync(join(out, 'app'))).toBe(false);
+});
+
+for (const startsForeign of [false, true]) foreignGitTest(`reused checkouts refresh upload-pack (${startsForeign ? 'foreign to owned' : 'owned to foreign'})`, () => {
+  if (startsForeign) foreign();
+  expect(install().status).toBe(0);
+  checkOrigin('app', host, startsForeign);
+  checkOrigin('component-src', component, startsForeign);
+
+  if (startsForeign) {
+    bunArgs = [];
+    rmSync(join(bin, 'git'));
+  } else {
+    foreign();
+  }
+  const next = install();
+  expect(next.status).toBe(0);
+  expect(next.stdout.match(/unchanged /g)).toHaveLength(2);
+  checkOrigin('app', host, !startsForeign);
+  checkOrigin('component-src', component, !startsForeign);
+});
+
+foreignGitTest('reuse does not set upload-pack on a repointed origin', () => {
+  expect(install().status).toBe(0);
+  const checkout = join(out, 'app');
+  git(checkout, 'remote', 'set-url', 'origin', component);
+
+  foreign([host]);
+  const next = install();
+  expect(next.status).toBe(0);
+  expect(next.stdout.match(/unchanged /g)).toHaveLength(2);
+  checkOrigin('app', component, false);
 });
 
 for (const withEngines of [false, true]) test(`owned absolute URLs agree in preview, lock and origin (selected engines: ${withEngines})`, () => {

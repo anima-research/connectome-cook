@@ -16,7 +16,11 @@ import { assertCredentialFreeSourceUrl, sourceLocation } from './source-url.js';
 import { log } from './log.js';
 import type { McpSource } from './types.js';
 
-interface PinOptions { hostLocal?: boolean }
+interface PinOptions {
+  hostLocal?: boolean;
+  /** Path-validation label, which must not echo the path itself. */
+  localSourceLocation?: string;
+}
 
 /** Only full SHA-1 or SHA-256 object IDs are trusted without remote lookup. */
 export function looksLikeSha(ref: string): boolean {
@@ -37,8 +41,8 @@ export function resolveRemoteRef(
   url: string, ref: string, sslBypass = false, location = 'Source URL', options: PinOptions = {},
 ): string | null {
   assertCredentialFreeSourceUrl(url, location);
+  const uploadPack = options.hostLocal ? localSourceUploadPack(url, options.localSourceLocation ?? location) : undefined;
   if (looksLikeSha(ref)) return ref.toLowerCase();
-  const uploadPack = options.hostLocal ? localSourceUploadPack(url, location) : undefined;
   if (options.hostLocal) url = normalizeLocalSourceUrl(url);
   for (const candidate of candidateRefNames(ref)) {
     const args = [...(sslBypass ? ['-c', 'http.sslVerify=false'] : []), 'ls-remote',

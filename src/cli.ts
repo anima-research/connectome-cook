@@ -240,7 +240,9 @@ async function handleInstall(argv: string[]): Promise<number> {
     // Engine preflight fetches and binds the host itself; avoid ls-remote too.
     if (flags['bun-path'] === undefined && flags['node-path'] === undefined) {
       const chLocation = `connectome-host (${chRepoUrl})`;
-      const chSha = resolveRemoteRef(chRepoUrl, chRef, false, chLocation, { hostLocal: true });
+      const chSha = resolveRemoteRef(chRepoUrl, chRef, false, chLocation, {
+        hostLocal: true, localSourceLocation: '--ch-repo',
+      });
       if (chSha) {
         chCommit = chSha;
         log.info(`--pin-refs: ${chLocation}@${chRef} → ${chSha.slice(0, 12)}`);

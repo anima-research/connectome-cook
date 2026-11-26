@@ -40,6 +40,7 @@ import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
 import { repositoryIndependentGitEnv } from '../git-env.js';
 import { localSourceUploadPack, normalizeLocalSourceUrl } from '../local-source-git.js';
+import { looksLikeSha } from '../pin-refs.js';
 import { shellQuote } from '../shell-quote.js';
 import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
 import { log } from '../log.js';
@@ -298,6 +299,32 @@ export function isSatisfiedByLock(
     && (action.commit === undefined || entry.commit === action.commit);
 }
 
+function refreshOriginUploadPack(action: CloneAction, sourceUrl: string): void {
+  // Target the checkout's own config, never an enclosing repo or user config.
+  const config = join(action.target, '.git', 'config');
+  if (!existsSync(config)) return;
+  const git = (...args: string[]) => execFileSync('git', ['config', '--file', config, ...args], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const read = (key: string, ...args: string[]) => {
+    try { return git(...args, '--null', '--get-all', key); }
+    catch (err) {
+      if ((err as { status?: number }).status === 1) return '';
+      throw err;
+    }
+  };
+  // Compare the raw URL (not Git's insteadOf rewrite) and refuse ambiguity.
+  if (read('remote.origin.url', '--includes') !== action.url + '\0') return;
+  const uploadPack = localSourceUploadPack(sourceUrl, action.role === 'connectome-host' ? '--ch-repo' : 'Component source URL');
+  const key = 'remote.origin.uploadpack';
+  const current = read(key);
+  if (uploadPack !== undefined) {
+    if (current !== uploadPack + '\0') git('--replace-all', key, uploadPack);
+  } else if (current !== '') {
+    git('--unset-all', key);
+  }
+}
+
 /** Clone URL with an optional token (resolved values > environment; never
  *  logged). The credentialed form is briefly visible in the process list
  *  during the clone; executeClone scrubs it from .git/config afterwards. */
@@ -339,15 +366,25 @@ async function executeClone(
   // A dependency preflight checkout already holds the inspected commit.
   const sourceDir = preparedCheckout ? undefined : context.sourceDir;
   const env = repositoryIndependentGitEnv();
-  const git = (args: string[], cwd?: string) => commands
-    ? commands.run('git', args, cwd ?? process.cwd(), true, env)
-    : execFileSync('git', args, { env, cwd, stdio: ['ignore', 'inherit', 'inherit'] });
+  const git = (args: string[], cwd?: string, inherit = true) => commands
+    ? commands.run('git', args, cwd ?? process.cwd(), inherit, env)
+    : execFileSync('git', args, { env, cwd, stdio: inherit ? ['ignore', 'inherit', 'inherit'] : 'pipe' });
   const uploadPack = preparedCheckout ? undefined : sourceDir ? context.sourceUploadPack
     : localSourceUploadPack(action.url, action.role === 'connectome-host' ? '--ch-repo' : 'Component source URL');
   const checkout = async (ref: string) => {
-    try { await git(['checkout', ref], action.target); }
+    const fetchBySha = !!uploadPack && looksLikeSha(ref);
+    try { await git(['checkout', ref], action.target, !fetchBySha); }
     catch (err) {
       if (!uploadPack || !/^[a-f0-9]{4,64}$/i.test(ref)) throw err;
+      if (fetchBySha) {
+        try {
+          await git(['fetch', 'origin', ref], action.target, false);
+          await git(['checkout', ref], action.target);
+          return;
+        } catch {
+          // Keep the original checkout error and the full-ref guidance.
+        }
+      }
       throw new Error(`${(err as Error).message} A foreign local source cloned with --no-local may not include commits outside branches and tags. To fetch a commit from another ref, specify the full ref name (refs/...), or use a branch or tag containing it.`);
     }
   };
@@ -658,6 +695,8 @@ async function materializeHost(
   const hasRecordedPins = assertHostDependencyReinstall(installDir, existingLock?.hostDependencies, dependencyInputs, options.dropHostDependencies);
   const dependencies = dependencyInputs.length ? await preflightHostDependencies(options.chRepoUrl, options.chCommit ?? options.chRef, dependencyInputs, installDir, onStaged, commands) : undefined;
   // Dependency preflight needs the original URL to distinguish relative paths.
+  // Reuse also needs the original spelling to preserve that distinction.
+  const hostSourceUrl = options.chRepoUrl;
   if (checked) options = { ...options, chRepoUrl: checked.sourceUrl };
   if (dependencies) {
     installDir = dependencies.installDir;
@@ -785,9 +824,12 @@ async function materializeHost(
       ? () => { engines = checked.recheck(action.target); } : undefined;
     let commit: string | undefined;
     if (canReuse(action)) {
-      try { recheck?.(); }
+      try {
+        recheck?.();
+        refreshOriginUploadPack(action, action.role === 'connectome-host' ? hostSourceUrl : action.url);
+      }
       catch (err) {
-        // A directory-sensitive shim can change even on a reusable checkout.
+        // A directory-sensitive shim or origin config can fail even on reuse.
         if (existingLockOnDisk) writeLockfile(installDir, { ...existingLockOnDisk, incomplete: true });
         log.error(err instanceof Error ? err.message : String(err));
         return { exitCode: 3, outDir: installDir };

@@ -8,7 +8,7 @@ import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import * as fs from 'node:fs';
-import { markForeign, originUploadPack } from './test-support/foreign-git.js';
+import { foreignGitTest, markForeign, originUploadPack } from './test-support/foreign-git.js';
 import { archivePackage, preflightHostDependencies, parseHostDependencies, verifyHostDependencyResolutions } from './host-dependency.js';
 
 let dir: string, repo: string, out: string, recipe: string, archive: string, digest: string, shim: string;
@@ -75,7 +75,7 @@ test('host dependency install skips root lifecycle scripts in the direct Bun inv
   expect(r.status).toBe(0);
   expect(existsSync(join(out, 'app', 'host-postinstall'))).toBe(false);
 });
-test('foreign local host retains the upload-pack exception after dependency staging', () => {
+foreignGitTest('foreign local host retains the upload-pack exception after dependency staging', () => {
   const { gitEnv, bunArgs } = markForeign(dir, shim, [repo], process.env);
   const r = install(undefined, gitEnv, bunArgs);
   expect(r.status).toBe(0);
@@ -807,7 +807,6 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) test(`R3-8 cleanup exceptio
   writeFileSync(join(shim, 'bun'), `#!/bin/sh\ntouch '${marker}'\nexec sleep 30\n`);
   writeFileSync(preload, `import { spyOn } from 'bun:test';
 import * as fs from 'node:fs';
-import { markForeign, originUploadPack } from './test-support/foreign-git.js';
 const original = fs.rmSync;
 spyOn(fs, 'rmSync').mockImplementation((path, opts) => {
   if (String(path).includes('cook-host-dependency-') && fs.existsSync(${JSON.stringify(marker)})) throw new Error('injected cleanup failure');

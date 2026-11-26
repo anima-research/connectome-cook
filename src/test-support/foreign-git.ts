@@ -1,9 +1,33 @@
-import { expect } from 'bun:test';
+import { expect, test } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 export const REAL_GIT = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+
+function plainCloneRejectsForeignSource(): boolean {
+  const dir = mkdtempSync(join(tmpdir(), 'cook-foreign-git-probe-'));
+  try {
+    const source = join(dir, 'source');
+    const env = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_GLOBAL: join(dir, 'gitconfig'),
+      GIT_CONFIG_NOSYSTEM: '1', GIT_ALLOW_PROTOCOL: 'file', LC_ALL: 'C' };
+    execFileSync(REAL_GIT, ['init', '-q', source], { cwd: dir, env, stdio: 'pipe' });
+    // Git >=2.48 allows ls-remote from a foreign source, but still rejects
+    // plain local clones with the ownership fixes and test hook present.
+    const probe = spawnSync(REAL_GIT, ['clone', '--', source, join(dir, 'plain-clone')], {
+      cwd: dir, env: { ...env, GIT_TEST_ASSUME_DIFFERENT_OWNER: '1' }, encoding: 'utf8',
+    });
+    if (probe.error) throw probe.error;
+    return probe.status !== 0 && probe.stderr.includes('dubious ownership');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const canSimulateForeignGit = plainCloneRejectsForeignSource();
+if (!canSimulateForeignGit) console.warn('SKIP foreign local Git tests: plain clone did not refuse simulated foreign ownership.');
+export const foreignGitTest = test.skipIf(!canSimulateForeignGit);
 
 /** Simulates repositories owned by another uid (no sudo in tests). A `git`
  * wrapper in `bin` runs clone/fetch/ls-remote that touch a
@@ -37,13 +61,6 @@ export function markForeign(dir: string, bin: string, sources: string[], env: No
   writeFileSync(list, sources.flatMap(path => [path, path + '/']).join('\n') + '\n');
   writeForeignGit(bin, list);
   const gitEnv = { ...env, PATH: bin + ':' + env.PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(dir, 'gitconfig'), LC_ALL: 'C' };
-  // Git >=2.48 allows ls-remote from a foreign source. A plain local clone
-  // still rejects it, both before and after the upload-pack behavior change.
-  const rejected = spawnSync('git', ['clone', '--', sources[0]!, join(dir, 'plain-clone')], {
-    cwd: dir, env: gitEnv, encoding: 'utf8',
-  });
-  expect(rejected.status).not.toBe(0);
-  expect(rejected.stderr).toContain('dubious ownership');
   const preload = join(dir, 'foreign.ts');
   const gitDirs = sources.map(path => existsSync(path + '/.git') ? path + '/.git' : path);
   writeFileSync(preload, `
