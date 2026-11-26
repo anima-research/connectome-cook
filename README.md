@@ -103,6 +103,13 @@ for connectome-host. This skips install lifecycle scripts from the project's
 not change component commands (including npm installs and builds) or Docker
 build commands.
 
+At build time, Cook warns which root lifecycle scripts it skips at the checked-out
+commit. Connectome-host v0.3.2 through v0.14.1 build the Web UI in a root
+`postinstall`. Fresh host builds of these tags (selected with `--ch-ref`) skip
+that script and leave no Web UI bundle, so the Web UI responds with HTTP 503.
+To build the bundle explicitly, run `bun run build:web` in `<installDir>/app`
+after installation (requires Node and npm).
+
 ### Source credentials
 
 Source URLs must not embed password/token userinfo. Bare usernames such as

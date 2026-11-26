@@ -35,7 +35,7 @@ import { applyHostDependencies, assertHostDependencyReinstall, parseHostDependen
  */
 
 import { execFileSync, execSync } from 'node:child_process';
-import { chmodSync, cpSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
 import { repositoryIndependentGitEnv } from '../git-env.js';
@@ -156,6 +156,21 @@ export function hostBuildCommand(source: McpSource): string {
 }
 
 const BUN_INSTALL_ARGS = ['install', '--ignore-scripts'] as const;
+
+function warnSkippedHostScripts(target: string, commit?: string): void {
+  let scripts: Record<string, unknown> | undefined;
+  try {
+    scripts = JSON.parse(readFileSync(join(target, 'package.json'), 'utf8'))?.scripts;
+  } catch {
+    // This warning is advisory; leave manifest errors to Bun.
+    return;
+  }
+  const skipped = ['preinstall', 'install', 'postinstall', 'prepare']
+    .filter(name => typeof scripts?.[name] === 'string');
+  if (skipped.length) {
+    log.warn(`connectome-host${commit ? ` at ${commit}` : ''}: bun install --ignore-scripts skips root lifecycle scripts: ${skipped.join(', ')}`);
+  }
+}
 
 /** Compute every action the host install would take. Pure. */
 export function planHostActions(plan: InstallPlan, options: HostBackendOptions): HostActions {
@@ -393,6 +408,7 @@ async function executeClone(
     onDependencyMutation?.();
   }
   if (action.buildCommand) {
+    if (action.role === 'connectome-host') warnSkippedHostScripts(action.target, commit);
     log.step(`building ${log.dim(action.target)}: ${action.buildCommand}`);
     // The fixed host build needs no shell: Bun itself must be the direct child
     // so PID-only cancellation stops it, without signaling any helpers.

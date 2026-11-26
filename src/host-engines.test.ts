@@ -29,16 +29,19 @@ function install(flags = true, env = process.env) {
   return spawnSync(process.execPath, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, '--ch-ref', 'main', '--no-prompts', '--yes', ...(flags ? ['--bun-path', bun, '--node-path', node] : [])], { encoding: 'utf8', env });
 }
 
-test('default host install previews --ignore-scripts and does not run postinstall', () => {
+test('default host install previews --ignore-scripts and reports the skipped postinstall', () => {
   writeFileSync(join(repo, 'package.json'), JSON.stringify({
     name: 'host-fixture', scripts: { postinstall: 'touch host-postinstall' },
   }));
   git('commit', '-am', 'Add host postinstall');
+  const commit = git('rev-parse', 'HEAD');
   script(bun, `exec '${process.execPath}' "$@" --offline`);
   const result = install(false, { ...process.env, PATH: dir + ':' + process.env.PATH });
   expect(result.status).toBe(0);
   expect(existsSync(join(out, 'app', 'host-postinstall'))).toBe(false);
   expect(result.stdout).toContain('then run: bun install --ignore-scripts');
+  expect(result.stderr).toContain(`connectome-host at ${commit}: bun install --ignore-scripts skips root lifecycle scripts: postinstall\n`);
+  expect(result.stderr).not.toContain('touch host-postinstall');
 });
 
 test('R1 diagnostics: distinct safe path, execution, version and range errors', () => {
