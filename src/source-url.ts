@@ -4,7 +4,7 @@ import type { McpSource } from './types.js';
 export function assertCredentialFreeSourceUrl(
   url: string,
   location = 'Source URL',
-  options: { allowSuffix?: boolean } = {},
+  options: { allowSuffix?: boolean; allowGitScp?: boolean } = {},
 ): void {
   const credentialError = () => new Error(`${location}: embedded credentials are not allowed.`);
   // URL() silently trims whitespace and removes some controls. Reject the raw
@@ -62,7 +62,11 @@ export function assertCredentialFreeSourceUrl(
       }
     }
   }
-  // URL-shaped spellings must parse or fail, never fall through as paths.
+  // npm-package-arg treats git+ssh://host:path as scp unless the colon
+  // introduces a numeric port. Raw userinfo and suffixes were checked above.
+  const scpPath = options.allowGitScp ? /^git\+ssh:\/\/([^:#]+:[^#]+)(?:#.*)?$/i.exec(url)?.[1] : undefined;
+  if (scpPath && !/:[0-9]+(\/|$)/.test(scpPath)) return;
+  // Other URL-shaped spellings must parse or fail, never fall through as paths.
   if (!/^(?:\/\/|[a-z][a-z0-9+.-]*:[/\\])/i.test(url)) return; // Local/scp paths.
   let parsed: URL;
   try {

@@ -17,7 +17,7 @@ their own safeguards. The new inventory fields do not control these decisions.
 | `cook.packageVersion`, `recipe`, `build.dir` | Identify the package version, root recipe and its input digest, and the output directory. |
 | `connectomeHost`, `components` | Record known Git commits, host sibling copies and declared npm sources. Unpinned Docker refs may have no commit; npm declarations are not resolved against a registry. |
 | `referencedVariables` | List referenced names, including defaults and alternatives. It is not a startup checklist. |
-| `outputs` | List generated paths, modes and digests of declared public bytes as generated, not as read back from disk. |
+| `outputs` | List generated or preserved output paths and numeric permission bits. Digests of declared public outputs use the bytes cook generated before writing, not bytes read back from disk. |
 
 The [README](../../README.md#connectomelock-v2) describes the emitted fields.
 Neither the inventory nor the output digests verify current disk contents or
