@@ -39,6 +39,8 @@ import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlink
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
 import { repositoryIndependentGitEnv } from '../git-env.js';
+import { localSourceUploadPack, normalizeLocalSourceUrl } from '../local-source-git.js';
+import { shellQuote } from '../shell-quote.js';
 import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
 import { log } from '../log.js';
 import type { GeneratorInput, McpSource } from '../types.js';
@@ -181,7 +183,7 @@ export function planHostActions(plan: InstallPlan, options: HostBackendOptions):
   clones.push({
     key: 'connectome-host',
     role: 'connectome-host',
-    url: options.chRepoUrl,
+    url: normalizeLocalSourceUrl(options.chRepoUrl),
     ref: options.chRef,
     target: join(options.installDir, 'app'),
     buildCommand: ['bun', ...BUN_INSTALL_ARGS].join(' '),
@@ -211,7 +213,7 @@ export function planHostActions(plan: InstallPlan, options: HostBackendOptions):
     clones.push({
       key: source.key,
       role: source.role === 'extension' ? 'extension' : 'mcp',
-      url: source.url,
+      url: normalizeLocalSourceUrl(source.url),
       ref: source.ref,
       target: hostPathFor(options.installDir, source.inContainerPath),
       buildCommand: hostBuildCommand(source),
@@ -315,6 +317,8 @@ function cloneUrlFor(action: CloneAction, values: Record<string, string>): strin
 interface CloneContext {
   /** Scratch store holding the commit engine preflight inspected. */
   sourceDir?: string | undefined;
+  /** Selected using the original URL, before preflight resolves relative paths. */
+  sourceUploadPack?: string | undefined;
   /** Runs once the checkout exists, before anything is written into or installed in it. */
   beforeBuild?: (() => void) | undefined;
   dependencies?: LockedHostDependency[] | undefined;
@@ -338,6 +342,15 @@ async function executeClone(
   const git = (args: string[], cwd?: string) => commands
     ? commands.run('git', args, cwd ?? process.cwd(), true, env)
     : execFileSync('git', args, { env, cwd, stdio: ['ignore', 'inherit', 'inherit'] });
+  const uploadPack = preparedCheckout ? undefined : sourceDir ? context.sourceUploadPack
+    : localSourceUploadPack(action.url, action.role === 'connectome-host' ? '--ch-repo' : 'Component source URL');
+  const checkout = async (ref: string) => {
+    try { await git(['checkout', ref], action.target); }
+    catch (err) {
+      if (!uploadPack || !/^[a-f0-9]{4,64}$/i.test(ref)) throw err;
+      throw new Error(`${(err as Error).message} A foreign local source cloned with --no-local may not include commits outside branches and tags. To fetch a commit from another ref, specify the full ref name (refs/...), or use a branch or tag containing it.`);
+    }
+  };
   rmSync(action.target, { recursive: true, force: true });
   mkdirSync(resolve(action.target, '..'), { recursive: true });
 
@@ -357,8 +370,10 @@ async function executeClone(
       localGit(['clone', '--origin', 'origin', '--no-reject-shallow', '--no-hardlinks', '--branch', 'cook-selected', '--', sourceDir, action.target], 'clone inspected source');
       localGit(['-C', action.target, 'remote', 'set-url', 'origin', action.url], 'set-url origin');
     } else {
-      await git([...sslArgs, 'clone', cloneUrlFor(action, values), action.target]);
+      const localArgs = uploadPack ? ['--origin', 'origin', '--no-local', '-u', uploadPack] : [];
+      await git([...sslArgs, 'clone', ...localArgs, cloneUrlFor(action, values), action.target]);
     }
+    if (uploadPack) await git(['config', 'remote.origin.uploadpack', uploadPack], action.target);
     if (action.authSecret) {
       // Scrub the token from .git/config — the credentialed URL must not
       // persist on disk (backups, shared machines, later `git fetch`).
@@ -376,14 +391,14 @@ async function executeClone(
         try { execFileSync('git', ['checkout', action.commit], { env, cwd: action.target, stdio: ['ignore', 'pipe', 'pipe'] }); }
         catch { throw new Error('E_HOST_ENGINE_CHECKOUT: git checkout inspected commit failed'); }
       } else {
-        await git(['checkout', action.commit], action.target);
+        await checkout(action.commit);
       }
     } else if (action.ref && action.ref !== 'main') {
       if (action.ref.startsWith('refs/')) {
         await git(['fetch', 'origin', `${action.ref}:cook-install-checkout`], action.target);
         await git(['checkout', 'cook-install-checkout'], action.target);
       } else {
-        await git(['checkout', action.ref], action.target);
+        await checkout(action.ref);
       }
     }
   }
@@ -459,11 +474,6 @@ function warnServiceNameNetworking(
       `the native agent must use the sidecar's published localhost port (e.g. http://localhost:<port>).`,
     );
   }
-}
-
-/** Shell-safe single-quoted value for the sourceable .env. */
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 function renderShellEnvFile(values: Record<string, string>): string {
@@ -548,8 +558,13 @@ export async function runHostBackend(
 ): Promise<BuildResult> {
   // Preflight every source before previewing URLs or making any changes.
   assertCredentialFreeSourceUrl(options.chRepoUrl, '--ch-repo');
+  localSourceUploadPack(options.chRepoUrl, '--ch-repo');
   for (const source of plan.sources) {
-    assertCredentialFreeSourceUrl(source.url, `${sourceLocation(source)}.url`);
+    const location = `${sourceLocation(source)}.url`;
+    assertCredentialFreeSourceUrl(source.url, location);
+    if (source.install.kind !== 'npm-global' && source.install.kind !== 'sibling-copy') {
+      localSourceUploadPack(source.url, location);
+    }
   }
   if (options.userUnit !== undefined) {
     if (!options.bunPath || !options.nodePath) throw new Error('E_HOST_UNIT: --user-unit requires both --bun-path and --node-path');
@@ -609,7 +624,7 @@ async function runWithSelectedEngines(
     signals.forEach((signal, i) => process.on(signal, handlers[i]!));
     try {
       const checked = preflightHostEngines(options.chRepoUrl, options.chCommit ?? options.chRef, options.bunPath, options.nodePath, cleanup => { removeScratch = cleanup; });
-      options = { ...options, chRepoUrl: checked.sourceUrl, chCommit: checked.commit };
+      options = { ...options, chCommit: checked.commit };
       return await materializeHost(plan, options, checked, onStaged, commands);
     } finally {
       // Sync git/build subprocesses defer JS signal delivery. Drain pending
@@ -642,6 +657,8 @@ async function materializeHost(
 
   const hasRecordedPins = assertHostDependencyReinstall(installDir, existingLock?.hostDependencies, dependencyInputs, options.dropHostDependencies);
   const dependencies = dependencyInputs.length ? await preflightHostDependencies(options.chRepoUrl, options.chCommit ?? options.chRef, dependencyInputs, installDir, onStaged, commands) : undefined;
+  // Dependency preflight needs the original URL to distinguish relative paths.
+  if (checked) options = { ...options, chRepoUrl: checked.sourceUrl };
   if (dependencies) {
     installDir = dependencies.installDir;
     options = { ...options, installDir, chCommit: dependencies.commit };
@@ -784,6 +801,7 @@ async function materializeHost(
         const isHost = action.role === 'connectome-host';
         commit = (await executeClone(action, plan.values, buildEnv, {
           sourceDir: isHost ? checked?.sourceDir : undefined,
+          sourceUploadPack: isHost ? checked?.uploadPack : undefined,
           beforeBuild: recheck,
           dependencies: isHost ? dependencies?.records : undefined,
           onDependencyMutation: () => { keepSnapshots = true; },
@@ -1007,7 +1025,7 @@ async function materializeHost(
       recipePath: plan.recipePath,
       createdAt: new Date().toISOString(),
       connectomeHost: {
-        url: options.chRepoUrl,
+        url: normalizeLocalSourceUrl(options.chRepoUrl),
         ref: options.chRef,
         path: join(installDir, 'app'),
         ...(chCommit !== undefined ? { commit: chCommit } : {}),

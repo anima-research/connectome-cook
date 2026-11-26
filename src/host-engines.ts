@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { satisfies, valid, validRange } from 'semver';
 import { repositoryIndependentGitEnv } from './git-env.js';
+import { localSourceUploadPack, normalizeLocalSourceUrl } from './local-source-git.js';
 import { assertCredentialFreeSourceUrl } from './source-url.js';
 import { assertHostEnginePath } from './host-engine-path.js';
 
@@ -52,6 +53,7 @@ export interface HostEnginePreflight {
   commit: string;
   sourceDir: string;
   sourceUrl: string;
+  uploadPack?: string;
   cleanup: () => void;
   recheck: (cwd: string) => HostEngines;
 }
@@ -61,6 +63,9 @@ export interface HostEnginePreflight {
  * onScratch lets the CLI register signal cleanup even before fetching. */
 export function preflightHostEngines(url: string, ref: string, bunPath: string, nodePath: string, onScratch?: (cleanup: () => void) => void): HostEnginePreflight {
   assertCredentialFreeSourceUrl(url);
+  const uploadPack = localSourceUploadPack(url, '--ch-repo');
+  const uploadPackArgs = uploadPack ? [`--upload-pack=${uploadPack}`] : [];
+  url = normalizeLocalSourceUrl(url);
   // Git treats a colon before the first slash as a remote (including scp
   // host:path). Resolve only local spellings, as git clone does for origin.
   if (!isAbsolute(url) && !/^[^/]+:/.test(url)) url = process.cwd() + '/' + url;
@@ -85,7 +90,7 @@ export function preflightHostEngines(url: string, ref: string, bunPath: string, 
       else if (code === 'FETCH' && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(ref)) {
         // A failed fetch alone cannot distinguish a missing ref from transport
         // failure. Only ls-remote's documented exit 2 means no matching ref.
-        try { runGit(['ls-remote', '--exit-code', '--', url, ref]); }
+        try { runGit(['ls-remote', '--exit-code', ...uploadPackArgs, '--', url, ref]); }
         catch (probeError) {
           if (timedOut(probeError)) code = 'TIMEOUT';
           else if ((probeError as { status?: number }).status === 2) code = 'REF';
@@ -96,7 +101,7 @@ export function preflightHostEngines(url: string, ref: string, bunPath: string, 
   };
   try {
     git(['init', '--bare', '--object-format=sha1', '.'], 'INIT', 'init');
-    git(['fetch', '--depth=1', '--', url, ref], 'FETCH', 'fetch');
+    git(['fetch', '--depth=1', ...uploadPackArgs, '--', url, ref], 'FETCH', 'fetch');
     const commit = git(['rev-parse', 'FETCH_HEAD^{commit}'], 'COMMIT', 'rev-parse FETCH_HEAD');
     const json = git(['show', commit + ':package.json'], 'PACKAGE', 'show package.json');
     let pkg: { engines?: { bun?: unknown; node?: unknown } } | null;
@@ -116,6 +121,6 @@ export function preflightHostEngines(url: string, ref: string, bunPath: string, 
       }
       return observed;
     };
-    return { engines, commit, sourceDir: scratch, sourceUrl: url, cleanup, recheck };
+    return { engines, commit, sourceDir: scratch, sourceUrl: url, ...(uploadPack ? { uploadPack } : {}), cleanup, recheck };
   } catch (err) { cleanup(); throw err; }
 }

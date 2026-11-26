@@ -110,6 +110,29 @@ that script and leave no Web UI bundle, so the Web UI responds with HTTP 503.
 To build the bundle explicitly, run `bun run build:web` in `<installDir>/app`
 after installation (requires Node and npm).
 
+### Absolute local Git sources on the host
+
+Cook uses a plain clone for repositories you own. For a readable absolute
+local path (including `--ch-repo`) owned by another user, Cook uses
+`--no-local` and gives Git's upload-pack an exact-path `safe.directory`
+exception. The exception is supported for bare repositories and checkouts
+with a `.git` directory, not linked worktrees or submodule checkouts with a
+`.git` file. It does not change global Git settings or apply to relative
+paths or explicit URLs such as `file://`, SSH, and HTTPS.
+
+The exception matters on versions whose upload-pack checks ownership (Git
+before 2.48 with the ownership fixes); Git 2.48 and later only need
+`--no-local` for these clones. Cook saves the upload-pack override as
+`remote.origin.uploadpack` for later fetches. In that checkout, run
+`git config --unset remote.origin.uploadpack` **before** changing origin to
+another repository, so Git does not send the local command and path to it.
+
+Cook removes trailing slashes from absolute local URLs without resolving
+symlinks. The foreign-owner exception refuses `*` and control characters.
+A foreign source acquired with `--no-local` may not include commits only
+reachable via a custom ref. Specify the full ref name (for example,
+`--ch-ref refs/keep/topic`) or a branch or tag containing the commit.
+
 ### Source credentials
 
 Source URLs must not embed password/token userinfo. Bare usernames such as

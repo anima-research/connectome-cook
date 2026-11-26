@@ -8,6 +8,7 @@ import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import * as fs from 'node:fs';
+import { markForeign, originUploadPack } from './test-support/foreign-git.js';
 import { archivePackage, preflightHostDependencies, parseHostDependencies, verifyHostDependencyResolutions } from './host-dependency.js';
 
 let dir: string, repo: string, out: string, recipe: string, archive: string, digest: string, shim: string;
@@ -35,8 +36,8 @@ function host(range: unknown = '^1.0.0', section = 'dependencies') {
   git(['add', 'package.json']); git(['commit', '--allow-empty', '-m', 'Synthetic host']);
 }
 function option(name = 'fixture-local-input', path = archive, hash = digest) { return `${name}=${path}#sha256=${hash}`; }
-function install(extra: string[] = ['--host-dependency', option()], env: NodeJS.ProcessEnv = {}) {
-  const result = spawnSync(realBun, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, ...(extra.includes('--ch-ref') ? [] : ['--ch-ref', 'main']), '--no-prompts', '--yes', ...extra], {
+function install(extra: string[] = ['--host-dependency', option()], env: NodeJS.ProcessEnv = {}, bunArgs: string[] = []) {
+  const result = spawnSync(realBun, [...bunArgs, resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, ...(extra.includes('--ch-ref') ? [] : ['--ch-ref', 'main']), '--no-prompts', '--yes', ...extra], {
     encoding: 'utf8', env: { ...process.env, TMPDIR: join(dir, 'staging'), PATH: shim + ':' + process.env.PATH, ...env },
   });
   if (result.status === 0 && existsSync(join(out, 'connectome.lock'))) {
@@ -73,6 +74,14 @@ test('host dependency install skips root lifecycle scripts in the direct Bun inv
   const r = install();
   expect(r.status).toBe(0);
   expect(existsSync(join(out, 'app', 'host-postinstall'))).toBe(false);
+});
+test('foreign local host retains the upload-pack exception after dependency staging', () => {
+  const { gitEnv, bunArgs } = markForeign(dir, shim, [repo], process.env);
+  const r = install(undefined, gitEnv, bunArgs);
+  expect(r.status).toBe(0);
+  expect(originUploadPack(join(out, 'app'), gitEnv)).toBe(
+    `git -c 'safe.directory=${repo}' -c 'safe.directory=${repo}/.git' upload-pack`,
+  );
 });
 test('CLI installs the artifact version offline, previews and records direct/override deltas and pinned commit', () => {
   const commit = git(['rev-parse', 'HEAD']);
@@ -798,6 +807,7 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) test(`R3-8 cleanup exceptio
   writeFileSync(join(shim, 'bun'), `#!/bin/sh\ntouch '${marker}'\nexec sleep 30\n`);
   writeFileSync(preload, `import { spyOn } from 'bun:test';
 import * as fs from 'node:fs';
+import { markForeign, originUploadPack } from './test-support/foreign-git.js';
 const original = fs.rmSync;
 spyOn(fs, 'rmSync').mockImplementation((path, opts) => {
   if (String(path).includes('cook-host-dependency-') && fs.existsSync(${JSON.stringify(marker)})) throw new Error('injected cleanup failure');

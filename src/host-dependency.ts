@@ -8,6 +8,7 @@ import { provisionPrivateDirectory, resolvePrivateDirectoryPath } from './privat
 import { log } from './log.js';
 import { PinnedCommands } from './pinned-commands.js';
 import { repositoryIndependentGitEnv } from './git-env.js';
+import { localSourceUploadPack, normalizeLocalSourceUrl } from './local-source-git.js';
 import { assertCredentialFreeSourceUrl } from './source-url.js';
 
 const MAX_ARCHIVE = 64 * 1024 * 1024, MAX_TAR = 128 * 1024 * 1024, MAX_JSON = 1024 * 1024, MAX_ENTRIES = 10000;
@@ -224,6 +225,7 @@ function snapshot(source: string, dest: string, onCreated?: () => void): Buffer 
 }
 export async function preflightHostDependencies(url: string, ref: string, inputs: HostDependencyInput[], installDir: string, onStaged?: (cleanup: () => void) => void, commands = new PinnedCommands()): Promise<{ installDir: string; commit: string; checkout: string; records: LockedHostDependency[]; materialize: () => void; cleanup: () => void; discardNew: () => void }> {
   assertCredentialFreeSourceUrl(url);
+  const uploadPack = localSourceUploadPack(url, '--ch-repo');
   // Loaded here so commands that pin no input still run without semver installed.
   const { satisfies, valid, validRange } = await import('semver').catch(() =>
     refuse('E_HOST_DEPENDENCY_RUNTIME', 'cannot load semver; run bun install', true));
@@ -254,8 +256,10 @@ export async function preflightHostDependencies(url: string, ref: string, inputs
       await git(['init', checkout]);
       const base = ['-C', checkout];
       // Git interprets local relative remotes against -C; clone uses process cwd.
-      const remote = /^(?:[a-z][a-z0-9+.-]*:|[^/]+:)/i.test(url) ? url : resolve(url);
+      const remote = url.startsWith('/') ? normalizeLocalSourceUrl(url)
+        : /^(?:[a-z][a-z0-9+.-]*:|[^/]+:)/i.test(url) ? url : resolve(url);
       await git([...base, 'remote', 'add', 'origin', remote]);
+      if (uploadPack) await git([...base, 'config', 'remote.origin.uploadpack', uploadPack]);
       operation = 'fetch';
       log.step(`fetching host ${log.dim(url)}@${ref} (full history and tags)`);
       await git([...base, 'fetch', '--tags', '--', 'origin', ref]);
