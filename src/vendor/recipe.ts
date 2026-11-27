@@ -10,6 +10,7 @@
  *              Earlier syncs: bb40b64 (credentialFiles), a111e79 (parent-dir
  *              resolution + enabledTools/disabledTools + activity), 6273370
  *              (source metadata).
+ * local patch: `onSource` exposes the raw recipe text to cook for hashing.
  *
  * Note: cook does NOT vendor `substituteEnvVars` itself — `loadRecipeRaw`
  * deliberately skips substitution so the env-collector can scan placeholders
@@ -392,9 +393,10 @@ export function resolveRecipeRelative(child: string, base: RecipeSourceBase): st
  * `children[].recipe` strings to absolute paths.  Cook's pipeline needs raw
  * recipes so the env-collector can find unresolved `${VAR}`s and prompt the
  * operator, and the walker can drive its own deterministic traversal.
+ * onSource lets the walker hash the exact loaded text without a second fetch.
  */
-export async function loadRecipeRaw(source: string): Promise<Recipe> {
-  let raw: unknown;
+export async function loadRecipeRaw(source: string, onSource?: (text: string) => void): Promise<Recipe> {
+  let text: string;
 
   if (source.startsWith('http://') || source.startsWith('https://')) {
     const res = await fetch(source);
@@ -403,14 +405,15 @@ export async function loadRecipeRaw(source: string): Promise<Recipe> {
         `Failed to fetch recipe from ${source}: ${res.status} ${res.statusText}`,
       );
     }
-    raw = await res.json();
+    text = await res.text();
   } else {
     const path = resolve(source);
     if (!existsSync(path)) throw new Error(`Recipe file not found: ${path}`);
-    raw = JSON.parse(readFileSync(path, 'utf-8'));
+    text = readFileSync(path, 'utf-8');
   }
 
-  return validateRecipe(raw);
+  onSource?.(text);
+  return validateRecipe(JSON.parse(text));
 }
 
 /**

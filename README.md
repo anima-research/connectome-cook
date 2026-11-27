@@ -30,7 +30,7 @@ cook check my-agent.json
 
 # Generate the Docker artifact bundle (Dockerfile, compose, .env.example,
 # README, recipes/).  Prompts for any required env vars unless --no-prompts.
-cook build my-agent.json --out ./my-agent-cook
+cook build my-agent.json --pin-refs --out ./my-agent-cook
 
 # Install directly onto this machine — no docker. Clones + builds every
 # component under ~/.connectome/installs/<name>/, resolves host requirements
@@ -40,7 +40,8 @@ cook install my-agent.json
 
 # Launch. Finds an existing materialization (lock in the named dir, then
 # ./<name>-cook, then ~/.connectome/installs/<name>) and launches it without
-# re-resolving; falls back to build-then-compose-up. --rebuild forces a re-cook.
+# re-resolving; falls back to build-then-compose-up (pinning is optional).
+# --rebuild forces a re-cook.
 cook run my-agent.json -- -d            # detached (docker) / launcher args (host)
 cook run ~/.connectome/installs/my-agent # launch a materialized dir directly
 ```
@@ -93,7 +94,10 @@ For code that must link against things already on the machine:
 
 Cook probes the candidates, suggests the first hit, lets you confirm or
 override, and exposes the answer as `$SPRING_HOME` — usable in recipe
-`${VAR}` references and install steps, and recorded in the lock.
+`${VAR}` references and install steps. The lock records requirement names and
+origins, never their resolved answers. **Secrets must not be literals in recipes or source specs;
+supply them through requirements or credential inputs**, not literal defaults or template/environment
+strings. `recipe.sha256` hashes the recipe as written, not a redacted copy.
 
 ### Source credentials
 
@@ -105,8 +109,11 @@ is refused. Known token prefixes (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
 `github_pat_`, `glpat-`) are rejected anywhere in the decoded username, case-insensitively,
 as are token usernames (`oauth2`, `x-access-token`, `x-token-auth`).
 Protocol-relative (`//host/path`) spellings require an explicit scheme.
-Query strings and fragments are unsupported and rejected: source path
-derivation does not support these suffixes. This validation is not shell quoting
+Git source URLs reject queries and fragments because source path derivation
+does not support them. npm specs can use ordinary URL suffixes and Git
+`#ref`s, but cook rejects credential-shaped query or fragment parameters
+(such as `token`, `access_token` and `X-Amz-Signature`) and userinfo in
+hosted shorthands. This validation is not shell quoting
 and does not make generated Docker commands safe for arbitrary URLs or refs.
 Surrounding whitespace and ASCII control characters are also rejected. Unknown
 token formats may not be recognized: never put credentials in a source URL.
@@ -125,7 +132,9 @@ ports** — compose service names only resolve inside the docker network.
 
 ### Pinned builds
 
-`--pin-refs` (on `build` and `install`) resolves every branch/tag ref —
+Docker `build` works without `--pin-refs`; unresolved commits are omitted,
+not guessed. Add `--pin-refs` for immutable Git provenance.
+`--pin-refs` (also optional on `install`) resolves every branch/tag ref —
 components and connectome-host itself — to its current commit SHA via
 `git ls-remote` at cook time. The SHA is baked into clone/checkout steps
 (and the `CH_REF` build-arg default) and recorded in `connectome.lock`,
@@ -136,6 +145,47 @@ private repos) fail before any files are written or clones/builds start. Private
 short hex strings are resolved as symbolic refs, like other branch/tag names.
 Abbreviated commit IDs cannot be pinned: use the full 40-hex ID from
 `git rev-parse <ref>` with `--pin-refs`.
+
+### `connectome.lock` v2
+
+Both `cook build` and `cook install` write a v2 lock on success. It records
+what cook materialized and where to launch it. The lock never stores resolved
+requirement answers.
+
+| Field | What it records |
+|---|---|
+| `cook.packageVersion` | The version from cook's `package.json`, not a source revision. |
+| `recipe` | The root recipe path or URL and SHA-256 of its loaded UTF-8 JSON, before validation or substitution. Programmatic plans without loaded text use canonical recipe JSON. |
+| `connectomeHost`, `components` | Git URL/ref and full commit SHA when known. Host installs record checkout HEADs; unpinned Docker refs may have no commit. Host sibling copies have `kind: "copy"` and no commit. npm entries record the declared `spec`; registry specs also get `name` and an exact `version` if declared. No npm lookup is performed and no `integrity` is recorded. |
+| `build.dir` | Absolute output directory. |
+| `requirements` | Requirement `name`, `envName`, and `origin`; no values. |
+| `referencedVariables` | Sorted, unique names, including defaulted and nonsecret variables, provider alternatives, build/sidecar secrets and credential-file overrides (or `path#field`). Not a list of required credentials. |
+| `outputs` | Generated or preserved output paths and numeric permission bits. Declared public outputs include the SHA-256 of the bytes cook generated before writing; `.env`, credential/secret files and rendered templates get mode only. Sensitive paths take precedence when declarations overlap. |
+| `backend`, `launch`, `engines`, `hostDependencies`, `incomplete` | Launch hints (including `launch.userUnit` when selected) and host install safeguards. |
+
+The new inventory fields don't control clone reuse or launch, verify disk
+content, or prove a build is reproducible. npm entries describe declarations,
+not globally installed packages. Output digests aren't a recursive inventory
+of checkouts or operator state, and digest eligibility doesn't depend on the
+values of answers. Use a fresh output directory rather than an untrusted
+pre-seeded one. See the [lifecycle RFC](docs/rfc/cook-lifecycle-and-lock-v2.md).
+
+#### Compatibility
+
+- Cook reads v1 and v2 locks and rejects unknown versions. A successful
+  build/install upgrades a v1 lock; a failed host upgrade may leave a v1
+  incomplete marker, without answers. Old v1 locks may already contain
+  secrets: rotate exposed credentials; rewriting the lock doesn't undo disclosure.
+- Cook versions before lock v2 treat a v2 lock as unreadable and `cook install`
+  reinstalls from scratch, replacing existing checkouts including `app/`.
+  Don't run an older cook against a v2 install.
+- Cook publishes locks by atomic rename from a same-directory temporary file.
+  New locks honor the umask; rewrites preserve an existing regular lock's
+  permission bits.
+- A v2-capable cook refuses to reconcile an unreadable or unsupported host
+  lock (exit 2). Restore a known-good lock or choose a fresh `--out` directory.
+  Before moving a damaged lock aside to reinstall in place, back up the
+  install and recover the original `--host-dependency` inputs.
 
 ### Templates
 
@@ -151,7 +201,7 @@ Abbreviated commit IDs cannot be pinned: use the full 40-hex ID from
 --image-name <name>    Override the generated image name
 --no-prompts           Non-interactive; warn-and-continue on missing values
 --env-file <path>      Read variable values from this file before prompting
---pin-refs             Resolve branch refs to current SHAs; fail if unresolved
+--pin-refs             Resolve branch/tag refs to commit SHAs; fail if unresolved
 ```
 
 ### Anthropic credentials

@@ -60,6 +60,13 @@ import {
   writeLockfile,
   type Lockfile,
   type LockedComponent,
+  type LockfileV2,
+  deploymentRecord,
+  fullCommit,
+  outputRecords,
+  sha256,
+  type PublicOutputDigest,
+  resolveNpmComponents,
 } from '../lockfile.js';
 import { renderUserUnit, validateUserUnit } from '../host-unit.js';
 import { assertHostEnginePath } from '../host-engine-path.js';
@@ -313,7 +320,7 @@ interface CloneContext {
  *  the target on failure so no half-built checkout survives. */
 async function executeClone(
   action: CloneAction, values: Record<string, string>, buildEnv: NodeJS.ProcessEnv, context: CloneContext = {},
-): Promise<{ commit?: string }> {
+): Promise<{ commit: string }> {
   const { beforeBuild, dependencies, onDependencyMutation, preparedCheckout, commands } = context;
   // A dependency preflight checkout already holds the inspected commit.
   const sourceDir = preparedCheckout ? undefined : context.sourceDir;
@@ -377,13 +384,9 @@ async function executeClone(
     } catch { throw new Error('E_HOST_ENGINE_CLONE: removing synthetic refs failed'); }
   }
 
-  let commit: string | undefined;
-  try {
-    commit = commands ? await commands.run('git', ['rev-parse', 'HEAD'], action.target, false, env)
-      : execFileSync('git', ['rev-parse', 'HEAD'], { env, cwd: action.target }).toString().trim();
-  } catch {
-    // Non-fatal — lock entry just omits the commit.
-  }
+  const commit = fullCommit(commands
+    ? await commands.run('git', ['rev-parse', 'HEAD'], action.target, false, env)
+    : execFileSync('git', ['rev-parse', 'HEAD'], { env, cwd: action.target }).toString().trim(), action.key);
 
   beforeBuild?.();
   if (dependencies?.length) {
@@ -403,7 +406,7 @@ async function executeClone(
     });
   }
   if (dependencies?.length) verifyHostDependencyResolutions(action.target, dependencies);
-  return { ...(commit !== undefined ? { commit } : {}) };
+  return { commit };
 }
 
 /** Warn when operator values or recipe defaults address a sidecar by its
@@ -619,7 +622,10 @@ async function materializeHost(
   try {
     existingLock = readLockfile(installDir);
   } catch (err) {
-    log.warn(`existing ${LOCKFILE_NAME} unreadable (${err instanceof Error ? err.message : String(err)}) — treating as fresh install`);
+    log.error(`existing ${LOCKFILE_NAME} unreadable (${err instanceof Error ? err.message : String(err)}) — refusing reconcile. ` +
+      'Restore a known-good lock, or choose a fresh --out directory. Before moving the damaged lock aside to reinstall in place, ' +
+      'back up this install and recover any --host-dependency inputs: deleting the lock loses their safety record.');
+    return { exitCode: 2, outDir: installDir };
   }
 
   const hasRecordedPins = assertHostDependencyReinstall(installDir, existingLock?.hostDependencies, dependencyInputs, options.dropHostDependencies);
@@ -658,6 +664,25 @@ async function materializeHost(
     return { exitCode: 2, outDir: installDir };
   }
 
+  const configurations = new Set(plan.walks.map(w => resolve(installDir, 'recipes', recipeFilename(w.path))));
+  for (const file of runtimeFiles) {
+    const target = file.kind === 'sidecar-template' ? resolve(installDir, file.relPath)
+      : resolve(hostPathFor(installDir, file.inContainer!));
+    // Runtime templates write a staging file now and their final target in
+    // run.sh. Neither destination may collide with a generated recipe.
+    const staged = file.kind === 'container-template' && file.runtime ? `${target}.tmpl` : target;
+    if (configurations.has(target) || configurations.has(staged)) {
+      log.error('template target overlaps generated configuration — choose a separate template path');
+      return { exitCode: 2, outDir: installDir };
+    }
+  }
+
+  let npmComponents: ReturnType<typeof resolveNpmComponents>;
+  try { npmComponents = resolveNpmComponents(plan.sources); }
+  catch (err) {
+    log.error(err instanceof Error ? err.message : String(err));
+    return { exitCode: 2, outDir: installDir };
+  }
   const actions = planHostActions(plan, options);
   if (dependencies) {
     const inputRoot = join(installDir, 'host-inputs');
@@ -758,9 +783,14 @@ async function materializeHost(
         return { exitCode: 3, outDir: installDir };
       }
       log.info(`unchanged ${log.dim(action.key)} — kept (${log.dim(action.target)})`);
-      commit = action.role === 'connectome-host'
-        ? existingLock!.connectomeHost.commit
-        : existingLock!.components.find((c) => c.key === action.key)?.commit;
+      try {
+        commit = fullCommit(commands
+          ? await commands.run('git', ['rev-parse', 'HEAD'], action.target, false, repositoryIndependentGitEnv())
+          : execFileSync('git', ['rev-parse', 'HEAD'], { env: repositoryIndependentGitEnv(), cwd: action.target }).toString().trim(), action.key);
+      } catch {
+        log.error(`${action.key}: cannot read full checkout commit — refusing reconcile`);
+        return { exitCode: 3, outDir: installDir };
+      }
     } else {
       try {
         const isHost = action.role === 'connectome-host';
@@ -787,13 +817,14 @@ async function materializeHost(
       chCommit = commit;
     } else {
       lockedComponents.push({
+        kind: 'git',
         key: action.key,
         role: action.role,
         url: action.url,
         ref: action.ref,
         path: action.target,
         install: action.buildCommand || 'clone-only',
-        ...(commit !== undefined ? { commit } : {}),
+        commit: fullCommit(commit, action.key),
       });
     }
   }
@@ -817,14 +848,7 @@ async function materializeHost(
       recursive: true,
       filter: (src) => basename(src) !== '.git',
     });
-    lockedComponents.push({
-      key: copy.key,
-      role: 'mcp',
-      url: '',
-      ref: '',
-      path: copy.target,
-      install: 'sibling-copy',
-    });
+    lockedComponents.push({ kind: 'copy', key: copy.key, role: 'mcp', url: '', ref: '', path: copy.target, install: 'sibling-copy' });
   }
 
   // ---- Lower configurations with host-rebased overlays. ----
@@ -861,6 +885,11 @@ async function materializeHost(
   }
 
   const parentRecipeBasename = recipeFilename(plan.parentWalk.path);
+  const publicOutputs = new Map<string, PublicOutputDigest>();
+  const writePublic = (path: string, content: string, mode?: number) => {
+    publicOutputs.set(path, sha256(content));
+    writeFileSync(join(installDir, path), content, { mode });
+  };
   try {
     for (const walk of plan.walks) {
       const configuration = lowerToConfiguration(walk.recipe, overlays.get(walk.path), walk.path);
@@ -868,8 +897,8 @@ async function materializeHost(
         if (server.command === 'node') server.command = engines.node.path;
         if (server.command === 'bun') server.command = engines.bun.path;
       }
-      writeFileSync(
-        join(installDir, 'recipes', recipeFilename(walk.path)),
+      writePublic(
+        `recipes/${recipeFilename(walk.path)}`,
         JSON.stringify(configuration, null, 2) + '\n',
       );
     }
@@ -958,7 +987,7 @@ async function materializeHost(
       },
     });
     if (sidecarCompose !== null) {
-      writeFileSync(join(installDir, SIDECAR_COMPOSE_FILENAME), sidecarCompose);
+      writePublic(SIDECAR_COMPOSE_FILENAME, sidecarCompose);
       warnServiceNameNetworking(
         plan,
         runtimeFiles.filter((f) => f.kind === 'container-template'),
@@ -968,44 +997,43 @@ async function materializeHost(
     if (Object.keys(plan.values).length > 0) {
       writeFileSync(join(installDir, '.env'), renderShellEnvFile(plan.values), { mode: 0o600 });
     }
-    writeFileSync(
-      join(installDir, 'run.sh'),
+    writePublic(
+      'run.sh',
       renderLauncher(parentRecipeBasename, { hasSidecars, envsubstFiles, engines }),
-      { mode: 0o755 },
+      0o755,
     );
 
     if (userUnit !== undefined) {
       const unitPath = join(installDir, options.userUnit!);
-      writeFileSync(unitPath, userUnit, { mode: 0o600 });
+      writePublic(options.userUnit!, userUnit, 0o600);
       // writeFileSync's mode applies only to new files, not reconciled exports.
       chmodSync(unitPath, 0o600);
     }
 
-    const lock: Lockfile = {
-      version: 1,
+    const connectomeHost = {
+      url: options.chRepoUrl, ref: options.chRef, path: join(installDir, 'app'),
+      commit: fullCommit(chCommit, 'connectome-host'),
+    };
+    lockedComponents.push(...npmComponents);
+    const lock: LockfileV2 = {
+      version: 2,
       backend: 'host',
       ...(dependencies ? { hostDependencies: dependencies.records } : {}),
       ...(engines ? { engines } : {}),
       recipePath: plan.recipePath,
       createdAt: new Date().toISOString(),
-      connectomeHost: {
-        url: options.chRepoUrl,
-        ref: options.chRef,
-        path: join(installDir, 'app'),
-        ...(chCommit !== undefined ? { commit: chCommit } : {}),
-      },
-      components: lockedComponents,
-      localExtensions: plan.localExtensions.map((ext) => ({
-        name: ext.name,
-        hostDir: ext.hostDir,
-        path: join(ext.hostDir, ext.entryBasename),
+      connectomeHost, components: lockedComponents,
+      ...deploymentRecord(plan, installDir),
+      localExtensions: plan.localExtensions.map(ext => ({
+        name: ext.name, hostDir: ext.hostDir, path: join(ext.hostDir, ext.entryBasename),
       })),
-      requirements: plan.requirements.map((r) => ({
-        name: r.name,
-        envName: r.envName,
-        origin: r.origin,
-        ...(r.value !== undefined ? { value: r.value } : {}),
-      })),
+      outputs: outputRecords(installDir, publicOutputs, [
+        ...plan.credentialFiles.filter(cf => !cf.path.startsWith('/')).map(cf => relative(installDir, resolve(join(installDir, 'app'), cf.path)))
+          .filter(p => p !== '..' && !p.startsWith('../')),
+        ...(parent.services ?? []).flatMap(s => s.secrets ?? []),
+        ...runtimeFiles.map(f => f.kind === 'sidecar-template' ? f.relPath
+          : relative(installDir, hostPathFor(installDir, f.inContainer!) + (f.runtime ? '.tmpl' : ''))),
+      ]),
       launch: { kind: 'script', script: join(installDir, 'run.sh'), ...(userUnitHint !== undefined ? { userUnit: userUnitHint } : {}) },
     };
     writeLockfile(installDir, lock);

@@ -421,8 +421,9 @@ test('R3 production probe: all reviewed bypasses leave every generated file cana
   const out = join(dir, 'out');
   const files = (path: string): string[] => readdirSync(path, { withFileTypes: true })
     .flatMap(entry => entry.isDirectory() ? files(join(path, entry.name)) : [join(path, entry.name)]);
-  const control = run('build', { url: 'https://user-name.1@example.invalid/x.git' });
+  const control = run('build', { url: 'https://user-name.1@example.invalid/x.git' }, ['--pin-refs']);
   expect(control.status).toBe(0);
+  const callsBefore = gitCalls();
   const before = new Map(files(out).map(path => [path, readFileSync(path, 'utf-8')]));
   for (const name of ['Dockerfile', 'README.md', 'connectome.lock']) {
     expect(before.has(join(out, name))).toBe(true);
@@ -446,6 +447,6 @@ test('R3 production probe: all reviewed bypasses leave every generated file cana
       expect(result.status).not.toBe(0);
     }
   }
-  expect(gitCalls()).toBe('');
+  expect(gitCalls()).toBe(callsBefore);
   console.log(`R3 production probe: ${usernames.length * 2} refused builds; ${before.size} files checked per build; no canary or writes`);
 });

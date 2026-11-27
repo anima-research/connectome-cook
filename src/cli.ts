@@ -62,7 +62,8 @@ ${log.bold('Flags:')}
   --image-name <name>    Override the generated image name
   --no-prompts           Non-interactive; warn-and-continue on missing values
   --env-file <path>      Read variable values from this file before prompting
-  --pin-refs             Resolve branch refs to commit SHAs (reproducible build)
+  --pin-refs             Resolve branch/tag refs to commit SHAs; fail if unresolved
+                         Optional; Docker records commits only when pinned.
   --allow-incomplete-templates
                          Write templated config files even when \${VAR}
                          references render as empty.  Default: refuse the
@@ -170,7 +171,7 @@ ${log.bold('Flags:')}
   --strict               Fail if any MCP server / extension can't be materialized
   --no-prompts           Non-interactive (requires --yes to actually install)
   --yes                  Skip the confirm gate
-  --pin-refs             Resolve branch refs to commit SHAs before cloning
+  --pin-refs             Resolve branch/tag refs to commit SHAs; fail if unresolved
   --allow-incomplete-templates
                          Write templated config files even when \${VAR}
                          references render as empty (default: refuse)
@@ -293,6 +294,7 @@ Resolution order:
      (--out dir, ./<name>-cook, then ~/.connectome/installs/<name>) and
      launch the first one found — no re-resolution, no prompts.
   3. Otherwise fall through to the classic build-then-\`docker compose up\`.
+     ${log.bold('--pin-refs')} is optional; Docker records commits only when pinned.
      Pass ${log.bold('--rebuild')} to force this path even when a lock exists.
 
 Build flags are the same as ${log.bold('cook build')}.  Anything after \`--\` goes to

@@ -1,7 +1,11 @@
 import type { McpSource } from './types.js';
 
 /** Reject inline credentials before a source URL can reach logs, git, or artifacts. */
-export function assertCredentialFreeSourceUrl(url: string, location = 'Source URL'): void {
+export function assertCredentialFreeSourceUrl(
+  url: string,
+  location = 'Source URL',
+  options: { allowSuffix?: boolean; allowGitScp?: boolean } = {},
+): void {
   const credentialError = () => new Error(`${location}: embedded credentials are not allowed.`);
   // URL() silently trims whitespace and removes some controls. Reject the raw
   // spelling first, before parsing, logging, or passing it to another tool.
@@ -35,13 +39,34 @@ export function assertCredentialFreeSourceUrl(url: string, location = 'Source UR
   if (userinfo !== undefined) {
     // A colon introduces a password component, including an empty password.
     if (userinfo.includes(':')) throw credentialError();
-    checkUsername(userinfo);
+    for (const part of options.allowGitScp ? userinfo.split('@') : [userinfo]) checkUsername(part);
   }
-  // Source path derivation does not support URL suffixes.
-  if (url.includes('?') || url.includes('#')) {
+  // Git-source path derivation does not support URL suffixes. npm specs do:
+  // callers may preserve their query/ref while retaining all credential checks.
+  if (!options.allowSuffix && (url.includes('?') || url.includes('#'))) {
     throw new Error(`${location}: query strings and fragments are not supported in source URLs.`);
   }
-  // URL-shaped spellings must parse or fail, never fall through as paths.
+  if (options.allowSuffix) {
+    const hashAt = url.indexOf('#');
+    const base = hashAt < 0 ? url : url.slice(0, hashAt);
+    const fragment = hashAt < 0 ? '' : url.slice(hashAt + 1);
+    const queryAt = base.indexOf('?');
+    const query = queryAt < 0 ? '' : base.slice(queryAt + 1);
+    const credentialParam = /^(?:_?auth(?:[_-]?token)?|(?:access[_-]?|private[_-]?)?token|api[_-]?key|password|sig(?:nature)?|x-amz-(?:credential|signature|security-token))$/i;
+    for (const suffix of [query, fragment.replace('?', '&')]) {
+      for (const part of suffix.split('&')) {
+        if (!part.includes('=')) continue; // A bare Git ref isn't a parameter.
+        for (const key of new URLSearchParams(part).keys()) {
+          if (credentialParam.test(key)) throw credentialError();
+        }
+      }
+    }
+  }
+  // npm-package-arg treats git+ssh://host:path as scp unless the colon
+  // introduces a numeric port. Raw userinfo and suffixes were checked above.
+  const scpPath = options.allowGitScp ? /^git\+ssh:\/\/([^:#]+:[^#]+)(?:#.*)?$/.exec(url)?.[1] : undefined;
+  if (scpPath && !/:[0-9]+(\/|$)/.test(scpPath)) return;
+  // Other URL-shaped spellings must parse or fail, never fall through as paths.
   if (!/^(?:\/\/|[a-z][a-z0-9+.-]*:[/\\])/i.test(url)) return; // Local/scp paths.
   let parsed: URL;
   try {
