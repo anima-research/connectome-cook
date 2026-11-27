@@ -3,6 +3,11 @@ import { assertCredentialFreeSourceUrl } from './source-url.js';
 
 const USERNAME_RULE = 'username must be non-empty and contain only ASCII letters, digits, ".", "_" and "-" after percent-decoding';
 
+test('R5-2: the npm scp shortcut requires a lowercase git+ssh scheme', () => {
+  expect(() => assertCredentialFreeSourceUrl('GIT+SSH://alice@example.com:org/repo#main',
+    'Source URL', { allowSuffix: true, allowGitScp: true })).toThrow('invalid source URL');
+});
+
 // Include ordinary non-ASCII text without a token: token detection must not
 // substitute for the username allowlist.
 for (const char of ['\u200b', '\u200c', '\u200d', '\u180e', '\ufeff',

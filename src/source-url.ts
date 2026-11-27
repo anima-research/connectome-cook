@@ -39,7 +39,7 @@ export function assertCredentialFreeSourceUrl(
   if (userinfo !== undefined) {
     // A colon introduces a password component, including an empty password.
     if (userinfo.includes(':')) throw credentialError();
-    checkUsername(userinfo);
+    for (const part of options.allowGitScp ? userinfo.split('@') : [userinfo]) checkUsername(part);
   }
   // Git-source path derivation does not support URL suffixes. npm specs do:
   // callers may preserve their query/ref while retaining all credential checks.
@@ -64,7 +64,7 @@ export function assertCredentialFreeSourceUrl(
   }
   // npm-package-arg treats git+ssh://host:path as scp unless the colon
   // introduces a numeric port. Raw userinfo and suffixes were checked above.
-  const scpPath = options.allowGitScp ? /^git\+ssh:\/\/([^:#]+:[^#]+)(?:#.*)?$/i.exec(url)?.[1] : undefined;
+  const scpPath = options.allowGitScp ? /^git\+ssh:\/\/([^:#]+:[^#]+)(?:#.*)?$/.exec(url)?.[1] : undefined;
   if (scpPath && !/:[0-9]+(\/|$)/.test(scpPath)) return;
   // Other URL-shaped spellings must parse or fail, never fall through as paths.
   if (!/^(?:\/\/|[a-z][a-z0-9+.-]*:[/\\])/i.test(url)) return; // Local/scp paths.

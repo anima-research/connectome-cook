@@ -104,7 +104,7 @@ export function fullCommit(commit: string | undefined, location: string): string
 }
 
 const npmArchive = /\.(?:tgz|tar\.gz|tar)$/i;
-const npmScpHost = /^[^@/\\?#]+@([^@:/\\?#]+):[^#]+/;
+const npmScpHost = /^[^@/\\?#]+@([^:/\\?#]+):[^#]+/;
 
 function isRegistryAliasTarget(target: string): boolean {
   // Registry aliases can still refer to legacy names containing ~'!()*.
