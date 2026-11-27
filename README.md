@@ -95,6 +95,50 @@ Cook probes the candidates, suggests the first hit, lets you confirm or
 override, and exposes the answer as `$SPRING_HOME` — usable in recipe
 `${VAR}` references and install steps, and recorded in the lock.
 
+### Host install scripts
+
+The host install preview and command include `bun install --ignore-scripts`
+for connectome-host. This skips install lifecycle scripts from the project's
+`package.json` and its dependencies, including trusted dependencies. It does
+not change component commands (including npm installs and builds) or Docker
+build commands.
+
+At build time, Cook warns which root lifecycle scripts it skips at the checked-out
+commit. Connectome-host v0.3.2 through v0.14.1 build the Web UI in a root
+`postinstall`. Fresh host builds of these tags (selected with `--ch-ref`) skip
+that script and leave no Web UI bundle, so the Web UI responds with HTTP 503.
+To build the bundle explicitly, run `bun run build:web` in `<installDir>/app`
+after installation (requires Node and npm).
+
+### Absolute local Git sources on the host
+
+Cook uses a plain clone for repositories you own. For a readable absolute
+local path (including `--ch-repo`) owned by another user, Cook uses
+`--no-local` and gives Git's upload-pack an exact-path `safe.directory`
+exception. The exception is supported for bare repositories and checkouts
+with a `.git` directory, not linked worktrees or submodule checkouts with a
+`.git` file. It does not change global Git settings or apply to relative
+paths or explicit URLs such as `file://`, SSH, and HTTPS.
+
+The exception matters on versions whose upload-pack checks ownership (Git
+before 2.48 with the ownership fixes); Git 2.48 and later only need
+`--no-local` for these clones. Cook saves the upload-pack override as
+`remote.origin.uploadpack` for later fetches. On reuse, Cook updates or removes
+the override if ownership is known and the recorded origin URL still matches
+the source. In that checkout, run
+`git config --unset remote.origin.uploadpack` **before** changing origin to
+another repository, so Git does not send the local command and path to it.
+
+Cook removes trailing slashes from absolute local URLs without resolving
+symlinks. For a foreign path containing `*` or a control character, Cook warns
+without printing the path in the warning and uses a plain clone, leaving the
+trust decision to Git.
+If a full commit SHA is missing from a foreign clone (for example, because
+it is only reachable via a custom ref), Cook fetches the SHA from origin and
+retries the checkout. If that fails, specify the full ref name (for example,
+`--ch-ref refs/keep/topic`) or a branch or tag containing the commit. For an
+abbreviated ID, use the full commit ID so Cook can fetch it.
+
 ### Source credentials
 
 Source URLs must not embed password/token userinfo. Bare usernames such as

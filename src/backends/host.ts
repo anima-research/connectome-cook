@@ -35,10 +35,13 @@ import { applyHostDependencies, assertHostDependencyReinstall, parseHostDependen
  */
 
 import { execFileSync, execSync } from 'node:child_process';
-import { chmodSync, cpSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
 import { repositoryIndependentGitEnv } from '../git-env.js';
+import { inspectLocalSource, localSourceUploadPack, normalizeLocalSourceUrl } from '../local-source-git.js';
+import { looksLikeSha } from '../pin-refs.js';
+import { shellQuote } from '../shell-quote.js';
 import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
 import { log } from '../log.js';
 import type { GeneratorInput, McpSource } from '../types.js';
@@ -155,6 +158,23 @@ export function hostBuildCommand(source: McpSource): string {
   }
 }
 
+const BUN_INSTALL_ARGS = ['install', '--ignore-scripts'] as const;
+
+function warnSkippedHostScripts(target: string, commit?: string): void {
+  let scripts: Record<string, unknown> | undefined;
+  try {
+    scripts = JSON.parse(readFileSync(join(target, 'package.json'), 'utf8'))?.scripts;
+  } catch {
+    // This warning is advisory; leave manifest errors to Bun.
+    return;
+  }
+  const skipped = ['preinstall', 'install', 'postinstall', 'prepare']
+    .filter(name => typeof scripts?.[name] === 'string');
+  if (skipped.length) {
+    log.warn(`connectome-host${commit ? ` at ${commit}` : ''}: bun install --ignore-scripts skips root lifecycle scripts: ${skipped.join(', ')}`);
+  }
+}
+
 /** Compute every action the host install would take. Pure. */
 export function planHostActions(plan: InstallPlan, options: HostBackendOptions): HostActions {
   const clones: CloneAction[] = [];
@@ -164,10 +184,10 @@ export function planHostActions(plan: InstallPlan, options: HostBackendOptions):
   clones.push({
     key: 'connectome-host',
     role: 'connectome-host',
-    url: options.chRepoUrl,
+    url: normalizeLocalSourceUrl(options.chRepoUrl),
     ref: options.chRef,
     target: join(options.installDir, 'app'),
-    buildCommand: 'bun install',
+    buildCommand: ['bun', ...BUN_INSTALL_ARGS].join(' '),
     ...(options.chCommit !== undefined ? { commit: options.chCommit } : {}),
   });
 
@@ -194,7 +214,7 @@ export function planHostActions(plan: InstallPlan, options: HostBackendOptions):
     clones.push({
       key: source.key,
       role: source.role === 'extension' ? 'extension' : 'mcp',
-      url: source.url,
+      url: normalizeLocalSourceUrl(source.url),
       ref: source.ref,
       target: hostPathFor(options.installDir, source.inContainerPath),
       buildCommand: hostBuildCommand(source),
@@ -218,7 +238,7 @@ export function planHostActions(plan: InstallPlan, options: HostBackendOptions):
 export function bindHostEngine(actions: HostActions, bunPath: string): void {
   const host = actions.clones.find(action => action.role === 'connectome-host');
   if (!host) throw new Error('E_HOST_ENGINE_PLAN: connectome-host clone is missing');
-  host.buildCommand = shellQuote(bunPath) + ' install';
+  host.buildCommand = [shellQuote(bunPath), ...BUN_INSTALL_ARGS].join(' ');
 }
 
 /** Render the confirm-gate preview. Pure (string). */
@@ -279,6 +299,34 @@ export function isSatisfiedByLock(
     && (action.commit === undefined || entry.commit === action.commit);
 }
 
+function refreshOriginUploadPack(action: CloneAction, sourceUrl: string): void {
+  // Target the checkout's own config, never an enclosing repo or user config.
+  const config = join(action.target, '.git', 'config');
+  if (!existsSync(config)) return;
+  const git = (...args: string[]) => execFileSync('git', ['config', '--file', config, ...args], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const read = (key: string, ...args: string[]) => {
+    try { return git(...args, '--null', '--get-all', key); }
+    catch (err) {
+      if ((err as { status?: number }).status === 1) return '';
+      throw err;
+    }
+  };
+  // Compare the raw URL (not Git's insteadOf rewrite) and refuse ambiguity.
+  if (read('remote.origin.url', '--includes') !== action.url + '\0') return;
+  const source = inspectLocalSource(sourceUrl, action.role === 'connectome-host' ? '--ch-repo' : 'Component source URL');
+  if (!source) return;
+  const { uploadPack } = source;
+  const key = 'remote.origin.uploadpack';
+  const current = read(key);
+  if (uploadPack !== undefined) {
+    if (current !== uploadPack + '\0') git('--replace-all', key, uploadPack);
+  } else if (current !== '') {
+    git('--unset-all', key);
+  }
+}
+
 /** Clone URL with an optional token (resolved values > environment; never
  *  logged). The credentialed form is briefly visible in the process list
  *  during the clone; executeClone scrubs it from .git/config afterwards. */
@@ -298,6 +346,8 @@ function cloneUrlFor(action: CloneAction, values: Record<string, string>): strin
 interface CloneContext {
   /** Scratch store holding the commit engine preflight inspected. */
   sourceDir?: string | undefined;
+  /** Selected using the original URL, before preflight resolves relative paths. */
+  sourceUploadPack?: string | undefined;
   /** Runs once the checkout exists, before anything is written into or installed in it. */
   beforeBuild?: (() => void) | undefined;
   dependencies?: LockedHostDependency[] | undefined;
@@ -309,6 +359,10 @@ interface CloneContext {
   bun?: string | undefined;
 }
 
+function firstStderrLine(err: unknown): string | undefined {
+  return (err as { stderr?: string | Buffer } | null)?.stderr?.toString().split(/\r?\n/, 1)[0];
+}
+
 /** Execute one clone+build action. Throws on failure; the caller removes
  *  the target on failure so no half-built checkout survives. */
 async function executeClone(
@@ -318,9 +372,39 @@ async function executeClone(
   // A dependency preflight checkout already holds the inspected commit.
   const sourceDir = preparedCheckout ? undefined : context.sourceDir;
   const env = repositoryIndependentGitEnv();
-  const git = (args: string[], cwd?: string) => commands
-    ? commands.run('git', args, cwd ?? process.cwd(), true, env)
-    : execFileSync('git', args, { env, cwd, stdio: ['ignore', 'inherit', 'inherit'] });
+  const git = (args: string[], cwd?: string, inherit = true) => commands
+    ? commands.run('git', args, cwd ?? process.cwd(), inherit, env)
+    : execFileSync('git', args, { env, cwd, stdio: inherit ? ['ignore', 'inherit', 'inherit'] : 'pipe' });
+  const uploadPack = preparedCheckout ? undefined : sourceDir ? context.sourceUploadPack
+    : localSourceUploadPack(action.url, action.role === 'connectome-host' ? '--ch-repo' : 'Component source URL');
+  const checkout = async (ref: string) => {
+    const fetchBySha = !!uploadPack && looksLikeSha(ref);
+    try { await git(['checkout', ref], action.target, !fetchBySha); }
+    catch (err) {
+      if (!uploadPack || !/^[a-f0-9]{4,64}$/i.test(ref)) throw err;
+      let fetchReason: string | undefined;
+      if (fetchBySha) {
+        try {
+          await git(['fetch', 'origin', ref], action.target, false);
+        } catch (fetchErr) {
+          fetchReason = firstStderrLine(fetchErr) || (fetchErr instanceof Error ? fetchErr.message : String(fetchErr));
+        }
+        if (fetchReason === undefined) {
+          await git(['checkout', ref], action.target);
+          return;
+        }
+      }
+      const message = (err as Error).message.trimEnd();
+      const checkoutReason = firstStderrLine(err);
+      throw new Error([
+        message,
+        // execFileSync already includes stderr; PinnedCommands does not.
+        checkoutReason && !message.includes(checkoutReason) ? checkoutReason : undefined,
+        fetchReason,
+        `Cook could not fetch ${ref} from origin; specify the full ref name, a branch or tag containing it, or the full commit ID.`,
+      ].filter(Boolean).join('\n'));
+    }
+  };
   rmSync(action.target, { recursive: true, force: true });
   mkdirSync(resolve(action.target, '..'), { recursive: true });
 
@@ -340,8 +424,10 @@ async function executeClone(
       localGit(['clone', '--origin', 'origin', '--no-reject-shallow', '--no-hardlinks', '--branch', 'cook-selected', '--', sourceDir, action.target], 'clone inspected source');
       localGit(['-C', action.target, 'remote', 'set-url', 'origin', action.url], 'set-url origin');
     } else {
-      await git([...sslArgs, 'clone', cloneUrlFor(action, values), action.target]);
+      const localArgs = uploadPack ? ['--origin', 'origin', '--no-local', '-u', uploadPack] : [];
+      await git([...sslArgs, 'clone', ...localArgs, cloneUrlFor(action, values), action.target]);
     }
+    if (uploadPack) await git(['config', 'remote.origin.uploadpack', uploadPack], action.target);
     if (action.authSecret) {
       // Scrub the token from .git/config — the credentialed URL must not
       // persist on disk (backups, shared machines, later `git fetch`).
@@ -359,14 +445,14 @@ async function executeClone(
         try { execFileSync('git', ['checkout', action.commit], { env, cwd: action.target, stdio: ['ignore', 'pipe', 'pipe'] }); }
         catch { throw new Error('E_HOST_ENGINE_CHECKOUT: git checkout inspected commit failed'); }
       } else {
-        await git(['checkout', action.commit], action.target);
+        await checkout(action.commit);
       }
     } else if (action.ref && action.ref !== 'main') {
       if (action.ref.startsWith('refs/')) {
         await git(['fetch', 'origin', `${action.ref}:cook-install-checkout`], action.target);
         await git(['checkout', 'cook-install-checkout'], action.target);
       } else {
-        await git(['checkout', action.ref], action.target);
+        await checkout(action.ref);
       }
     }
   }
@@ -391,10 +477,11 @@ async function executeClone(
     onDependencyMutation?.();
   }
   if (action.buildCommand) {
+    if (action.role === 'connectome-host') warnSkippedHostScripts(action.target, commit);
     log.step(`building ${log.dim(action.target)}: ${action.buildCommand}`);
     // The fixed host build needs no shell: Bun itself must be the direct child
     // so PID-only cancellation stops it, without signaling any helpers.
-    if (commands && action.role === 'connectome-host') await commands.run(context.bun ?? 'bun', ['install'], action.target, true, buildEnv);
+    if (commands && action.role === 'connectome-host') await commands.run(context.bun ?? 'bun', [...BUN_INSTALL_ARGS], action.target, true, buildEnv);
     else if (commands) await commands.run('/bin/sh', ['-c', action.buildCommand], action.target, true, buildEnv);
     else execSync(action.buildCommand, {
       cwd: action.target,
@@ -441,11 +528,6 @@ function warnServiceNameNetworking(
       `the native agent must use the sidecar's published localhost port (e.g. http://localhost:<port>).`,
     );
   }
-}
-
-/** Shell-safe single-quoted value for the sourceable .env. */
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 function renderShellEnvFile(values: Record<string, string>): string {
@@ -528,7 +610,7 @@ export async function runHostBackend(
   plan: InstallPlan,
   options: HostBackendOptions,
 ): Promise<BuildResult> {
-  // Preflight every source before previewing URLs or making any changes.
+  // Reject source credentials before previewing URLs or making any changes.
   assertCredentialFreeSourceUrl(options.chRepoUrl, '--ch-repo');
   for (const source of plan.sources) {
     assertCredentialFreeSourceUrl(source.url, `${sourceLocation(source)}.url`);
@@ -591,7 +673,7 @@ async function runWithSelectedEngines(
     signals.forEach((signal, i) => process.on(signal, handlers[i]!));
     try {
       const checked = preflightHostEngines(options.chRepoUrl, options.chCommit ?? options.chRef, options.bunPath, options.nodePath, cleanup => { removeScratch = cleanup; });
-      options = { ...options, chRepoUrl: checked.sourceUrl, chCommit: checked.commit };
+      options = { ...options, chCommit: checked.commit };
       return await materializeHost(plan, options, checked, onStaged, commands);
     } finally {
       // Sync git/build subprocesses defer JS signal delivery. Drain pending
@@ -624,6 +706,10 @@ async function materializeHost(
 
   const hasRecordedPins = assertHostDependencyReinstall(installDir, existingLock?.hostDependencies, dependencyInputs, options.dropHostDependencies);
   const dependencies = dependencyInputs.length ? await preflightHostDependencies(options.chRepoUrl, options.chCommit ?? options.chRef, dependencyInputs, installDir, onStaged, commands) : undefined;
+  // Dependency preflight needs the original URL to distinguish relative paths.
+  // Reuse also needs the original spelling to preserve that distinction.
+  const hostSourceUrl = options.chRepoUrl;
+  if (checked) options = { ...options, chRepoUrl: checked.sourceUrl };
   if (dependencies) {
     installDir = dependencies.installDir;
     options = { ...options, installDir, chCommit: dependencies.commit };
@@ -750,9 +836,12 @@ async function materializeHost(
       ? () => { engines = checked.recheck(action.target); } : undefined;
     let commit: string | undefined;
     if (canReuse(action)) {
-      try { recheck?.(); }
+      try {
+        recheck?.();
+        refreshOriginUploadPack(action, action.role === 'connectome-host' ? hostSourceUrl : action.url);
+      }
       catch (err) {
-        // A directory-sensitive shim can change even on a reusable checkout.
+        // A directory-sensitive shim or origin config can fail even on reuse.
         if (existingLockOnDisk) writeLockfile(installDir, { ...existingLockOnDisk, incomplete: true });
         log.error(err instanceof Error ? err.message : String(err));
         return { exitCode: 3, outDir: installDir };
@@ -766,6 +855,7 @@ async function materializeHost(
         const isHost = action.role === 'connectome-host';
         commit = (await executeClone(action, plan.values, buildEnv, {
           sourceDir: isHost ? checked?.sourceDir : undefined,
+          sourceUploadPack: isHost ? checked?.uploadPack : undefined,
           beforeBuild: recheck,
           dependencies: isHost ? dependencies?.records : undefined,
           onDependencyMutation: () => { keepSnapshots = true; },
@@ -989,7 +1079,7 @@ async function materializeHost(
       recipePath: plan.recipePath,
       createdAt: new Date().toISOString(),
       connectomeHost: {
-        url: options.chRepoUrl,
+        url: normalizeLocalSourceUrl(options.chRepoUrl),
         ref: options.chRef,
         path: join(installDir, 'app'),
         ...(chCommit !== undefined ? { commit: chCommit } : {}),

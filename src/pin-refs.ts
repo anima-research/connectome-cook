@@ -11,9 +11,16 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { localSourceUploadPack, normalizeLocalSourceUrl } from './local-source-git.js';
 import { assertCredentialFreeSourceUrl, sourceLocation } from './source-url.js';
 import { log } from './log.js';
 import type { McpSource } from './types.js';
+
+interface PinOptions {
+  hostLocal?: boolean;
+  /** Source label for local trust warnings, without any path. */
+  localSourceLocation?: string;
+}
 
 /** Only full SHA-1 or SHA-256 object IDs are trusted without remote lookup. */
 export function looksLikeSha(ref: string): boolean {
@@ -31,12 +38,15 @@ export function candidateRefNames(ref: string): string[] {
  * Returns null if no candidate ref exists; throws with diagnostics on remote failure.
  */
 export function resolveRemoteRef(
-  url: string, ref: string, sslBypass = false, location = 'Source URL',
+  url: string, ref: string, sslBypass = false, location = 'Source URL', options: PinOptions = {},
 ): string | null {
   assertCredentialFreeSourceUrl(url, location);
+  const uploadPack = options.hostLocal ? localSourceUploadPack(url, options.localSourceLocation ?? 'Component source URL') : undefined;
   if (looksLikeSha(ref)) return ref.toLowerCase();
+  if (options.hostLocal) url = normalizeLocalSourceUrl(url);
   for (const candidate of candidateRefNames(ref)) {
-    const args = [...(sslBypass ? ['-c', 'http.sslVerify=false'] : []), 'ls-remote', url, candidate];
+    const args = [...(sslBypass ? ['-c', 'http.sslVerify=false'] : []), 'ls-remote',
+      ...(uploadPack ? [`--upload-pack=${uploadPack}`] : []), url, candidate];
     let output: string;
     try {
       output = execFileSync('git', args, {
@@ -72,12 +82,13 @@ export function resolveRemoteRef(
  * sibling-copy, and already-pinned entries. Private symbolic refs are
  * refused: pinning does not implement an authSecret handoff.
  */
-export function pinSources(sources: McpSource[]): void {
+export function pinSources(sources: McpSource[], options: PinOptions = {}): void {
   for (const source of sources) {
     const location = sourceLocation(source);
     assertCredentialFreeSourceUrl(source.url, `${location}.url`);
-    if (!source.url || source.commit) continue;
-    if (source.install.kind === 'npm-global' || source.install.kind === 'sibling-copy') continue;
+    if (!source.url || source.install.kind === 'npm-global' || source.install.kind === 'sibling-copy') continue;
+    if (options.hostLocal) source.url = normalizeLocalSourceUrl(source.url);
+    if (source.commit) continue;
     if (looksLikeSha(source.ref)) {
       source.commit = source.ref.toLowerCase();
       continue;
@@ -85,7 +96,7 @@ export function pinSources(sources: McpSource[]): void {
     if (source.authSecret) {
       throw new Error(`--pin-refs: ${location}: cannot resolve private refs with authSecret; supply a full commit SHA.`);
     }
-    const sha = resolveRemoteRef(source.url, source.ref, source.sslBypass, location);
+    const sha = resolveRemoteRef(source.url, source.ref, source.sslBypass, location, options);
     if (sha) {
       source.commit = sha;
       log.info(`--pin-refs: ${log.dim(source.url)}@${source.ref} → ${sha.slice(0, 12)}`);

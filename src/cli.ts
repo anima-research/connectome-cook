@@ -236,11 +236,13 @@ async function handleInstall(argv: string[]): Promise<number> {
     log.step(flags['bun-path'] !== undefined || flags['node-path'] !== undefined
       ? 'pinning component refs (git ls-remote); host bound by engine preflight'
       : 'pinning refs (git ls-remote)');
-    pinSources(planResult.plan.sources);
+    pinSources(planResult.plan.sources, { hostLocal: true });
     // Engine preflight fetches and binds the host itself; avoid ls-remote too.
     if (flags['bun-path'] === undefined && flags['node-path'] === undefined) {
       const chLocation = `connectome-host (${chRepoUrl})`;
-      const chSha = resolveRemoteRef(chRepoUrl, chRef, false, chLocation);
+      const chSha = resolveRemoteRef(chRepoUrl, chRef, false, chLocation, {
+        hostLocal: true, localSourceLocation: '--ch-repo',
+      });
       if (chSha) {
         chCommit = chSha;
         log.info(`--pin-refs: ${chLocation}@${chRef} → ${chSha.slice(0, 12)}`);

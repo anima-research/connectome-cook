@@ -29,6 +29,21 @@ function install(flags = true, env = process.env) {
   return spawnSync(process.execPath, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, '--ch-ref', 'main', '--no-prompts', '--yes', ...(flags ? ['--bun-path', bun, '--node-path', node] : [])], { encoding: 'utf8', env });
 }
 
+test('default host install previews --ignore-scripts and reports the skipped postinstall', () => {
+  writeFileSync(join(repo, 'package.json'), JSON.stringify({
+    name: 'host-fixture', scripts: { postinstall: 'touch host-postinstall' },
+  }));
+  git('commit', '-am', 'Add host postinstall');
+  const commit = git('rev-parse', 'HEAD');
+  script(bun, `exec '${process.execPath}' "$@" --offline`);
+  const result = install(false, { ...process.env, PATH: dir + ':' + process.env.PATH });
+  expect(result.status).toBe(0);
+  expect(existsSync(join(out, 'app', 'host-postinstall'))).toBe(false);
+  expect(result.stdout).toContain('then run: bun install --ignore-scripts');
+  expect(result.stderr).toContain(`connectome-host at ${commit}: bun install --ignore-scripts skips root lifecycle scripts: postinstall\n`);
+  expect(result.stderr).not.toContain('touch host-postinstall');
+});
+
 test('R1 diagnostics: distinct safe path, execution, version and range errors', () => {
   expect(() => selected.checkEngine('relative', '*')).toThrow('E_HOST_ENGINE_PATH');
   expect(() => selected.checkEngine(join(dir, 'missing'), '*')).toThrow('not a readable executable file');
@@ -135,7 +150,7 @@ test('R1 role lookup: engine binding ignores clone array order', async () => {
   ], copies: [], skipped: [], localExtensionPaths: new Map<string, string>() };
   host.bindHostEngine(actions, bun);
   expect(actions.clones[0]!.buildCommand).toBe('make');
-  expect(actions.clones[1]!.buildCommand).toBe(`'${bun}' install`);
+  expect(actions.clones[1]!.buildCommand).toBe(`'${bun}' install --ignore-scripts`);
 });
 
 test('R1 pinned acquisition: --pin-refs does not look up the host twice', () => {

@@ -8,6 +8,7 @@ import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import * as fs from 'node:fs';
+import { foreignGitTest, markForeign, originUploadPack } from './test-support/foreign-git.js';
 import { archivePackage, preflightHostDependencies, parseHostDependencies, verifyHostDependencyResolutions } from './host-dependency.js';
 
 let dir: string, repo: string, out: string, recipe: string, archive: string, digest: string, shim: string;
@@ -35,8 +36,8 @@ function host(range: unknown = '^1.0.0', section = 'dependencies') {
   git(['add', 'package.json']); git(['commit', '--allow-empty', '-m', 'Synthetic host']);
 }
 function option(name = 'fixture-local-input', path = archive, hash = digest) { return `${name}=${path}#sha256=${hash}`; }
-function install(extra: string[] = ['--host-dependency', option()], env: NodeJS.ProcessEnv = {}) {
-  const result = spawnSync(realBun, [resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, ...(extra.includes('--ch-ref') ? [] : ['--ch-ref', 'main']), '--no-prompts', '--yes', ...extra], {
+function install(extra: string[] = ['--host-dependency', option()], env: NodeJS.ProcessEnv = {}, bunArgs: string[] = []) {
+  const result = spawnSync(realBun, [...bunArgs, resolve('bin/cook'), 'install', recipe, '--out', out, '--ch-repo', repo, ...(extra.includes('--ch-ref') ? [] : ['--ch-ref', 'main']), '--no-prompts', '--yes', ...extra], {
     encoding: 'utf8', env: { ...process.env, TMPDIR: join(dir, 'staging'), PATH: shim + ':' + process.env.PATH, ...env },
   });
   if (result.status === 0 && existsSync(join(out, 'connectome.lock'))) {
@@ -64,6 +65,38 @@ beforeEach(() => {
 afterEach(() => {
   for (const path of snapshots) rmSync(path, { recursive: true, force: true });
   rmSync(dir, { recursive: true, force: true });
+});
+test('host dependency install skips root lifecycle scripts in the direct Bun invocation', () => {
+  const pkg = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8'));
+  pkg.scripts = { postinstall: 'touch host-postinstall' };
+  writeFileSync(join(repo, 'package.json'), JSON.stringify(pkg));
+  git(['commit', '-qam', 'Add host postinstall']);
+  const r = install();
+  expect(r.status).toBe(0);
+  expect(existsSync(join(out, 'app', 'host-postinstall'))).toBe(false);
+});
+foreignGitTest('foreign local host retains the upload-pack exception after dependency staging', () => {
+  const { gitEnv, bunArgs } = markForeign(dir, shim, [repo], process.env);
+  const r = install(undefined, gitEnv, bunArgs);
+  expect(r.status).toBe(0);
+  expect(originUploadPack(join(out, 'app'), gitEnv)).toBe(
+    `git -c 'safe.directory=${repo}' -c 'safe.directory=${repo}/.git' upload-pack`,
+  );
+});
+foreignGitTest('pinned commands retain checkout and fetch diagnostics for an unavailable component SHA', () => {
+  const component = join(dir, 'component');
+  execFileSync('git', ['clone', '-q', repo, component], { stdio: 'pipe' });
+  const ref = 'f'.repeat(40);
+  writeFileSync(recipe, JSON.stringify({ name: 'Synthetic', agent: { systemPrompt: 'Test only' },
+    mcpServers: { comp: { command: 'node', args: ['index.js'],
+      source: { url: component, ref, install: { runtime: 'custom', run: 'true' } } } },
+  }));
+  const { gitEnv, bunArgs } = markForeign(dir, shim, [component], process.env);
+  const result = install(undefined, gitEnv, bunArgs);
+  expect(result.status).toBe(3);
+  expect(result.stderr).toMatch(/fatal: (reference is not a tree|invalid reference):/);
+  expect(result.stderr).toMatch(/not our ref|unadvertised object/);
+  expect(result.stderr).toContain(`Cook could not fetch ${ref} from origin`);
 });
 test('CLI installs the artifact version offline, previews and records direct/override deltas and pinned commit', () => {
   const commit = git(['rev-parse', 'HEAD']);
