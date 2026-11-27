@@ -122,28 +122,33 @@ foreignGitTest('foreign local host engine preflight can fetch and probe missing 
   checkLock();
 });
 
-for (const character of ['*', '\u0085']) foreignGitTest(`foreign local source refuses ${character === '*' ? 'wildcards' : 'controls'} before creating the install`, () => {
+for (const character of ['*', '\u0085']) foreignGitTest(`foreign local source leaves ${character === '*' ? 'wildcards' : 'controls'} to Git's trust decision`, () => {
   const bad = join(dir, 'private' + character + 'path');
   renameSync(component, bad);
   foreign([host, bad]);
   writeRecipe(bad);
   const result = install();
   expect(result.status).not.toBe(0);
-  expect(result.stderr).toContain('E_LOCAL_SOURCE_PATH:');
-  expect(result.stderr + result.stdout).not.toContain(bad);
-  expect(existsSync(out)).toBe(false);
+  expect(result.stderr).toContain('dubious ownership');
+  expect(existsSync(join(out, 'private' + character + 'path'))).toBe(false);
 });
 
-for (const character of ['*', '\u0085']) foreignGitTest(`--pin-refs does not echo a foreign host path with ${character === '*' ? 'wildcards' : 'controls'}`, () => {
+for (const character of ['*', '\u0085']) foreignGitTest(`Git-trusted foreign host with ${character === '*' ? 'wildcards' : 'controls'} clones and reuses without an override`, () => {
   const bad = join(dir, 'private' + character + 'path');
   renameSync(host, bad);
+  const sha = hiddenCommit(bad);
   foreign([bad]);
-  for (const ref of ['main', 'f'.repeat(40)]) {
-    const result = install(ref, ['--pin-refs'], bad);
-    expect(result.status).not.toBe(0);
-    expect(result.stderr + result.stdout).not.toContain(bad);
-    expect(result.stderr).toContain('E_LOCAL_SOURCE_PATH: --ch-repo:');
-    expect(existsSync(out)).toBe(false);
+  git(dir, 'config', '--global', '--add', 'safe.directory', bad + '/.git');
+  for (const reuse of [false, true]) {
+    const result = install(sha, reuse ? [] : ['--pin-refs'], bad);
+    expect(result.status).toBe(0);
+    const warnings = result.stderr.split('\n').filter(line => line.startsWith('! --ch-repo:'));
+    expect(warnings.length).toBeGreaterThan(0);
+    expect(warnings.join('\n')).not.toContain(bad);
+    expect(warnings.join('\n')).toContain('leaving trust to Git');
+    if (reuse) expect(result.stdout.match(/unchanged /g)).toHaveLength(2);
+    checkOrigin('app', bad, false);
+    expect(git(join(out, 'app'), 'rev-parse', 'HEAD')).toBe(sha);
   }
 });
 
@@ -169,10 +174,27 @@ foreignGitTest('foreign local source fetches a SHA only reachable from a custom 
 
 foreignGitTest('foreign local source still gives guidance for an unavailable SHA', () => {
   foreign();
-  const result = install('f'.repeat(40));
+  const sha = 'f'.repeat(40);
+  const result = install(sha);
   expect(result.status).not.toBe(0);
-  expect(result.stderr).toContain('specify the full ref name');
+  expect(result.stderr).toMatch(/not our ref|unadvertised object/);
+  expect(result.stderr).toContain(`Cook could not fetch ${sha} from origin; specify the full ref name, a branch or tag containing it, or the full commit ID.`);
   expect(existsSync(join(out, 'app'))).toBe(false);
+});
+
+foreignGitTest('reuse preserves the upload-pack override while the source is missing', () => {
+  foreign([host]);
+  expect(install().status).toBe(0);
+  const checkout = join(out, 'app');
+  const uploadPack = originUploadPack(checkout, env);
+  expect(uploadPack).toBeDefined();
+  renameSync(host, host + '.away');
+  const next = install();
+  expect(next.status).toBe(0);
+  expect(next.stdout.match(/unchanged /g)).toHaveLength(2);
+  expect(originUploadPack(checkout, env)).toBe(uploadPack);
+  renameSync(host + '.away', host);
+  checkOrigin('app', host, true);
 });
 
 for (const startsForeign of [false, true]) foreignGitTest(`reused checkouts refresh upload-pack (${startsForeign ? 'foreign to owned' : 'owned to foreign'})`, () => {
@@ -229,4 +251,10 @@ test('an HTTPS source rewritten by Git does not get a local exception', () => {
   writeFileSync(join(dir, 'gitconfig'), `[url "${component}"]\n\tinsteadOf = ${url}\n`);
   expect(install().status).toBe(0);
   checkOrigin('component', url, false);
+  const checkout = join(out, 'component');
+  git(checkout, 'config', 'remote.origin.uploadpack', '/operator/bin/git-upload-pack');
+  const next = install();
+  expect(next.status).toBe(0);
+  expect(next.stdout.match(/unchanged /g)).toHaveLength(2);
+  expect(originUploadPack(checkout, env)).toBe('/operator/bin/git-upload-pack');
 });

@@ -18,7 +18,7 @@ import type { McpSource } from './types.js';
 
 interface PinOptions {
   hostLocal?: boolean;
-  /** Path-validation label, which must not echo the path itself. */
+  /** Source label for local trust warnings, without any path. */
   localSourceLocation?: string;
 }
 
@@ -41,7 +41,7 @@ export function resolveRemoteRef(
   url: string, ref: string, sslBypass = false, location = 'Source URL', options: PinOptions = {},
 ): string | null {
   assertCredentialFreeSourceUrl(url, location);
-  const uploadPack = options.hostLocal ? localSourceUploadPack(url, options.localSourceLocation ?? location) : undefined;
+  const uploadPack = options.hostLocal ? localSourceUploadPack(url, options.localSourceLocation ?? 'Component source URL') : undefined;
   if (looksLikeSha(ref)) return ref.toLowerCase();
   if (options.hostLocal) url = normalizeLocalSourceUrl(url);
   for (const candidate of candidateRefNames(ref)) {

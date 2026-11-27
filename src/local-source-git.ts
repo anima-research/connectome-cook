@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { log } from './log.js';
 import { shellQuote } from './shell-quote.js';
 
 function isAbsoluteLocalSource(url: string): boolean {
@@ -10,10 +11,11 @@ export function normalizeLocalSourceUrl(url: string): string {
   return isAbsoluteLocalSource(url) ? url.replace(/\/+$/, '') || '/' : url;
 }
 
-/** Select an exact-path exception only for an explicitly absolute, foreign
- * bare repository or checkout with a .git directory. Gitfiles (linked
- * worktrees/submodules) don't use this exception. */
-export function localSourceUploadPack(url: string, location: string): string | undefined {
+/** Return undefined if ownership is unknown or out of scope. A result with no
+ * override leaves trust to Git. Gitfiles (linked worktrees/submodules) are
+ * out of scope; only bare directories and checkouts with a .git directory
+ * qualify. */
+export function inspectLocalSource(url: string, location: string): { uploadPack?: string } | undefined {
   if (!isAbsoluteLocalSource(url)) return;
   const uid = process.geteuid?.();
   if (uid === undefined) return;
@@ -26,9 +28,15 @@ export function localSourceUploadPack(url: string, location: string): string | u
     // Let Git diagnose missing/inaccessible sources without granting trust.
     return;
   }
-  if (!owner?.isDirectory() || owner.uid === uid) return;
+  if (!owner?.isDirectory()) return;
+  if (owner.uid === uid) return {};
   if (/[*\p{Cc}]/u.test(path)) {
-    throw new Error(`E_LOCAL_SOURCE_PATH: ${location}: foreign local source paths must not contain '*' or control characters.`);
+    log.warn(`${location}: no exact-path exception for a foreign local source with '*' or control characters; leaving trust to Git.`);
+    return {};
   }
-  return `git -c ${shellQuote('safe.directory=' + path)} -c ${shellQuote('safe.directory=' + gitDir)} upload-pack`;
+  return { uploadPack: `git -c ${shellQuote('safe.directory=' + path)} -c ${shellQuote('safe.directory=' + gitDir)} upload-pack` };
+}
+
+export function localSourceUploadPack(url: string, location: string): string | undefined {
+  return inspectLocalSource(url, location)?.uploadPack;
 }

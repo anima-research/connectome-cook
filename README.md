@@ -124,17 +124,20 @@ The exception matters on versions whose upload-pack checks ownership (Git
 before 2.48 with the ownership fixes); Git 2.48 and later only need
 `--no-local` for these clones. Cook saves the upload-pack override as
 `remote.origin.uploadpack` for later fetches. On reuse, Cook updates or removes
-the override to match current ownership if the recorded origin URL still
-matches the source. In that checkout, run
+the override if ownership is known and the recorded origin URL still matches
+the source. In that checkout, run
 `git config --unset remote.origin.uploadpack` **before** changing origin to
 another repository, so Git does not send the local command and path to it.
 
 Cook removes trailing slashes from absolute local URLs without resolving
-symlinks. The foreign-owner exception refuses `*` and control characters.
+symlinks. For a foreign path containing `*` or a control character, Cook warns
+without printing the path in the warning and uses a plain clone, leaving the
+trust decision to Git.
 If a full commit SHA is missing from a foreign clone (for example, because
 it is only reachable via a custom ref), Cook fetches the SHA from origin and
 retries the checkout. If that fails, specify the full ref name (for example,
-`--ch-ref refs/keep/topic`) or a branch or tag containing the commit.
+`--ch-ref refs/keep/topic`) or a branch or tag containing the commit. For an
+abbreviated ID, use the full commit ID so Cook can fetch it.
 
 ### Source credentials
 

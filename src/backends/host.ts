@@ -39,7 +39,7 @@ import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlink
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import promptsLib from 'prompts';
 import { repositoryIndependentGitEnv } from '../git-env.js';
-import { localSourceUploadPack, normalizeLocalSourceUrl } from '../local-source-git.js';
+import { inspectLocalSource, localSourceUploadPack, normalizeLocalSourceUrl } from '../local-source-git.js';
 import { looksLikeSha } from '../pin-refs.js';
 import { shellQuote } from '../shell-quote.js';
 import { assertCredentialFreeSourceUrl, sourceLocation } from '../source-url.js';
@@ -315,7 +315,9 @@ function refreshOriginUploadPack(action: CloneAction, sourceUrl: string): void {
   };
   // Compare the raw URL (not Git's insteadOf rewrite) and refuse ambiguity.
   if (read('remote.origin.url', '--includes') !== action.url + '\0') return;
-  const uploadPack = localSourceUploadPack(sourceUrl, action.role === 'connectome-host' ? '--ch-repo' : 'Component source URL');
+  const source = inspectLocalSource(sourceUrl, action.role === 'connectome-host' ? '--ch-repo' : 'Component source URL');
+  if (!source) return;
+  const { uploadPack } = source;
   const key = 'remote.origin.uploadpack';
   const current = read(key);
   if (uploadPack !== undefined) {
@@ -357,6 +359,10 @@ interface CloneContext {
   bun?: string | undefined;
 }
 
+function firstStderrLine(err: unknown): string | undefined {
+  return (err as { stderr?: string | Buffer } | null)?.stderr?.toString().split(/\r?\n/, 1)[0];
+}
+
 /** Execute one clone+build action. Throws on failure; the caller removes
  *  the target on failure so no half-built checkout survives. */
 async function executeClone(
@@ -376,16 +382,27 @@ async function executeClone(
     try { await git(['checkout', ref], action.target, !fetchBySha); }
     catch (err) {
       if (!uploadPack || !/^[a-f0-9]{4,64}$/i.test(ref)) throw err;
+      let fetchReason: string | undefined;
       if (fetchBySha) {
         try {
           await git(['fetch', 'origin', ref], action.target, false);
+        } catch (fetchErr) {
+          fetchReason = firstStderrLine(fetchErr) || (fetchErr instanceof Error ? fetchErr.message : String(fetchErr));
+        }
+        if (fetchReason === undefined) {
           await git(['checkout', ref], action.target);
           return;
-        } catch {
-          // Keep the original checkout error and the full-ref guidance.
         }
       }
-      throw new Error(`${(err as Error).message} A foreign local source cloned with --no-local may not include commits outside branches and tags. To fetch a commit from another ref, specify the full ref name (refs/...), or use a branch or tag containing it.`);
+      const message = (err as Error).message.trimEnd();
+      const checkoutReason = firstStderrLine(err);
+      throw new Error([
+        message,
+        // execFileSync already includes stderr; PinnedCommands does not.
+        checkoutReason && !message.includes(checkoutReason) ? checkoutReason : undefined,
+        fetchReason,
+        `Cook could not fetch ${ref} from origin; specify the full ref name, a branch or tag containing it, or the full commit ID.`,
+      ].filter(Boolean).join('\n'));
     }
   };
   rmSync(action.target, { recursive: true, force: true });
@@ -593,15 +610,10 @@ export async function runHostBackend(
   plan: InstallPlan,
   options: HostBackendOptions,
 ): Promise<BuildResult> {
-  // Preflight every source before previewing URLs or making any changes.
+  // Reject source credentials before previewing URLs or making any changes.
   assertCredentialFreeSourceUrl(options.chRepoUrl, '--ch-repo');
-  localSourceUploadPack(options.chRepoUrl, '--ch-repo');
   for (const source of plan.sources) {
-    const location = `${sourceLocation(source)}.url`;
-    assertCredentialFreeSourceUrl(source.url, location);
-    if (source.install.kind !== 'npm-global' && source.install.kind !== 'sibling-copy') {
-      localSourceUploadPack(source.url, location);
-    }
+    assertCredentialFreeSourceUrl(source.url, `${sourceLocation(source)}.url`);
   }
   if (options.userUnit !== undefined) {
     if (!options.bunPath || !options.nodePath) throw new Error('E_HOST_UNIT: --user-unit requires both --bun-path and --node-path');

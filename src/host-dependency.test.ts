@@ -83,6 +83,21 @@ foreignGitTest('foreign local host retains the upload-pack exception after depen
     `git -c 'safe.directory=${repo}' -c 'safe.directory=${repo}/.git' upload-pack`,
   );
 });
+foreignGitTest('pinned commands retain checkout and fetch diagnostics for an unavailable component SHA', () => {
+  const component = join(dir, 'component');
+  execFileSync('git', ['clone', '-q', repo, component], { stdio: 'pipe' });
+  const ref = 'f'.repeat(40);
+  writeFileSync(recipe, JSON.stringify({ name: 'Synthetic', agent: { systemPrompt: 'Test only' },
+    mcpServers: { comp: { command: 'node', args: ['index.js'],
+      source: { url: component, ref, install: { runtime: 'custom', run: 'true' } } } },
+  }));
+  const { gitEnv, bunArgs } = markForeign(dir, shim, [component], process.env);
+  const result = install(undefined, gitEnv, bunArgs);
+  expect(result.status).toBe(3);
+  expect(result.stderr).toMatch(/fatal: (reference is not a tree|invalid reference):/);
+  expect(result.stderr).toMatch(/not our ref|unadvertised object/);
+  expect(result.stderr).toContain(`Cook could not fetch ${ref} from origin`);
+});
 test('CLI installs the artifact version offline, previews and records direct/override deltas and pinned commit', () => {
   const commit = git(['rev-parse', 'HEAD']);
   const r = install(); if (r.status) console.error(r.stdout, r.stderr);
